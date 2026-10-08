@@ -1,0 +1,2177 @@
+```{r}
+required_packages <- c(
+  "edgeR",
+  "dplyr",
+  "tibble",
+  "ggplot2",
+  "ggrepel",
+  "patchwork",
+  "Rtsne",
+  "uwot",
+  "openxlsx",
+  "svglite",
+  "knitr"
+)
+
+missing_packages <- required_packages[
+  !vapply(
+    required_packages,
+    requireNamespace,
+    logical(1),
+    quietly = TRUE
+  )
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing packages: ",
+    paste(
+      missing_packages,
+      collapse = ", "
+    )
+  )
+}
+
+library(edgeR)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(Rtsne)
+library(uwot)
+library(openxlsx)
+library(svglite)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 8,
+  fig.height = 6
+)
+```
+
+```{r}
+params <- list(
+  
+  
+  
+  crc_counts_file =
+    "data/prepared/counts_coad_read_HUGO_shortbarcodes.csv",
+
+  ucec_counts_file =
+    "data/UCEC/count_gene_name.csv",
+
+  
+  
+  
+  crc_clinical_file =
+    "data/clinical_data.csv",
+
+  ucec_clinical_file =
+    "data/ucec_clinical.csv",
+
+  sample_column =
+    "sample_submitter_id",
+
+  group_column =
+    "MSI_TMB",
+
+  crc_project_column =
+    "dataset",
+
+  coad_pattern =
+    "COAD",
+
+  read_pattern =
+    "READ",
+
+  
+  
+  
+  min_count =
+    10L,
+
+  logcpm_prior_count =
+    1,
+
+  
+  top_variable_genes =
+    2000L,
+
+  
+  
+  
+  embedding_max_pcs =
+    30L,
+
+  embedding_variance_threshold =
+    0.80,
+
+  
+  
+  
+  tsne_max_perplexity =
+    30,
+
+  tsne_theta =
+    0.5,
+
+  tsne_max_iter =
+    1500,
+
+  
+  
+  
+  umap_n_neighbors =
+    15L,
+
+  umap_min_dist =
+    0.30,
+
+  umap_metric =
+    "euclidean",
+
+  
+  
+  
+  random_seed =
+    20260810,
+
+  
+  
+  
+  point_size =
+    2.8,
+
+  point_alpha =
+    0.80,
+
+  show_pca_centroids =
+    TRUE,
+
+  
+  
+  
+  output_root =
+    "bootstrap_validated_downstream_analysis/global_expression_HVG_PCA_tSNE_UMAP"
+)
+
+plot_dir <- file.path(
+  params$output_root,
+  "plots"
+)
+
+table_dir <- file.path(
+  params$output_root,
+  "tables"
+)
+
+expression_dir <- file.path(
+  params$output_root,
+  "normalized_expression"
+)
+
+hvg_dir <- file.path(
+  params$output_root,
+  "highly_variable_genes"
+)
+
+for (
+  directory in c(
+    params$output_root,
+    plot_dir,
+    table_dir,
+    expression_dir,
+    hvg_dir
+  )
+) {
+  dir.create(
+    directory,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+}
+```
+
+```{r}
+group_levels <- c(
+  "MSI-H",
+  "MSS/TMB-H",
+  "MSS/TMB-L"
+)
+
+group_colors <- c(
+  "MSI-H" =
+    "#7AA6DC",
+
+  "MSS/TMB-H" =
+    "#A73030",
+
+  "MSS/TMB-L" =
+    "#868686"
+)
+```
+
+```{r}
+normalize_tcga_id <- function(x) {
+  substr(
+    trimws(
+      as.character(x)
+    ),
+    1,
+    16
+  )
+}
+
+
+assert_file <- function(
+    file,
+    description
+) {
+  if (
+    !file.exists(
+      file
+    )
+  ) {
+    stop(
+      description,
+      " not found:\n",
+      file
+    )
+  }
+}
+
+
+read_count_matrix <- function(
+    file,
+    dataset_name
+) {
+  assert_file(
+    file,
+    paste0(
+      dataset_name,
+      " count matrix"
+    )
+  )
+
+  counts <- as.matrix(
+    read.csv(
+      file,
+      row.names = 1,
+      check.names = FALSE
+    )
+  )
+
+  suppressWarnings(
+    storage.mode(
+      counts
+    ) <-
+      "numeric"
+  )
+
+  if (
+    anyNA(
+      counts
+    )
+  ) {
+    stop(
+      dataset_name,
+      ": count matrix contains NA/non-numeric values."
+    )
+  }
+
+  if (
+    any(
+      counts < 0
+    )
+  ) {
+    stop(
+      dataset_name,
+      ": count matrix contains negative values."
+    )
+  }
+
+  if (
+    anyDuplicated(
+      rownames(
+        counts
+      )
+    )
+  ) {
+    message(
+      dataset_name,
+      ": collapsing duplicated gene rows by summing counts."
+    )
+
+    counts <- rowsum(
+      counts,
+      group =
+        rownames(
+          counts
+        ),
+      reorder =
+        FALSE
+    )
+  }
+
+  colnames(
+    counts
+  ) <-
+    normalize_tcga_id(
+      colnames(
+        counts
+      )
+    )
+
+  if (
+    anyDuplicated(
+      colnames(
+        counts
+      )
+    )
+  ) {
+    warning(
+      dataset_name,
+      ": duplicated sample IDs after barcode shortening; keeping first."
+    )
+
+    counts <- counts[
+      ,
+      !duplicated(
+        colnames(
+          counts
+        )
+      ),
+      drop =
+        FALSE
+    ]
+  }
+
+  counts
+}
+
+
+read_clinical <- function(
+    file,
+    dataset_name
+) {
+  assert_file(
+    file,
+    paste0(
+      dataset_name,
+      " clinical file"
+    )
+  )
+
+  clinical <- read.csv(
+    file,
+    stringsAsFactors =
+      FALSE,
+    fileEncoding =
+      "UTF-8",
+    na.strings = c(
+      "NA",
+      ""
+    ),
+    check.names =
+      FALSE
+  )
+
+  required_columns <- c(
+    params$
+      sample_column,
+
+    params$
+      group_column
+  )
+
+  missing_columns <- setdiff(
+    required_columns,
+    names(
+      clinical
+    )
+  )
+
+  if (
+    length(
+      missing_columns
+    ) >
+      0
+  ) {
+    stop(
+      dataset_name,
+      " clinical file is missing: ",
+      paste(
+        missing_columns,
+        collapse = ", "
+      )
+    )
+  }
+
+  clinical[[
+    params$
+      sample_column
+  ]] <-
+    normalize_tcga_id(
+      clinical[[
+        params$
+          sample_column
+      ]]
+    )
+
+  clinical[[
+    params$
+      group_column
+  ]] <-
+    factor(
+      clinical[[
+        params$
+          group_column
+      ]],
+      levels =
+        group_levels
+    )
+
+  clinical <- clinical %>%
+    dplyr::filter(
+      !is.na(
+        .data[[
+          params$
+            group_column
+        ]]
+      )
+    )
+
+  clinical <- clinical[
+    !duplicated(
+      clinical[[
+        params$
+          sample_column
+      ]]
+    ),
+    ,
+    drop =
+      FALSE
+  ]
+
+  rownames(
+    clinical
+  ) <-
+    clinical[[
+      params$
+        sample_column
+    ]]
+
+  clinical
+}
+```
+
+```{r}
+crc_counts_all <- read_count_matrix(
+  file =
+    params$
+      crc_counts_file,
+  dataset_name =
+    "CRC"
+)
+
+crc_clinical_all <- read_clinical(
+  file =
+    params$
+      crc_clinical_file,
+  dataset_name =
+    "CRC"
+)
+
+
+ucec_counts_all <- read_count_matrix(
+  file =
+    params$
+      ucec_counts_file,
+  dataset_name =
+    "UCEC"
+)
+
+ucec_clinical_all <- read_clinical(
+  file =
+    params$
+      ucec_clinical_file,
+  dataset_name =
+    "UCEC"
+)
+
+
+if (
+  !params$
+    crc_project_column %in%
+    names(
+      crc_clinical_all
+    )
+) {
+  stop(
+    "CRC clinical data does not contain the project column '",
+    params$
+      crc_project_column,
+    "'."
+  )
+}
+
+table(
+  crc_clinical_all[[
+    params$
+      crc_project_column
+  ]],
+  useNA =
+    "ifany"
+)
+```
+
+```{r}
+coad_clinical <- crc_clinical_all %>%
+  dplyr::filter(
+    grepl(
+      params$
+        coad_pattern,
+      .data[[
+        params$
+          crc_project_column
+      ]],
+      ignore.case =
+        TRUE
+    )
+  )
+
+
+read_clinical_subset <- crc_clinical_all %>%
+  dplyr::filter(
+    grepl(
+      params$
+        read_pattern,
+      .data[[
+        params$
+          crc_project_column
+      ]],
+      ignore.case =
+        TRUE
+    )
+  )
+
+
+dataset_inputs <- list(
+  COAD =
+    list(
+      counts =
+        crc_counts_all,
+      clinical =
+        coad_clinical
+    ),
+
+  READ =
+    list(
+      counts =
+        crc_counts_all,
+      clinical =
+        read_clinical_subset
+    ),
+
+  UCEC =
+    list(
+      counts =
+        ucec_counts_all,
+      clinical =
+        ucec_clinical_all
+    )
+)
+
+
+group_sizes <- dplyr::bind_rows(
+  lapply(
+    names(
+      dataset_inputs
+    ),
+    function(dataset_name) {
+      dataset_inputs[[
+        dataset_name
+      ]]$
+        clinical %>%
+        dplyr::count(
+          .data[[
+            params$
+              group_column
+          ]],
+          name =
+            "n"
+        ) %>%
+        dplyr::rename(
+          MSI_TMB =
+            1
+        ) %>%
+        dplyr::mutate(
+          Dataset =
+            dataset_name,
+          .before =
+            1
+        )
+    }
+  )
+)
+
+group_sizes
+```
+
+```{r}
+prepare_dataset <- function(
+    dataset_name,
+    counts,
+    clinical
+) {
+  common_samples <- intersect(
+    colnames(
+      counts
+    ),
+    rownames(
+      clinical
+    )
+  )
+
+  if (
+    length(
+      common_samples
+    ) <
+      5
+  ) {
+    stop(
+      dataset_name,
+      ": fewer than five matched samples."
+    )
+  }
+
+  counts <- counts[
+    ,
+    common_samples,
+    drop =
+      FALSE
+  ]
+
+  clinical <- clinical[
+    common_samples,
+    ,
+    drop =
+      FALSE
+  ]
+
+  stopifnot(
+    identical(
+      colnames(
+        counts
+      ),
+      rownames(
+        clinical
+      )
+    )
+  )
+
+  group <- droplevels(
+    clinical[[
+      params$
+        group_column
+    ]]
+  )
+
+  message(
+    "\n",
+    dataset_name,
+    "\nMatched samples: ",
+    ncol(
+      counts
+    ),
+    "\nMSI/TMB group sizes:"
+  )
+
+  print(
+    table(
+      group
+    )
+  )
+
+  
+  
+  
+  y <- edgeR::DGEList(
+    counts =
+      counts,
+    group =
+      group
+  )
+
+  keep <- edgeR::filterByExpr(
+    y,
+    group =
+      group,
+    min.count =
+      params$
+        min_count
+  )
+
+  y <- y[
+    keep,
+    ,
+    keep.lib.sizes =
+      FALSE
+  ]
+
+  
+  
+  
+  y <- edgeR::calcNormFactors(
+    y,
+    method =
+      "TMM"
+  )
+
+  logcpm_all <- edgeR::cpm(
+    y,
+    log =
+      TRUE,
+    prior.count =
+      params$
+        logcpm_prior_count
+  )
+
+  
+  
+  
+  gene_variance <- apply(
+    logcpm_all,
+    1,
+    stats::var,
+    na.rm =
+      TRUE
+  )
+
+  gene_mean <- rowMeans(
+    logcpm_all,
+    na.rm =
+      TRUE
+  )
+
+  variance_table <- tibble::tibble(
+    Gene =
+      rownames(
+        logcpm_all
+      ),
+
+    Mean_logCPM =
+      as.numeric(
+        gene_mean
+      ),
+
+    Variance =
+      as.numeric(
+        gene_variance
+      )
+  ) %>%
+    dplyr::filter(
+      is.finite(
+        Variance
+      ),
+      Variance >
+        0
+    ) %>%
+    dplyr::arrange(
+      dplyr::desc(
+        Variance
+      ),
+      Gene
+    ) %>%
+    dplyr::mutate(
+      Variance_rank =
+        dplyr::row_number(),
+
+      Selected_HVG =
+        Variance_rank <=
+        params$
+          top_variable_genes
+    )
+
+  selected_genes <- variance_table %>%
+    dplyr::filter(
+      Selected_HVG
+    ) %>%
+    dplyr::pull(
+      Gene
+    )
+
+  hvg_expression <- logcpm_all[
+    selected_genes,
+    ,
+    drop =
+      FALSE
+  ]
+
+  message(
+    dataset_name,
+    ": ",
+    nrow(
+      logcpm_all
+    ),
+    " genes retained after low-expression filtering."
+  )
+
+  message(
+    dataset_name,
+    ": top ",
+    nrow(
+      hvg_expression
+    ),
+    " variable genes selected for PCA/t-SNE/UMAP."
+  )
+
+  list(
+    dataset =
+      dataset_name,
+
+    clinical =
+      clinical,
+
+    dge =
+      y,
+
+    logcpm_all =
+      logcpm_all,
+
+    variance_table =
+      variance_table,
+
+    selected_genes =
+      selected_genes,
+
+    expression =
+      hvg_expression
+  )
+}
+```
+
+```{r}
+run_embeddings <- function(
+    prepared
+) {
+  dataset_name <-
+    prepared$
+      dataset
+
+  expression <-
+    prepared$
+      expression
+
+  clinical <-
+    prepared$
+      clinical
+
+  
+  
+  
+  pca <- stats::prcomp(
+    t(
+      expression
+    ),
+    center =
+      TRUE,
+    scale. =
+      FALSE
+  )
+
+  variance_fraction <-
+    pca$
+      sdev^2 /
+    sum(
+      pca$
+        sdev^2
+    )
+
+  variance_percent <-
+    100 *
+    variance_fraction
+
+  cumulative_variance <-
+    cumsum(
+      variance_fraction
+    )
+
+  
+  
+  
+  n_pc_by_variance <- which(
+    cumulative_variance >=
+      params$
+        embedding_variance_threshold
+  )[1]
+
+  if (
+    is.na(
+      n_pc_by_variance
+    )
+  ) {
+    n_pc_by_variance <-
+      length(
+        cumulative_variance
+      )
+  }
+
+  n_embedding_pcs <- min(
+    params$
+      embedding_max_pcs,
+
+    n_pc_by_variance,
+
+    ncol(
+      pca$
+        x
+    ),
+
+    nrow(
+      pca$
+        x
+    ) -
+      1
+  )
+
+  n_embedding_pcs <- max(
+    2,
+    n_embedding_pcs
+  )
+
+  embedding_input <- pca$
+    x[
+      ,
+      seq_len(
+        n_embedding_pcs
+      ),
+      drop =
+        FALSE
+    ]
+
+  message(
+    dataset_name,
+    ": t-SNE/UMAP use ",
+    n_embedding_pcs,
+    " PCs explaining ",
+    round(
+      100 *
+        cumulative_variance[
+          n_embedding_pcs
+        ],
+      1
+    ),
+    "% of HVG expression variance."
+  )
+
+  
+  
+  
+  n_samples <- nrow(
+    embedding_input
+  )
+
+  max_valid_perplexity <- floor(
+    (
+      n_samples -
+        2
+    ) /
+      3
+  )
+
+  tsne_perplexity <- min(
+    params$
+      tsne_max_perplexity,
+    max_valid_perplexity
+  )
+
+  tsne_perplexity <- max(
+    1,
+    tsne_perplexity
+  )
+
+  if (
+    3 *
+      tsne_perplexity >=
+      n_samples -
+      1
+  ) {
+    tsne_perplexity <- max(
+      1,
+      floor(
+        (
+          n_samples -
+            2
+        ) /
+          3
+      )
+    )
+  }
+
+  if (
+    tsne_perplexity <
+      1
+  ) {
+    stop(
+      dataset_name,
+      ": too few samples for t-SNE."
+    )
+  }
+
+  seed_offset <- match(
+    dataset_name,
+    c(
+      "COAD",
+      "READ",
+      "UCEC"
+    )
+  )
+
+  set.seed(
+    params$
+      random_seed +
+      seed_offset
+  )
+
+  tsne <- Rtsne::Rtsne(
+    embedding_input,
+    dims =
+      2,
+    perplexity =
+      tsne_perplexity,
+    theta =
+      params$
+        tsne_theta,
+    max_iter =
+      params$
+        tsne_max_iter,
+    pca =
+      FALSE,
+    check_duplicates =
+      FALSE,
+    verbose =
+      TRUE
+  )
+
+  
+  
+  
+  umap_neighbors <- min(
+    params$
+      umap_n_neighbors,
+    n_samples -
+      1
+  )
+
+  umap_neighbors <- max(
+    2,
+    umap_neighbors
+  )
+
+  set.seed(
+    params$
+      random_seed +
+      100 +
+      seed_offset
+  )
+
+  umap <- uwot::umap(
+    embedding_input,
+    n_neighbors =
+      umap_neighbors,
+    n_components =
+      2,
+    min_dist =
+      params$
+        umap_min_dist,
+    metric =
+      params$
+        umap_metric,
+    n_threads =
+      1,
+    verbose =
+      TRUE
+  )
+
+  
+  
+  
+  sample_ids <- rownames(
+    pca$
+      x
+  )
+
+  metadata <- clinical[
+    sample_ids,
+    ,
+    drop =
+      FALSE
+  ]
+
+  pca_scores <- tibble::tibble(
+    sample_submitter_id =
+      sample_ids,
+
+    Dim1 =
+      pca$
+        x[
+          ,
+          1
+        ],
+
+    Dim2 =
+      pca$
+        x[
+          ,
+          2
+        ],
+
+    MSI_TMB =
+      metadata[[
+        params$
+          group_column
+      ]]
+  )
+
+  tsne_scores <- tibble::tibble(
+    sample_submitter_id =
+      sample_ids,
+
+    Dim1 =
+      tsne$
+        Y[
+          ,
+          1
+        ],
+
+    Dim2 =
+      tsne$
+        Y[
+          ,
+          2
+        ],
+
+    MSI_TMB =
+      metadata[[
+        params$
+          group_column
+      ]]
+  )
+
+  umap_scores <- tibble::tibble(
+    sample_submitter_id =
+      sample_ids,
+
+    Dim1 =
+      umap[
+        ,
+        1
+      ],
+
+    Dim2 =
+      umap[
+        ,
+        2
+      ],
+
+    MSI_TMB =
+      metadata[[
+        params$
+          group_column
+      ]]
+  )
+
+  variance_explained_table <- tibble::tibble(
+    PC =
+      paste0(
+        "PC",
+        seq_along(
+          variance_percent
+        )
+      ),
+
+    Variance_percent =
+      variance_percent,
+
+    Cumulative_variance_percent =
+      100 *
+      cumulative_variance
+  )
+
+  parameter_table <- tibble::tibble(
+    Dataset =
+      dataset_name,
+
+    Samples =
+      n_samples,
+
+    Genes_after_filterByExpr =
+      nrow(
+        prepared$
+          logcpm_all
+      ),
+
+    HVGs_used =
+      nrow(
+        expression
+      ),
+
+    Embedding_PCs =
+      n_embedding_pcs,
+
+    Embedding_PC_variance_percent =
+      100 *
+      cumulative_variance[
+        n_embedding_pcs
+      ],
+
+    tSNE_perplexity =
+      tsne_perplexity,
+
+    UMAP_n_neighbors =
+      umap_neighbors
+  )
+
+  list(
+    dataset =
+      dataset_name,
+
+    pca =
+      pca,
+
+    pca_scores =
+      pca_scores,
+
+    tsne_scores =
+      tsne_scores,
+
+    umap_scores =
+      umap_scores,
+
+    variance_percent =
+      variance_percent,
+
+    variance_table =
+      variance_explained_table,
+
+    parameter_table =
+      parameter_table
+  )
+}
+```
+
+```{r}
+base_embedding_plot <- function(
+    scores,
+    title,
+    x_label,
+    y_label
+) {
+  ggplot2::ggplot(
+    scores,
+    ggplot2::aes(
+      x =
+        Dim1,
+
+      y =
+        Dim2,
+
+      color =
+        MSI_TMB
+    )
+  ) +
+
+    ggplot2::geom_point(
+      size =
+        params$
+          point_size,
+      alpha =
+        params$
+          point_alpha
+    ) +
+
+    ggplot2::scale_color_manual(
+      values =
+        group_colors,
+      breaks =
+        group_levels,
+      drop =
+        FALSE,
+      name =
+        NULL
+    ) +
+
+    ggplot2::labs(
+      title =
+        title,
+      x =
+        x_label,
+      y =
+        y_label
+    ) +
+
+    ggplot2::theme_classic(
+      base_size =
+        12
+    ) +
+
+    ggplot2::theme(
+      plot.title =
+        ggplot2::element_text(
+          face =
+            "bold",
+          hjust =
+            0.5
+        ),
+
+      legend.position =
+        "bottom"
+    )
+}
+
+
+plot_pca <- function(
+    result
+) {
+  p <- base_embedding_plot(
+    scores =
+      result$
+        pca_scores,
+
+    title =
+      paste0(
+        result$
+          dataset,
+        " — PCA (top ",
+        params$
+          top_variable_genes,
+        " variable genes)"
+      ),
+
+    x_label =
+      paste0(
+        "PC1 (",
+        round(
+          result$
+            variance_percent[
+              1
+            ],
+          1
+        ),
+        "%)"
+      ),
+
+    y_label =
+      paste0(
+        "PC2 (",
+        round(
+          result$
+            variance_percent[
+              2
+            ],
+          1
+        ),
+        "%)"
+      )
+  )
+
+  if (
+    isTRUE(
+      params$
+        show_pca_centroids
+    )
+  ) {
+    centroids <- result$
+      pca_scores %>%
+      dplyr::group_by(
+        MSI_TMB
+      ) %>%
+      dplyr::summarise(
+        Dim1 =
+          mean(
+            Dim1,
+            na.rm =
+              TRUE
+          ),
+
+        Dim2 =
+          mean(
+            Dim2,
+            na.rm =
+              TRUE
+          ),
+
+        .groups =
+          "drop"
+      )
+
+    p <- p +
+      ggplot2::geom_point(
+        data =
+          centroids,
+        ggplot2::aes(
+          x =
+            Dim1,
+          y =
+            Dim2,
+          color =
+            MSI_TMB
+        ),
+        inherit.aes =
+          FALSE,
+        shape =
+          4,
+        size =
+          5,
+        stroke =
+          1.5,
+        show.legend =
+          FALSE
+      ) +
+
+      ggrepel::geom_text_repel(
+        data =
+          centroids,
+        ggplot2::aes(
+          x =
+            Dim1,
+          y =
+            Dim2,
+          label =
+            MSI_TMB,
+          color =
+            MSI_TMB
+        ),
+        inherit.aes =
+          FALSE,
+        size =
+          3.2,
+        fontface =
+          "bold",
+        box.padding =
+          0.30,
+        point.padding =
+          0.20,
+        show.legend =
+          FALSE
+      )
+  }
+
+  p
+}
+
+
+plot_tsne <- function(
+    result
+) {
+  base_embedding_plot(
+    scores =
+      result$
+        tsne_scores,
+
+    title =
+      paste0(
+        result$
+          dataset,
+        " — t-SNE"
+      ),
+
+    x_label =
+      "t-SNE 1",
+
+    y_label =
+      "t-SNE 2"
+  )
+}
+
+
+plot_umap <- function(
+    result
+) {
+  base_embedding_plot(
+    scores =
+      result$
+        umap_scores,
+
+    title =
+      paste0(
+        result$
+          dataset,
+        " — UMAP"
+      ),
+
+    x_label =
+      "UMAP 1",
+
+    y_label =
+      "UMAP 2"
+  )
+}
+```
+
+```{r}
+prepared_data <- list()
+embedding_results <- list()
+plot_results <- list()
+
+for (
+  dataset_name in names(
+    dataset_inputs
+  )
+) {
+  prepared_data[[
+    dataset_name
+  ]] <- prepare_dataset(
+    dataset_name =
+      dataset_name,
+
+    counts =
+      dataset_inputs[[
+        dataset_name
+      ]]$
+        counts,
+
+    clinical =
+      dataset_inputs[[
+        dataset_name
+      ]]$
+        clinical
+  )
+
+  embedding_results[[
+    dataset_name
+  ]] <- run_embeddings(
+    prepared_data[[
+      dataset_name
+    ]]
+  )
+
+  plot_results[[
+    dataset_name
+  ]] <- list(
+    PCA =
+      plot_pca(
+        embedding_results[[
+          dataset_name
+        ]]
+      ),
+
+    tSNE =
+      plot_tsne(
+        embedding_results[[
+          dataset_name
+        ]]
+      ),
+
+    UMAP =
+      plot_umap(
+        embedding_results[[
+          dataset_name
+        ]]
+      )
+  )
+}
+```
+
+```{r}
+coad_figure <- patchwork::wrap_plots(
+  plot_results$
+    COAD$
+    PCA,
+
+  plot_results$
+    COAD$
+    tSNE,
+
+  plot_results$
+    COAD$
+    UMAP,
+
+  nrow =
+    1,
+
+  guides =
+    "collect"
+) &
+
+  ggplot2::theme(
+    legend.position =
+      "bottom"
+  )
+
+coad_figure
+```
+
+```{r}
+read_figure <- patchwork::wrap_plots(
+  plot_results$
+    READ$
+    PCA,
+
+  plot_results$
+    READ$
+    tSNE,
+
+  plot_results$
+    READ$
+    UMAP,
+
+  nrow =
+    1,
+
+  guides =
+    "collect"
+) &
+
+  ggplot2::theme(
+    legend.position =
+      "bottom"
+  )
+
+read_figure
+```
+
+```{r}
+ucec_figure <- patchwork::wrap_plots(
+  plot_results$
+    UCEC$
+    PCA,
+
+  plot_results$
+    UCEC$
+    tSNE,
+
+  plot_results$
+    UCEC$
+    UMAP,
+
+  nrow =
+    1,
+
+  guides =
+    "collect"
+) &
+
+  ggplot2::theme(
+    legend.position =
+      "bottom"
+  )
+
+ucec_figure
+```
+
+```{r}
+combined_overview <- patchwork::wrap_plots(
+  plot_results$COAD$PCA,
+  plot_results$COAD$tSNE,
+  plot_results$COAD$UMAP,
+
+  plot_results$READ$PCA,
+  plot_results$READ$tSNE,
+  plot_results$READ$UMAP,
+
+  plot_results$UCEC$PCA,
+  plot_results$UCEC$tSNE,
+  plot_results$UCEC$UMAP,
+
+  ncol =
+    3,
+
+  guides =
+    "collect"
+) +
+
+  patchwork::plot_annotation(
+    tag_levels =
+      "A"
+  ) &
+
+  ggplot2::theme(
+    legend.position =
+      "bottom",
+
+    plot.tag =
+      ggplot2::element_text(
+        face =
+          "bold",
+        size =
+          14
+      )
+  )
+
+combined_overview
+```
+
+```{r}
+dataset_figures <- list(
+  COAD =
+    coad_figure,
+
+  READ =
+    read_figure,
+
+  UCEC =
+    ucec_figure
+)
+
+for (
+  dataset_name in names(
+    dataset_figures
+  )
+) {
+  ggplot2::ggsave(
+    filename =
+      file.path(
+        plot_dir,
+        paste0(
+          dataset_name,
+          "_HVG_PCA_tSNE_UMAP.svg"
+        )
+      ),
+
+    plot =
+      dataset_figures[[
+        dataset_name
+      ]],
+
+    width =
+      18,
+
+    height =
+      5.5,
+
+    device =
+      "svg"
+  )
+
+  ggplot2::ggsave(
+    filename =
+      file.path(
+        plot_dir,
+        paste0(
+          dataset_name,
+          "_HVG_PCA_tSNE_UMAP.pdf"
+        )
+      ),
+
+    plot =
+      dataset_figures[[
+        dataset_name
+      ]],
+
+    width =
+      18,
+
+    height =
+      5.5,
+
+    device =
+      grDevices::
+        cairo_pdf
+  )
+
+  for (
+    method_name in c(
+      "PCA",
+      "tSNE",
+      "UMAP"
+    )
+  ) {
+    ggplot2::ggsave(
+      filename =
+        file.path(
+          plot_dir,
+          paste0(
+            dataset_name,
+            "_HVG_",
+            method_name,
+            ".svg"
+          )
+        ),
+
+      plot =
+        plot_results[[
+          dataset_name
+        ]][[
+          method_name
+        ]],
+
+      width =
+        7,
+
+      height =
+        6,
+
+      device =
+        "svg"
+    )
+
+    ggplot2::ggsave(
+      filename =
+        file.path(
+          plot_dir,
+          paste0(
+            dataset_name,
+            "_HVG_",
+            method_name,
+            ".pdf"
+          )
+        ),
+
+      plot =
+        plot_results[[
+          dataset_name
+        ]][[
+          method_name
+        ]],
+
+      width =
+        7,
+
+      height =
+        6,
+
+      device =
+        grDevices::
+          cairo_pdf
+    )
+  }
+}
+
+
+ggplot2::ggsave(
+  filename =
+    file.path(
+      plot_dir,
+      "COAD_READ_UCEC_HVG_PCA_tSNE_UMAP_overview.svg"
+    ),
+
+  plot =
+    combined_overview,
+
+  width =
+    18,
+
+  height =
+    16,
+
+  device =
+    "svg"
+)
+
+
+ggplot2::ggsave(
+  filename =
+    file.path(
+      plot_dir,
+      "COAD_READ_UCEC_HVG_PCA_tSNE_UMAP_overview.pdf"
+    ),
+
+  plot =
+    combined_overview,
+
+  width =
+    18,
+
+  height =
+    16,
+
+  device =
+    grDevices::
+      cairo_pdf
+)
+```
+
+```{r}
+for (
+  dataset_name in names(
+    prepared_data
+  )
+) {
+  write.csv(
+    prepared_data[[
+      dataset_name
+    ]]$
+      variance_table,
+
+    file.path(
+      hvg_dir,
+      paste0(
+        dataset_name,
+        "_gene_variance_ranking.csv"
+      )
+    ),
+
+    row.names =
+      FALSE
+  )
+
+  write.csv(
+    tibble::tibble(
+      Gene =
+        prepared_data[[
+          dataset_name
+        ]]$
+          selected_genes
+    ),
+
+    file.path(
+      hvg_dir,
+      paste0(
+        dataset_name,
+        "_top_",
+        params$
+          top_variable_genes,
+        "_variable_genes.csv"
+      )
+    ),
+
+    row.names =
+      FALSE
+  )
+}
+```
+
+```{r}
+for (
+  dataset_name in names(
+    prepared_data
+  )
+) {
+  write.csv(
+    prepared_data[[
+      dataset_name
+    ]]$
+      logcpm_all,
+
+    file.path(
+      expression_dir,
+      paste0(
+        dataset_name,
+        "_TMM_logCPM_all_filtered_genes.csv"
+      )
+    )
+  )
+
+  write.csv(
+    prepared_data[[
+      dataset_name
+    ]]$
+      expression,
+
+    file.path(
+      expression_dir,
+      paste0(
+        dataset_name,
+        "_TMM_logCPM_top_",
+        params$
+          top_variable_genes,
+        "_variable_genes.csv"
+      )
+    )
+  )
+}
+```
+
+```{r}
+embedding_parameters <- dplyr::bind_rows(
+  lapply(
+    embedding_results,
+    function(x) {
+      x$
+        parameter_table
+    }
+  )
+)
+
+
+write.csv(
+  group_sizes,
+  file.path(
+    table_dir,
+    "MSI_TMB_group_sizes_COAD_READ_UCEC.csv"
+  ),
+  row.names =
+    FALSE
+)
+
+
+write.csv(
+  embedding_parameters,
+  file.path(
+    table_dir,
+    "embedding_parameters.csv"
+  ),
+  row.names =
+    FALSE
+)
+
+
+for (
+  dataset_name in names(
+    embedding_results
+  )
+) {
+  result <- embedding_results[[
+    dataset_name
+  ]]
+
+  write.csv(
+    result$
+      pca_scores,
+
+    file.path(
+      table_dir,
+      paste0(
+        dataset_name,
+        "_HVG_PCA_coordinates.csv"
+      )
+    ),
+
+    row.names =
+      FALSE
+  )
+
+  write.csv(
+    result$
+      tsne_scores,
+
+    file.path(
+      table_dir,
+      paste0(
+        dataset_name,
+        "_HVG_tSNE_coordinates.csv"
+      )
+    ),
+
+    row.names =
+      FALSE
+  )
+
+  write.csv(
+    result$
+      umap_scores,
+
+    file.path(
+      table_dir,
+      paste0(
+        dataset_name,
+        "_HVG_UMAP_coordinates.csv"
+      )
+    ),
+
+    row.names =
+      FALSE
+  )
+
+  write.csv(
+    result$
+      variance_table,
+
+    file.path(
+      table_dir,
+      paste0(
+        dataset_name,
+        "_HVG_PCA_variance_explained.csv"
+      )
+    ),
+
+    row.names =
+      FALSE
+  )
+}
+```
+
+```{r}
+workbook_tables <- list(
+  Group_sizes =
+    group_sizes,
+
+  Embedding_parameters =
+    embedding_parameters
+)
+
+for (
+  dataset_name in names(
+    embedding_results
+  )
+) {
+  workbook_tables[[
+    paste0(
+      dataset_name,
+      "_PCA"
+    )
+  ]] <-
+    embedding_results[[
+      dataset_name
+    ]]$
+      pca_scores
+
+  workbook_tables[[
+    paste0(
+      dataset_name,
+      "_tSNE"
+    )
+  ]] <-
+    embedding_results[[
+      dataset_name
+    ]]$
+      tsne_scores
+
+  workbook_tables[[
+    paste0(
+      dataset_name,
+      "_UMAP"
+    )
+  ]] <-
+    embedding_results[[
+      dataset_name
+    ]]$
+      umap_scores
+
+  workbook_tables[[
+    paste0(
+      dataset_name,
+      "_PCAvar"
+    )
+  ]] <-
+    embedding_results[[
+      dataset_name
+    ]]$
+      variance_table
+
+  workbook_tables[[
+    paste0(
+      dataset_name,
+      "_HVG"
+    )
+  ]] <-
+    prepared_data[[
+      dataset_name
+    ]]$
+      variance_table %>%
+      dplyr::filter(
+        Selected_HVG
+      )
+}
+
+
+openxlsx::write.xlsx(
+  workbook_tables,
+  file =
+    file.path(
+      params$output_root,
+      "COAD_READ_UCEC_HVG_global_expression_embeddings.xlsx"
+    ),
+  overwrite =
+    TRUE
+)
+```
+
+```{r}
+sessionInfo()
+```

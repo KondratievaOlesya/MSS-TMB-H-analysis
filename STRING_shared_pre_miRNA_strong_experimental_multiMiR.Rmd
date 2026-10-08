@@ -1,0 +1,3194 @@
+```{r}
+required_packages <- c(
+  "dplyr",
+  "tibble",
+  "stringr",
+  "msigdbr",
+  "STRINGdb",
+  "igraph",
+  "ggraph",
+  "ggplot2",
+  "multiMiR",
+  "patchwork",
+  "openxlsx",
+  "svglite",
+  "knitr"
+)
+
+missing_packages <- required_packages[
+  !vapply(
+    required_packages,
+    requireNamespace,
+    logical(1),
+    quietly = TRUE
+  )
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing packages: ",
+    paste(
+      missing_packages,
+      collapse = ", "
+    )
+  )
+}
+
+library(dplyr)
+library(tibble)
+library(stringr)
+library(msigdbr)
+library(STRINGdb)
+library(igraph)
+library(ggraph)
+library(ggplot2)
+library(multiMiR)
+library(patchwork)
+library(openxlsx)
+library(svglite)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 11,
+  fig.height = 8
+)
+
+set.seed(20260807)
+```
+
+```{r}
+params <- list(
+  contrast =
+    "MSS_TMB_H_vs_MSS_TMB_L",
+
+  fdr_cutoff =
+    0.05,
+
+  
+  
+  
+  original_crc_de_dir =
+    "data/DE_results",
+
+  original_ucec_de_dir =
+    "data/DE_results/ucec_gene_DE",
+
+  
+  
+  
+  crc_mrna_stability_file =
+    "data/DE_results/stability_analysis/combined_primary_bootstrap_LOO_stability.csv",
+
+  ucec_mrna_stability_file =
+    "data/DE_results/ucec_gene_DE/stability_analysis/combined_primary_bootstrap_LOO_stability.csv",
+
+  mrna_stability_flag_column =
+    "bootstrap_robust_effect",
+
+  
+  
+  
+  crc_mirna_primary_dir =
+    "data/DE_results/pre_miRNA/bootstrap_stability/CRC/primary_DE",
+
+  ucec_mirna_primary_dir =
+    "data/DE_results/pre_miRNA/bootstrap_stability/UCEC/primary_DE",
+
+  
+  
+  
+  crc_mirna_stability_file =
+    "data/DE_results/pre_miRNA/bootstrap_stability/CRC/stability_analysis/combined_primary_bootstrap_LOO_pre_miRNA_stability.csv",
+
+  ucec_mirna_stability_file =
+    "data/DE_results/pre_miRNA/bootstrap_stability/UCEC/stability_analysis/combined_primary_bootstrap_LOO_pre_miRNA_stability.csv",
+
+  mirna_stability_flag_column =
+    "bootstrap_stable",
+
+  
+  
+  
+  selected_pathways = c(
+    "HALLMARK_MTORC1_SIGNALING",
+    "HALLMARK_E2F_TARGETS",
+    "HALLMARK_G2M_CHECKPOINT"
+  ),
+
+  
+  
+  
+  multimir_table =
+    "validated",
+
+  run_multimir =
+    TRUE,
+
+  force_multimir_query =
+    FALSE,
+
+  
+  strong_experiment_regex = paste(
+    c(
+      "luciferase",
+      "reporter assay",
+      "reporter gene",
+      "dual[- ]?luciferase",
+      "western blot",
+      "western blotting",
+      "immunoblot",
+      "qRT[- ]?PCR",
+      "RT[- ]?qPCR",
+      "qPCR",
+      "quantitative real[- ]?time PCR",
+      "real[- ]?time PCR"
+    ),
+    collapse = "|"
+  ),
+
+  
+  
+  plot_only_strong_mirna_edges =
+    FALSE,
+
+  
+  
+  
+  string_version =
+    "11.5",
+
+  string_score_threshold =
+    400,
+
+  string_cache_directory =
+    "data/STRINGdb_cache",
+
+  
+  
+  
+  gene_radius =
+    1.00,
+
+  mirna_radius =
+    1.80,
+
+  
+  
+  
+  individual_width =
+    10,
+
+  individual_height =
+    8,
+
+  combined_width =
+    22,
+
+  combined_height =
+    15,
+
+  
+  
+  
+  output_root =
+    "bootstrap_validated_downstream_analysis/STRING_shared_pre_miRNA_strong_multiMiR"
+)
+
+table_dir <- file.path(
+  params$output_root,
+  "tables"
+)
+
+multimir_dir <- file.path(
+  params$output_root,
+  "multiMiR"
+)
+
+individual_plot_dir <- file.path(
+  params$output_root,
+  "individual_panels"
+)
+
+combined_plot_dir <- file.path(
+  params$output_root,
+  "combined_figure"
+)
+
+for (
+  directory in c(
+    params$output_root,
+    table_dir,
+    multimir_dir,
+    individual_plot_dir,
+    combined_plot_dir,
+    params$string_cache_directory
+  )
+) {
+  dir.create(
+    directory,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+}
+```
+
+```{r}
+node_fill_colors <- c(
+  "Up in MSS/TMB-H" =
+    "#FF8F8F",
+
+  "Down in MSS/TMB-H" =
+    "#74AEFF"
+)
+
+edge_colors <- c(
+  "STRING PPI" =
+    "#B3B3B3",
+
+  "Validated multiMiR" =
+    "#808080",
+
+  "Strong experimental evidence" =
+    "#008000"
+)
+
+edge_widths <- c(
+  "STRING PPI" =
+    0.55,
+
+  "Validated multiMiR" =
+    0.80,
+
+  "Strong experimental evidence" =
+    1.25
+)
+
+edge_alphas <- c(
+  "STRING PPI" =
+    0.65,
+
+  "Validated multiMiR" =
+    0.75,
+
+  "Strong experimental evidence" =
+    0.95
+)
+
+label_colors <- c(
+  "miRNA-supported gene" =
+    "#0000FF",
+
+  "Other gene" =
+    "black"
+)
+```
+
+```{r}
+input_files <- list(
+  CRC = list(
+    mRNA_primary =
+      file.path(
+        params$original_crc_de_dir,
+        paste0(
+          params$contrast,
+          ".csv"
+        )
+      ),
+
+    mRNA_stability =
+      params$crc_mrna_stability_file,
+
+    pre_miRNA_primary =
+      file.path(
+        params$crc_mirna_primary_dir,
+        paste0(
+          params$contrast,
+          ".csv"
+        )
+      ),
+
+    pre_miRNA_stability =
+      params$crc_mirna_stability_file
+  ),
+
+  UCEC = list(
+    mRNA_primary =
+      file.path(
+        params$original_ucec_de_dir,
+        paste0(
+          params$contrast,
+          ".csv"
+        )
+      ),
+
+    mRNA_stability =
+      params$ucec_mrna_stability_file,
+
+    pre_miRNA_primary =
+      file.path(
+        params$ucec_mirna_primary_dir,
+        paste0(
+          params$contrast,
+          ".csv"
+        )
+      ),
+
+    pre_miRNA_stability =
+      params$ucec_mirna_stability_file
+  )
+)
+
+missing_files <- unlist(
+  input_files
+)
+
+missing_files <- missing_files[
+  !file.exists(
+    missing_files
+  )
+]
+
+if (length(missing_files) > 0) {
+  stop(
+    "Missing input files:\n",
+    paste(
+      missing_files,
+      collapse = "\n"
+    )
+  )
+}
+```
+
+```{r}
+as_flag <- function(x) {
+  if (is.logical(x)) {
+    return(
+      replace(
+        x,
+        is.na(x),
+        FALSE
+      )
+    )
+  }
+
+  if (is.numeric(x)) {
+    return(
+      !is.na(x) &
+        x != 0
+    )
+  }
+
+  tolower(
+    trimws(
+      as.character(x)
+    )
+  ) %in%
+    c(
+      "true",
+      "t",
+      "1",
+      "yes",
+      "y"
+    )
+}
+
+
+canonical_contrast <- function(x) {
+  x %>%
+    as.character() %>%
+    stringr::str_replace_all(
+      "[^A-Za-z0-9]+",
+      "_"
+    ) %>%
+    stringr::str_replace_all(
+      "_+",
+      "_"
+    ) %>%
+    stringr::str_remove_all(
+      "^_|_$"
+    )
+}
+
+
+canonical_gene <- function(x) {
+  toupper(
+    trimws(
+      as.character(x)
+    )
+  )
+}
+
+
+find_column <- function(
+    data,
+    candidates,
+    description
+) {
+  found <- candidates[
+    candidates %in%
+      names(data)
+  ]
+
+  if (length(found) == 0) {
+    stop(
+      "Could not identify ",
+      description,
+      ". Available columns: ",
+      paste(
+        names(data),
+        collapse = ", "
+      )
+    )
+  }
+
+  found[1]
+}
+
+
+flatten_list_columns <- function(data) {
+  list_columns <- names(data)[
+    vapply(
+      data,
+      is.list,
+      logical(1)
+    )
+  ]
+
+  if (length(list_columns) == 0) {
+    return(data)
+  }
+
+  data %>%
+    dplyr::mutate(
+      dplyr::across(
+        dplyr::all_of(
+          list_columns
+        ),
+        ~ vapply(
+          .x,
+          function(value) {
+            if (
+              is.null(value) ||
+              length(value) == 0
+            ) {
+              return("")
+            }
+
+            paste(
+              unlist(
+                value,
+                recursive = TRUE,
+                use.names = FALSE
+              ),
+              collapse = "; "
+            )
+          },
+          character(1)
+        )
+      )
+    )
+}
+
+
+safe_unique_collapse <- function(x) {
+  x <- as.character(x)
+  x <- x[
+    !is.na(x) &
+      nzchar(x)
+  ]
+
+  paste(
+    sort(
+      unique(x)
+    ),
+    collapse = "; "
+  )
+}
+```
+
+```{r}
+read_primary_de <- function(
+    file,
+    molecule,
+    dataset
+) {
+  identifier <- if (
+    molecule == "mRNA"
+  ) {
+    "Gene"
+  } else {
+    "pre_miRNA"
+  }
+
+  data <- read.csv(
+    file,
+    row.names = 1,
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  ) %>%
+    tibble::rownames_to_column(
+      identifier
+    ) %>%
+    tibble::as_tibble()
+
+  required_columns <- c(
+    "logFC",
+    "PValue",
+    "FDR"
+  )
+
+  if (
+    !all(
+      required_columns %in%
+        names(data)
+    )
+  ) {
+    stop(
+      "Expected logFC, PValue and FDR in ",
+      file
+    )
+  }
+
+  data[[identifier]] <- trimws(
+    as.character(
+      data[[identifier]]
+    )
+  )
+
+  data %>%
+    dplyr::mutate(
+      Dataset =
+        dataset,
+
+      Contrast =
+        params$contrast,
+
+      logFC =
+        as.numeric(logFC),
+
+      PValue =
+        as.numeric(PValue),
+
+      FDR =
+        as.numeric(FDR),
+
+      .before =
+        1
+    )
+}
+
+
+read_stability <- function(
+    file,
+    molecule,
+    flag_column
+) {
+  data <- read.csv(
+    file,
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  ) %>%
+    tibble::as_tibble()
+
+  identifier_candidates <- if (
+    molecule == "mRNA"
+  ) {
+    c(
+      "Gene",
+      "gene",
+      "gene_symbol",
+      "symbol",
+      "GeneSymbol",
+      "X",
+      "...1"
+    )
+  } else {
+    c(
+      "pre_miRNA",
+      "pre_mirna",
+      "miRNA",
+      "mirna",
+      "Gene",
+      "X",
+      "...1"
+    )
+  }
+
+  identifier <- if (
+    molecule == "mRNA"
+  ) {
+    "Gene"
+  } else {
+    "pre_miRNA"
+  }
+
+  identifier_column <- find_column(
+    data,
+    identifier_candidates,
+    paste0(
+      molecule,
+      " identifier"
+    )
+  )
+
+  names(data)[
+    names(data) ==
+      identifier_column
+  ] <- identifier
+
+  contrast_column <- find_column(
+    data,
+    c(
+      "Contrast",
+      "contrast",
+      "Comparison",
+      "comparison"
+    ),
+    "contrast"
+  )
+
+  names(data)[
+    names(data) ==
+      contrast_column
+  ] <- "Contrast"
+
+  if (
+    !flag_column %in%
+      names(data)
+  ) {
+    stop(
+      "Could not find stability column ",
+      flag_column,
+      " in ",
+      file
+    )
+  }
+
+  data[[identifier]] <- trimws(
+    as.character(
+      data[[identifier]]
+    )
+  )
+
+  data %>%
+    dplyr::mutate(
+      Contrast =
+        canonical_contrast(
+          Contrast
+        ),
+
+      selected_stability_flag =
+        as_flag(
+          .data[[
+            flag_column
+          ]]
+        )
+    ) %>%
+    dplyr::filter(
+      Contrast ==
+        canonical_contrast(
+          params$contrast
+        )
+    ) %>%
+    dplyr::select(
+      dplyr::all_of(
+        identifier
+      ),
+      Contrast,
+      selected_stability_flag
+    ) %>%
+    dplyr::distinct()
+}
+
+
+build_analysis_table <- function(
+    dataset,
+    molecule,
+    primary_file,
+    stability_file,
+    flag_column
+) {
+  identifier <- if (
+    molecule == "mRNA"
+  ) {
+    "Gene"
+  } else {
+    "pre_miRNA"
+  }
+
+  primary <- read_primary_de(
+    primary_file,
+    molecule,
+    dataset
+  )
+
+  stability <- read_stability(
+    stability_file,
+    molecule,
+    flag_column
+  )
+
+  joined <- primary %>%
+    dplyr::left_join(
+      stability,
+      by = c(
+        identifier,
+        "Contrast"
+      )
+    ) %>%
+    dplyr::mutate(
+      bootstrap_stable =
+        dplyr::coalesce(
+          selected_stability_flag,
+          FALSE
+        ),
+
+      primary_significant =
+        !is.na(FDR) &
+        FDR <=
+          params$fdr_cutoff,
+
+      validated_significant =
+        primary_significant &
+        bootstrap_stable,
+
+      Direction =
+        dplyr::case_when(
+          logFC > 0 ~
+            "Up in MSS/TMB-H",
+
+          logFC < 0 ~
+            "Down in MSS/TMB-H",
+
+          TRUE ~
+            NA_character_
+        )
+    )
+
+  list(
+    all =
+      joined,
+
+    validated =
+      joined %>%
+      dplyr::filter(
+        validated_significant
+      )
+  )
+}
+```
+
+```{r}
+analysis_data <- list()
+
+for (
+  dataset_name in c(
+    "CRC",
+    "UCEC"
+  )
+) {
+  files <- input_files[[
+    dataset_name
+  ]]
+
+  analysis_data[[
+    dataset_name
+  ]] <- list(
+    mRNA =
+      build_analysis_table(
+        dataset_name,
+        "mRNA",
+        files$mRNA_primary,
+        files$mRNA_stability,
+        params$mrna_stability_flag_column
+      ),
+
+    pre_miRNA =
+      build_analysis_table(
+        dataset_name,
+        "pre_miRNA",
+        files$pre_miRNA_primary,
+        files$pre_miRNA_stability,
+        params$mirna_stability_flag_column
+      )
+  )
+}
+```
+
+```{r}
+crc_mirna <- analysis_data$
+  CRC$
+  pre_miRNA$
+  all %>%
+  dplyr::filter(
+    !is.na(FDR),
+    FDR <=
+      params$fdr_cutoff,
+    bootstrap_stable
+  ) %>%
+  dplyr::transmute(
+    pre_miRNA,
+
+    CRC_miRNA_logFC =
+      logFC,
+
+    CRC_miRNA_FDR =
+      FDR,
+
+    CRC_miRNA_Direction =
+      Direction
+  )
+
+
+ucec_mirna <- analysis_data$
+  UCEC$
+  pre_miRNA$
+  all %>%
+  dplyr::filter(
+    !is.na(FDR),
+    FDR <=
+      params$fdr_cutoff,
+    bootstrap_stable
+  ) %>%
+  dplyr::transmute(
+    pre_miRNA,
+
+    UCEC_miRNA_logFC =
+      logFC,
+
+    UCEC_miRNA_FDR =
+      FDR,
+
+    UCEC_miRNA_Direction =
+      Direction
+  )
+
+
+shared_mirna <- dplyr::inner_join(
+  crc_mirna,
+  ucec_mirna,
+  by =
+    "pre_miRNA"
+) %>%
+  dplyr::mutate(
+    Direction_consistent =
+      sign(
+        CRC_miRNA_logFC
+      ) ==
+      sign(
+        UCEC_miRNA_logFC
+      )
+  ) %>%
+  dplyr::arrange(
+    pre_miRNA
+  )
+
+
+shared_mirna_summary <- tibble::tibble(
+  CRC_FDR_bootstrap_pre_miRNAs =
+    nrow(
+      crc_mirna
+    ),
+
+  UCEC_FDR_bootstrap_pre_miRNAs =
+    nrow(
+      ucec_mirna
+    ),
+
+  Shared_CRC_UCEC_pre_miRNAs =
+    nrow(
+      shared_mirna
+    ),
+
+  Direction_consistent_shared =
+    sum(
+      shared_mirna$
+        Direction_consistent,
+      na.rm =
+        TRUE
+    )
+)
+
+write.csv(
+  shared_mirna,
+  file.path(
+    table_dir,
+    "shared_CRC_UCEC_bootstrap_stable_pre_miRNAs.csv"
+  ),
+  row.names =
+    FALSE
+)
+
+write.csv(
+  shared_mirna_summary,
+  file.path(
+    table_dir,
+    "shared_pre_miRNA_summary.csv"
+  ),
+  row.names =
+    FALSE
+)
+
+shared_mirna_summary
+shared_mirna
+```
+
+```{r}
+premir_to_mature_candidates <- function(
+    pre_mirnas
+) {
+  dplyr::bind_rows(
+    lapply(
+      unique(
+        pre_mirnas
+      ),
+      function(pre_miRNA) {
+        base <- pre_miRNA %>%
+          stringr::str_replace(
+            "^hsa-mir",
+            "hsa-miR"
+          )
+
+        candidates <- if (
+          stringr::str_detect(
+            base,
+            "-(5p|3p)$"
+          )
+        ) {
+          base
+        } else {
+          c(
+            paste0(
+              base,
+              "-5p"
+            ),
+            paste0(
+              base,
+              "-3p"
+            )
+          )
+        }
+
+        tibble::tibble(
+          pre_miRNA =
+            pre_miRNA,
+
+          mature_query =
+            candidates
+        )
+      }
+    )
+  ) %>%
+    dplyr::distinct()
+}
+
+
+shared_mature_candidates <- premir_to_mature_candidates(
+  shared_mirna$
+    pre_miRNA
+)
+
+write.csv(
+  shared_mature_candidates,
+  file.path(
+    multimir_dir,
+    "shared_pre_miRNA_mature_candidates.csv"
+  ),
+  row.names =
+    FALSE
+)
+
+shared_mature_candidates
+```
+
+```{r}
+safe_get_multimir <- function(
+    pre_miRNA,
+    mature_query
+) {
+  message(
+    "Querying: ",
+    mature_query
+  )
+
+  result <- tryCatch(
+    multiMiR::get_multimir(
+      mirna =
+        mature_query,
+
+      table =
+        params$multimir_table,
+
+      summary =
+        TRUE
+    ),
+
+    error = function(e) {
+      message(
+        "Failed: ",
+        mature_query,
+        " | ",
+        conditionMessage(e)
+      )
+
+      NULL
+    }
+  )
+
+  if (
+    is.null(result) ||
+    is.null(result@data) ||
+    nrow(result@data) == 0
+  ) {
+    return(
+      tibble::tibble()
+    )
+  }
+
+  result@data %>%
+    tibble::as_tibble() %>%
+    dplyr::mutate(
+      pre_miRNA =
+        pre_miRNA,
+
+      mature_query =
+        mature_query,
+
+      .before =
+        1
+    )
+}
+
+
+multimir_cache <- file.path(
+  multimir_dir,
+  "validated_multiMiR_shared_pre_miRNAs.csv"
+)
+
+if (
+  file.exists(
+    multimir_cache
+  ) &&
+  !params$
+    force_multimir_query
+) {
+  mir_gene_raw <- read.csv(
+    multimir_cache,
+    check.names =
+      FALSE,
+    stringsAsFactors =
+      FALSE
+  ) %>%
+    tibble::as_tibble()
+
+} else {
+  if (
+    !params$
+      run_multimir
+  ) {
+    stop(
+      "multiMiR cache is absent and run_multimir is FALSE."
+    )
+  }
+
+  mir_gene_raw <- dplyr::bind_rows(
+    lapply(
+      seq_len(
+        nrow(
+          shared_mature_candidates
+        )
+      ),
+      function(i) {
+        safe_get_multimir(
+          shared_mature_candidates$
+            pre_miRNA[
+              i
+            ],
+
+          shared_mature_candidates$
+            mature_query[
+              i
+            ]
+        )
+      }
+    )
+  )
+
+  write.csv(
+    flatten_list_columns(
+      mir_gene_raw
+    ),
+    multimir_cache,
+    row.names =
+      FALSE
+  )
+}
+```
+
+```{r}
+for (
+  required_column in c(
+    "mature_mirna_id",
+    "target_symbol",
+    "database",
+    "experiment",
+    "support_type",
+    "pubmed_id"
+  )
+) {
+  if (
+    !required_column %in%
+      names(
+        mir_gene_raw
+      )
+  ) {
+    mir_gene_raw[[
+      required_column
+    ]] <- NA_character_
+  }
+}
+
+
+mir_gene_raw <- mir_gene_raw %>%
+  dplyr::mutate(
+    mature_mirna_id =
+      dplyr::coalesce(
+        as.character(
+          mature_mirna_id
+        ),
+        as.character(
+          mature_query
+        )
+      )
+  )
+
+
+mir_gene_df <- mir_gene_raw %>%
+  dplyr::mutate(
+    pre_miRNA =
+      trimws(
+        as.character(
+          pre_miRNA
+        )
+      ),
+
+    mature_miRNA =
+      trimws(
+        as.character(
+          mature_mirna_id
+        )
+      ),
+
+    target_symbol =
+      trimws(
+        as.character(
+          target_symbol
+        )
+      ),
+
+    target_key =
+      canonical_gene(
+        target_symbol
+      ),
+
+    experiment =
+      dplyr::coalesce(
+        as.character(
+          experiment
+        ),
+        ""
+      ),
+
+    support_type =
+      dplyr::coalesce(
+        as.character(
+          support_type
+        ),
+        ""
+      ),
+
+    pubmed_id =
+      dplyr::coalesce(
+        as.character(
+          pubmed_id
+        ),
+        ""
+      ),
+
+    evidence_text =
+      paste(
+        experiment,
+        support_type
+      ),
+
+    strong_experimental =
+      stringr::str_detect(
+        evidence_text,
+        stringr::regex(
+          params$
+            strong_experiment_regex,
+          ignore_case =
+            TRUE
+        )
+      )
+  ) %>%
+  dplyr::filter(
+    pre_miRNA %in%
+      shared_mirna$
+        pre_miRNA,
+
+    !is.na(
+      target_symbol
+    ),
+
+    nzchar(
+      target_symbol
+    )
+  ) %>%
+  dplyr::distinct()
+
+
+write.csv(
+  flatten_list_columns(
+    mir_gene_df
+  ),
+  file.path(
+    multimir_dir,
+    "shared_pre_miRNA_validated_multiMiR_with_experimental_evidence.csv"
+  ),
+  row.names =
+    FALSE
+)
+
+
+strong_multimir_records <- mir_gene_df %>%
+  dplyr::filter(
+    strong_experimental
+  )
+
+write.csv(
+  flatten_list_columns(
+    strong_multimir_records
+  ),
+  file.path(
+    multimir_dir,
+    "shared_pre_miRNA_STRONG_experimental_multiMiR_records.csv"
+  ),
+  row.names =
+    FALSE
+)
+
+
+evidence_audit <- mir_gene_df %>%
+  dplyr::count(
+    database,
+    strong_experimental,
+    sort =
+      TRUE
+  )
+
+write.csv(
+  evidence_audit,
+  file.path(
+    table_dir,
+    "multiMiR_experimental_evidence_audit.csv"
+  ),
+  row.names =
+    FALSE
+)
+
+evidence_audit
+```
+
+```{r}
+strong_assay_summary <- mir_gene_df %>%
+  dplyr::filter(
+    strong_experimental
+  ) %>%
+  dplyr::count(
+    experiment,
+    support_type,
+    database,
+    sort =
+      TRUE
+  )
+
+write.csv(
+  strong_assay_summary,
+  file.path(
+    table_dir,
+    "strong_experimental_assay_summary.csv"
+  ),
+  row.names =
+    FALSE
+)
+
+strong_assay_summary
+```
+
+```{r}
+msigdbr_arguments <- names(
+  formals(
+    msigdbr::msigdbr
+  )
+)
+
+if (
+  "collection" %in%
+    msigdbr_arguments
+) {
+  hallmark_data <- msigdbr::msigdbr(
+    species =
+      "Homo sapiens",
+
+    collection =
+      "H"
+  )
+} else {
+  hallmark_data <- msigdbr::msigdbr(
+    species =
+      "Homo sapiens",
+
+    category =
+      "H"
+  )
+}
+
+hallmark_genes <- hallmark_data %>%
+  dplyr::filter(
+    gs_name %in%
+      params$
+        selected_pathways
+  ) %>%
+  dplyr::select(
+    gs_name,
+    gene_symbol
+  ) %>%
+  dplyr::distinct()
+```
+
+```{r}
+panel_specification <- tibble::tribble(
+  ~panel, ~dataset, ~pathway, ~title,
+  "A", "CRC",  "HALLMARK_MTORC1_SIGNALING", "CRC — mTORC1 signaling",
+  "B", "CRC",  "HALLMARK_E2F_TARGETS",       "CRC — E2F targets",
+  "C", "CRC",  "HALLMARK_G2M_CHECKPOINT",    "CRC — G2M checkpoint",
+  "D", "UCEC", "HALLMARK_MTORC1_SIGNALING",  "UCEC — mTORC1 signaling",
+  "E", "UCEC", "HALLMARK_E2F_TARGETS",        "UCEC — E2F targets",
+  "F", "UCEC", "HALLMARK_G2M_CHECKPOINT",     "UCEC — G2M checkpoint"
+)
+```
+
+```{r}
+prepare_panel_data <- function(
+    dataset_name,
+    pathway_name
+) {
+  pathway_gene_symbols <- hallmark_genes %>%
+    dplyr::filter(
+      gs_name ==
+        pathway_name
+    ) %>%
+    dplyr::pull(
+      gene_symbol
+    ) %>%
+    unique()
+
+  pathway_genes <- analysis_data[[
+    dataset_name
+  ]]$
+    mRNA$
+    all %>%
+    dplyr::filter(
+      !is.na(
+        FDR
+      ),
+
+      FDR <=
+        params$
+          fdr_cutoff,
+
+      bootstrap_stable,
+
+      Gene %in%
+        pathway_gene_symbols
+    ) %>%
+    dplyr::transmute(
+      gene =
+        trimws(
+          as.character(
+            Gene
+          )
+        ),
+
+      gene_key =
+        canonical_gene(
+          Gene
+        ),
+
+      logFC =
+        as.numeric(
+          logFC
+        ),
+
+      FDR =
+        as.numeric(
+          FDR
+        ),
+
+      Direction
+    ) %>%
+    dplyr::distinct(
+      gene,
+      .keep_all =
+        TRUE
+    )
+
+  if (
+    dataset_name ==
+      "CRC"
+  ) {
+    dataset_mirna <- shared_mirna %>%
+      dplyr::transmute(
+        pre_miRNA,
+
+        miRNA_logFC =
+          CRC_miRNA_logFC,
+
+        miRNA_FDR =
+          CRC_miRNA_FDR,
+
+        miRNA_Direction =
+          CRC_miRNA_Direction
+      )
+  } else {
+    dataset_mirna <- shared_mirna %>%
+      dplyr::transmute(
+        pre_miRNA,
+
+        miRNA_logFC =
+          UCEC_miRNA_logFC,
+
+        miRNA_FDR =
+          UCEC_miRNA_FDR,
+
+        miRNA_Direction =
+          UCEC_miRNA_Direction
+      )
+  }
+
+  candidate_interactions <- mir_gene_df %>%
+    dplyr::filter(
+      pre_miRNA %in%
+        dataset_mirna$
+          pre_miRNA,
+
+      target_key %in%
+        pathway_genes$
+          gene_key
+    ) %>%
+    dplyr::inner_join(
+      dataset_mirna,
+      by =
+        "pre_miRNA"
+    ) %>%
+    dplyr::inner_join(
+      pathway_genes %>%
+        dplyr::select(
+          gene,
+          gene_key
+        ),
+      by = c(
+        "target_key" =
+          "gene_key"
+      )
+    ) %>%
+    dplyr::distinct()
+
+  list(
+    pathway_genes =
+      pathway_genes,
+
+    dataset_mirna =
+      dataset_mirna,
+
+    candidate_interactions =
+      candidate_interactions
+  )
+}
+
+
+panel_data <- list()
+
+for (
+  i in seq_len(
+    nrow(
+      panel_specification
+    )
+  )
+) {
+  panel <- panel_specification$
+    panel[
+      i
+    ]
+
+  panel_data[[
+    panel
+  ]] <- prepare_panel_data(
+    panel_specification$
+      dataset[
+        i
+      ],
+
+    panel_specification$
+      pathway[
+        i
+      ]
+  )
+}
+```
+
+```{r}
+panel_audit <- dplyr::bind_rows(
+  lapply(
+    seq_len(
+      nrow(
+        panel_specification
+      )
+    ),
+    function(i) {
+      panel <- panel_specification$
+        panel[
+          i
+        ]
+
+      x <- panel_data[[
+        panel
+      ]]
+
+      pair_summary <- x$
+        candidate_interactions %>%
+        dplyr::group_by(
+          pre_miRNA,
+          gene
+        ) %>%
+        dplyr::summarise(
+          strong =
+            any(
+              strong_experimental,
+              na.rm =
+                TRUE
+            ),
+
+          .groups =
+            "drop"
+        )
+
+      tibble::tibble(
+        Panel =
+          panel,
+
+        Dataset =
+          panel_specification$
+            dataset[
+              i
+            ],
+
+        Pathway =
+          panel_specification$
+            pathway[
+              i
+            ],
+
+        Pathway_FDR_bootstrap_genes =
+          nrow(
+            x$
+              pathway_genes
+          ),
+
+        Shared_pre_miRNAs_total =
+          nrow(
+            shared_mirna
+          ),
+
+        Shared_pre_miRNAs_linked_to_pathway =
+          dplyr::n_distinct(
+            x$
+              candidate_interactions$
+              pre_miRNA
+          ),
+
+        miRNA_supported_pathway_genes =
+          dplyr::n_distinct(
+            x$
+              candidate_interactions$
+              gene
+          ),
+
+        Validated_multiMiR_pre_miRNA_gene_pairs =
+          nrow(
+            pair_summary
+          ),
+
+        Strong_experimental_pairs =
+          sum(
+            pair_summary$
+              strong,
+            na.rm =
+              TRUE
+          )
+      )
+    }
+  )
+)
+
+write.csv(
+  panel_audit,
+  file.path(
+    table_dir,
+    "panel_experimental_evidence_audit.csv"
+  ),
+  row.names =
+    FALSE
+)
+
+panel_audit
+```
+
+```{r}
+string_db <- STRINGdb::STRINGdb$new(
+  version =
+    params$
+      string_version,
+
+  species =
+    9606,
+
+  score_threshold =
+    params$
+      string_score_threshold,
+
+  input_directory =
+    params$
+      string_cache_directory
+)
+```
+
+```{r}
+make_outer_ring_layout <- function(
+    nodes,
+    ppi_edges,
+    mirna_gene_edges
+) {
+  gene_nodes <- nodes %>%
+    dplyr::filter(
+      node_type ==
+        "Gene"
+    )
+
+  mirna_nodes <- nodes %>%
+    dplyr::filter(
+      node_type ==
+        "pre-miRNA"
+    )
+
+  gene_graph <- igraph::graph_from_data_frame(
+    ppi_edges %>%
+      dplyr::select(
+        from,
+        to
+      ),
+
+    directed =
+      FALSE,
+
+    vertices =
+      data.frame(
+        name =
+          gene_nodes$
+            name,
+
+        stringsAsFactors =
+          FALSE
+      )
+  )
+
+  set.seed(
+    20260807
+  )
+
+  if (
+    igraph::vcount(
+      gene_graph
+    ) == 1
+  ) {
+    xy <- matrix(
+      c(
+        0,
+        0
+      ),
+      nrow =
+        1
+    )
+
+  } else if (
+    igraph::ecount(
+      gene_graph
+    ) > 0
+  ) {
+    xy <- igraph::layout_with_fr(
+      gene_graph,
+      niter =
+        3000
+    )
+  } else {
+    xy <- igraph::layout_in_circle(
+      gene_graph
+    )
+  }
+
+  xy <- igraph::norm_coords(
+    xy,
+    xmin =
+      -params$
+        gene_radius,
+
+    xmax =
+      params$
+        gene_radius,
+
+    ymin =
+      -params$
+        gene_radius,
+
+    ymax =
+      params$
+        gene_radius
+  )
+
+  gene_layout <- tibble::tibble(
+    name =
+      igraph::V(
+        gene_graph
+      )$name,
+
+    x =
+      xy[
+        ,
+        1
+      ],
+
+    y =
+      xy[
+        ,
+        2
+      ]
+  )
+
+  if (
+    nrow(
+      mirna_nodes
+    ) == 0
+  ) {
+    return(
+      nodes %>%
+        dplyr::left_join(
+          gene_layout,
+          by =
+            "name"
+        )
+    )
+  }
+
+  target_positions <- mirna_gene_edges %>%
+    dplyr::transmute(
+      mirna_name =
+        paste0(
+          "mirna::",
+          pre_miRNA
+        ),
+
+      gene_name =
+        paste0(
+          "gene::",
+          gene
+        )
+    ) %>%
+    dplyr::left_join(
+      gene_layout %>%
+        dplyr::rename(
+          gene_name =
+            name,
+
+          target_x =
+            x,
+
+          target_y =
+            y
+        ),
+      by =
+        "gene_name"
+    ) %>%
+    dplyr::group_by(
+      mirna_name
+    ) %>%
+    dplyr::summarise(
+      mean_x =
+        mean(
+          target_x,
+          na.rm =
+            TRUE
+        ),
+
+      mean_y =
+        mean(
+          target_y,
+          na.rm =
+            TRUE
+        ),
+
+      .groups =
+        "drop"
+    ) %>%
+    dplyr::mutate(
+      target_angle =
+        atan2(
+          mean_y,
+          mean_x
+        )
+    )
+
+  mirna_layout <- mirna_nodes %>%
+    dplyr::select(
+      name
+    ) %>%
+    dplyr::left_join(
+      target_positions,
+      by = c(
+        "name" =
+          "mirna_name"
+      )
+    ) %>%
+    dplyr::arrange(
+      target_angle,
+      name
+    )
+
+  angles <- seq(
+    -pi,
+    pi,
+    length.out =
+      nrow(
+        mirna_layout
+      ) +
+      1
+  )[
+    seq_len(
+      nrow(
+        mirna_layout
+      )
+    )
+  ]
+
+  mirna_layout <- mirna_layout %>%
+    dplyr::mutate(
+      x =
+        params$
+          mirna_radius *
+        cos(
+          angles
+        ),
+
+      y =
+        params$
+          mirna_radius *
+        sin(
+          angles
+        )
+    ) %>%
+    dplyr::select(
+      name,
+      x,
+      y
+    )
+
+  nodes %>%
+    dplyr::left_join(
+      dplyr::bind_rows(
+        gene_layout,
+        mirna_layout
+      ),
+      by =
+        "name"
+    )
+}
+```
+
+```{r}
+build_network <- function(
+    panel_name,
+    dataset_name,
+    panel_title
+) {
+  prepared <- panel_data[[
+    panel_name
+  ]]
+
+  pathway_genes <-
+    prepared$
+      pathway_genes
+
+  candidate_interactions <-
+    prepared$
+      candidate_interactions
+
+  
+  
+  
+  if (
+    nrow(
+      candidate_interactions
+    ) > 0
+  ) {
+    mirna_gene_edges <- candidate_interactions %>%
+      dplyr::group_by(
+        pre_miRNA,
+        gene,
+        miRNA_logFC,
+        miRNA_FDR,
+        miRNA_Direction
+      ) %>%
+      dplyr::summarise(
+        mature_miRNAs =
+          safe_unique_collapse(
+            mature_miRNA
+          ),
+
+        databases =
+          safe_unique_collapse(
+            database
+          ),
+
+        experiments =
+          safe_unique_collapse(
+            experiment
+          ),
+
+        support_types =
+          safe_unique_collapse(
+            support_type
+          ),
+
+        pubmed_ids =
+          safe_unique_collapse(
+            pubmed_id
+          ),
+
+        strong_experimental =
+          any(
+            strong_experimental,
+            na.rm =
+              TRUE
+          ),
+
+        strong_experiments =
+          safe_unique_collapse(
+            experiment[
+              strong_experimental
+            ]
+          ),
+
+        edge_type =
+          dplyr::if_else(
+            strong_experimental,
+            "Strong experimental evidence",
+            "Validated multiMiR"
+          ),
+
+        .groups =
+          "drop"
+      )
+
+    if (
+      params$
+        plot_only_strong_mirna_edges
+    ) {
+      mirna_gene_edges <- mirna_gene_edges %>%
+        dplyr::filter(
+          strong_experimental
+        )
+    }
+
+  } else {
+    mirna_gene_edges <- tibble::tibble(
+      pre_miRNA =
+        character(),
+
+      gene =
+        character(),
+
+      miRNA_logFC =
+        numeric(),
+
+      miRNA_FDR =
+        numeric(),
+
+      miRNA_Direction =
+        character(),
+
+      mature_miRNAs =
+        character(),
+
+      databases =
+        character(),
+
+      experiments =
+        character(),
+
+      support_types =
+        character(),
+
+      pubmed_ids =
+        character(),
+
+      strong_experimental =
+        logical(),
+
+      strong_experiments =
+        character(),
+
+      edge_type =
+        character()
+    )
+  }
+
+  supported_genes <- unique(
+    mirna_gene_edges$
+      gene
+  )
+
+  
+  
+  
+  string_ids <- string_db$mp(
+    as.character(
+      pathway_genes$
+        gene
+    )
+  )
+
+  mapped <- pathway_genes %>%
+    dplyr::mutate(
+      STRING_id =
+        as.character(
+          string_ids
+        )
+    ) %>%
+    dplyr::filter(
+      !is.na(
+        STRING_id
+      ),
+
+      nzchar(
+        STRING_id
+      )
+    ) %>%
+    dplyr::distinct(
+      STRING_id,
+      .keep_all =
+        TRUE
+    )
+
+  if (
+    nrow(
+      mapped
+    ) >= 2
+  ) {
+    string_interactions <-
+      string_db$get_interactions(
+        mapped$
+          STRING_id
+      ) %>%
+      tibble::as_tibble() %>%
+      dplyr::filter(
+        combined_score >=
+          params$
+            string_score_threshold
+      )
+  } else {
+    string_interactions <-
+      tibble::tibble(
+        from =
+          character(),
+
+        to =
+          character(),
+
+        combined_score =
+          numeric()
+      )
+  }
+
+  string_to_gene <- mapped %>%
+    dplyr::select(
+      STRING_id,
+      gene
+    )
+
+  
+  
+  
+  ppi_edges <- string_interactions %>%
+    dplyr::left_join(
+      string_to_gene %>%
+        dplyr::rename(
+          from_gene =
+            gene
+        ),
+
+      by = c(
+        "from" =
+          "STRING_id"
+      )
+    ) %>%
+    dplyr::left_join(
+      string_to_gene %>%
+        dplyr::rename(
+          to_gene =
+            gene
+        ),
+
+      by = c(
+        "to" =
+          "STRING_id"
+      )
+    ) %>%
+    dplyr::filter(
+      !is.na(
+        from_gene
+      ),
+
+      !is.na(
+        to_gene
+      ),
+
+      from_gene !=
+        to_gene
+    ) %>%
+    dplyr::transmute(
+      from =
+        paste0(
+          "gene::",
+          from_gene
+        ),
+
+      to =
+        paste0(
+          "gene::",
+          to_gene
+        ),
+
+      edge_type =
+        "STRING PPI",
+
+      combined_score,
+
+      evidence =
+        paste0(
+          "STRING combined score: ",
+          combined_score
+        )
+    ) %>%
+    dplyr::mutate(
+      edge_a =
+        pmin(
+          from,
+          to
+        ),
+
+      edge_b =
+        pmax(
+          from,
+          to
+        )
+    ) %>%
+    dplyr::distinct(
+      edge_a,
+      edge_b,
+      .keep_all =
+        TRUE
+    ) %>%
+    dplyr::select(
+      -edge_a,
+      -edge_b
+    )
+
+  
+  
+  
+  
+  
+  network_mirna_edges <- mirna_gene_edges %>%
+    dplyr::transmute(
+      from =
+        paste0(
+          "mirna::",
+          pre_miRNA
+        ),
+
+      to =
+        paste0(
+          "gene::",
+          gene
+        ),
+
+      edge_type,
+
+      combined_score =
+        NA_real_,
+
+      evidence =
+        paste0(
+          "Mature miRNA: ",
+          mature_miRNAs,
+          "; database: ",
+          databases,
+          "; experiment: ",
+          experiments,
+          "; support type: ",
+          support_types,
+          "; PubMed: ",
+          pubmed_ids,
+          "; strong experimental: ",
+          strong_experimental
+        )
+    )
+
+  all_edges <- dplyr::bind_rows(
+    ppi_edges,
+    network_mirna_edges
+  )
+
+  
+  
+  
+  gene_nodes <- pathway_genes %>%
+    dplyr::transmute(
+      name =
+        paste0(
+          "gene::",
+          gene
+        ),
+
+      label =
+        gene,
+
+      node_type =
+        "Gene",
+
+      Direction,
+
+      logFC,
+
+      FDR,
+
+      abs_logFC =
+        abs(
+          logFC
+        ),
+
+      label_class =
+        dplyr::if_else(
+          gene %in%
+            supported_genes,
+
+          "miRNA-supported gene",
+
+          "Other gene"
+        )
+    )
+
+
+  mirna_nodes <- mirna_gene_edges %>%
+    dplyr::distinct(
+      pre_miRNA,
+      miRNA_logFC,
+      miRNA_FDR,
+      miRNA_Direction
+    ) %>%
+    dplyr::transmute(
+      name =
+        paste0(
+          "mirna::",
+          pre_miRNA
+        ),
+
+      label =
+        pre_miRNA,
+
+      node_type =
+        "pre-miRNA",
+
+      Direction =
+        miRNA_Direction,
+
+      logFC =
+        miRNA_logFC,
+
+      FDR =
+        miRNA_FDR,
+
+      abs_logFC =
+        abs(
+          miRNA_logFC
+        ),
+
+      label_class =
+        "Other gene"
+    )
+
+
+  
+  
+  nodes <- dplyr::bind_rows(
+    gene_nodes,
+    mirna_nodes
+  ) %>%
+    dplyr::distinct(
+      name,
+      .keep_all =
+        TRUE
+    )
+
+  nodes <- make_outer_ring_layout(
+    nodes =
+      nodes,
+
+    ppi_edges =
+      ppi_edges,
+
+    mirna_gene_edges =
+      mirna_gene_edges
+  )
+
+  graph_object <- igraph::graph_from_data_frame(
+    all_edges %>%
+      dplyr::select(
+        from,
+        to,
+        edge_type,
+        combined_score,
+        evidence
+      ) %>%
+      as.data.frame(),
+
+    directed =
+      FALSE,
+
+    vertices =
+      nodes %>%
+      as.data.frame()
+  )
+
+  vertex_order <- igraph::V(
+    graph_object
+  )$name
+
+  x <- nodes$x[
+    match(
+      vertex_order,
+      nodes$name
+    )
+  ]
+
+  y <- nodes$y[
+    match(
+      vertex_order,
+      nodes$name
+    )
+  ]
+
+  p <- ggraph::ggraph(
+    graph_object,
+    layout =
+      "manual",
+    x =
+      x,
+    y =
+      y
+  ) +
+
+    ggraph::geom_edge_link(
+      ggplot2::aes(
+        edge_colour =
+          edge_type,
+
+        edge_width =
+          edge_type,
+
+        edge_alpha =
+          edge_type
+      )
+    ) +
+
+    ggraph::scale_edge_colour_manual(
+      values =
+        edge_colors,
+
+      breaks = c(
+        "STRING PPI",
+        "Validated multiMiR",
+        "Strong experimental evidence"
+      ),
+
+      name =
+        "Interaction"
+    ) +
+
+    ggraph::scale_edge_width_manual(
+      values =
+        edge_widths,
+
+      guide =
+        "none"
+    ) +
+
+    ggraph::scale_edge_alpha_manual(
+      values =
+        edge_alphas,
+
+      guide =
+        "none"
+    ) +
+
+    ggraph::geom_node_point(
+      ggplot2::aes(
+        shape =
+          node_type,
+
+        fill =
+          Direction,
+
+        size =
+          abs_logFC
+      ),
+
+      colour =
+        "black",
+
+      stroke =
+        0.5
+    ) +
+
+    
+    ggraph::geom_node_text(
+      data =
+        function(x) {
+          x %>%
+            dplyr::filter(
+              node_type ==
+                "Gene"
+            )
+        },
+
+      ggplot2::aes(
+        label =
+          label,
+
+        colour =
+          label_class
+      ),
+
+      repel =
+        TRUE,
+
+      size =
+        3,
+
+      fontface =
+        "bold",
+
+      max.overlaps =
+        Inf,
+
+      box.padding =
+        0.20,
+
+      point.padding =
+        0.12,
+
+      segment.alpha =
+        0.25
+    ) +
+
+    
+    ggraph::geom_node_text(
+      data =
+        function(x) {
+          x %>%
+            dplyr::filter(
+              node_type ==
+                "pre-miRNA"
+            )
+        },
+
+      ggplot2::aes(
+        label =
+          label
+      ),
+
+      repel =
+        TRUE,
+
+      colour =
+        "black",
+
+      size =
+        3,
+
+      fontface =
+        "bold",
+
+      max.overlaps =
+        Inf,
+
+      box.padding =
+        0.15,
+
+      point.padding =
+        0.10,
+
+      segment.alpha =
+        0.20
+    ) +
+
+    ggplot2::scale_shape_manual(
+      values = c(
+        "Gene" =
+          21,
+
+        "pre-miRNA" =
+          22
+      ),
+
+      name =
+        "Node type"
+    ) +
+
+    ggplot2::scale_fill_manual(
+      values =
+        node_fill_colors,
+
+      breaks = c(
+        "Down in MSS/TMB-H",
+        "Up in MSS/TMB-H"
+      ),
+
+      name =
+        "Direction"
+    ) +
+
+    ggplot2::scale_size_continuous(
+      range = c(
+        3.2,
+        10
+      ),
+
+      name =
+        expression(
+          "|log"[2] *
+            " fold-change|"
+        )
+    ) +
+
+    ggplot2::scale_colour_manual(
+      values =
+        label_colors,
+
+      breaks = c(
+        "Other gene",
+        "miRNA-supported gene"
+      ),
+
+      name =
+        "Gene label"
+    ) +
+
+    ggplot2::labs(
+      title =
+        panel_title,
+
+      subtitle =
+        paste0(
+          nrow(
+            pathway_genes
+          ),
+          " pathway DE+bootstrap genes; ",
+          nrow(
+            mirna_nodes
+          ),
+          " linked shared pre-miRNAs; ",
+          sum(
+            mirna_gene_edges$
+              strong_experimental,
+            na.rm =
+              TRUE
+          ),
+          "/",
+          nrow(
+            mirna_gene_edges
+          ),
+          " miRNA-gene edges with strong experimental evidence"
+        )
+    ) +
+
+    ggplot2::theme_void(
+      base_size =
+        11
+    ) +
+
+    ggplot2::theme(
+      plot.title =
+        ggplot2::element_text(
+          face =
+            "bold",
+
+          hjust =
+            0.5
+        ),
+
+      plot.subtitle =
+        ggplot2::element_text(
+          hjust =
+            0.5,
+
+          size =
+            9
+        ),
+
+      legend.position =
+        "bottom",
+
+      legend.box =
+        "vertical"
+    )
+
+  list(
+    plot =
+      p,
+
+    nodes =
+      nodes,
+
+    edges =
+      all_edges,
+
+    pathway_genes =
+      pathway_genes,
+
+    mirna_gene_edges =
+      mirna_gene_edges,
+
+    mapped_genes =
+      mapped
+  )
+}
+```
+
+```{r}
+network_results <- list()
+
+for (
+  i in seq_len(
+    nrow(
+      panel_specification
+    )
+  )
+) {
+  panel <- panel_specification$
+    panel[
+      i
+    ]
+
+  network_results[[
+    panel
+  ]] <- build_network(
+    panel_name =
+      panel,
+
+    dataset_name =
+      panel_specification$
+        dataset[
+          i
+        ],
+
+    panel_title =
+      panel_specification$
+        title[
+          i
+        ]
+  )
+
+  stub <- paste0(
+    panel,
+    "_",
+    panel_specification$
+      dataset[
+        i
+      ],
+    "_",
+    panel_specification$
+      pathway[
+        i
+      ]
+  )
+
+  ggplot2::ggsave(
+    file.path(
+      individual_plot_dir,
+      paste0(
+        stub,
+        ".svg"
+      )
+    ),
+    network_results[[
+      panel
+    ]]$
+      plot,
+    width =
+      params$
+        individual_width,
+    height =
+      params$
+        individual_height,
+    device =
+      "svg"
+  )
+
+  ggplot2::ggsave(
+    file.path(
+      individual_plot_dir,
+      paste0(
+        stub,
+        ".pdf"
+      )
+    ),
+    network_results[[
+      panel
+    ]]$
+      plot,
+    width =
+      params$
+        individual_width,
+    height =
+      params$
+        individual_height,
+    device =
+      grDevices::
+        cairo_pdf
+  )
+
+  write.csv(
+    network_results[[
+      panel
+    ]]$
+      nodes,
+    file.path(
+      table_dir,
+      paste0(
+        stub,
+        "_nodes.csv"
+      )
+    ),
+    row.names =
+      FALSE
+  )
+
+  write.csv(
+    flatten_list_columns(
+      network_results[[
+        panel
+      ]]$
+        edges
+    ),
+    file.path(
+      table_dir,
+      paste0(
+        stub,
+        "_edges.csv"
+      )
+    ),
+    row.names =
+      FALSE
+  )
+
+  write.csv(
+    flatten_list_columns(
+      network_results[[
+        panel
+      ]]$
+        mirna_gene_edges
+    ),
+    file.path(
+      table_dir,
+      paste0(
+        stub,
+        "_miRNA_gene_experimental_evidence.csv"
+      )
+    ),
+    row.names =
+      FALSE
+  )
+}
+```
+
+```{r}
+gene_audit <- dplyr::bind_rows(
+  lapply(
+    seq_len(
+      nrow(
+        panel_specification
+      )
+    ),
+    function(i) {
+      panel <- panel_specification$
+        panel[
+          i
+        ]
+
+      selected <- panel_data[[
+        panel
+      ]]$
+        pathway_genes$
+        gene
+
+      plotted <- network_results[[
+        panel
+      ]]$
+        nodes %>%
+        dplyr::filter(
+          node_type ==
+            "Gene"
+        ) %>%
+        dplyr::pull(
+          label
+        )
+
+      tibble::tibble(
+        Panel =
+          panel,
+
+        Selected_pathway_genes =
+          length(
+            selected
+          ),
+
+        Plotted_gene_nodes =
+          length(
+            plotted
+          ),
+
+        Missing_gene_nodes =
+          length(
+            setdiff(
+              selected,
+              plotted
+            )
+          ),
+
+        Missing_genes =
+          paste(
+            setdiff(
+              selected,
+              plotted
+            ),
+            collapse =
+              "; "
+          )
+      )
+    }
+  )
+)
+
+write.csv(
+  gene_audit,
+  file.path(
+    table_dir,
+    "gene_node_audit.csv"
+  ),
+  row.names =
+    FALSE
+)
+
+gene_audit
+```
+
+```{r}
+combined_plot <- patchwork::wrap_plots(
+  lapply(
+    c(
+      "A",
+      "B",
+      "C",
+      "D",
+      "E",
+      "F"
+    ),
+    function(panel) {
+      network_results[[
+        panel
+      ]]$
+        plot
+    }
+  ),
+  ncol =
+    3,
+  guides =
+    "collect"
+) +
+  patchwork::plot_annotation(
+    tag_levels =
+      "A"
+  ) &
+  ggplot2::theme(
+    plot.tag =
+      ggplot2::element_text(
+        face =
+          "bold",
+        size =
+          16
+      ),
+
+    legend.position =
+      "bottom"
+  )
+
+ggplot2::ggsave(
+  file.path(
+    combined_plot_dir,
+    "STRING_shared_pre_miRNA_strong_multiMiR_A_to_F.svg"
+  ),
+  combined_plot,
+  width =
+    params$
+      combined_width,
+  height =
+    params$
+      combined_height,
+  device =
+    "svg",
+  limitsize =
+    FALSE
+)
+
+ggplot2::ggsave(
+  file.path(
+    combined_plot_dir,
+    "STRING_shared_pre_miRNA_strong_multiMiR_A_to_F.pdf"
+  ),
+  combined_plot,
+  width =
+    params$
+      combined_width,
+  height =
+    params$
+      combined_height,
+  device =
+    grDevices::
+      cairo_pdf,
+  limitsize =
+    FALSE
+)
+
+combined_plot
+```
+
+```{r}
+network_summary <- dplyr::bind_rows(
+  lapply(
+    seq_len(
+      nrow(
+        panel_specification
+      )
+    ),
+    function(i) {
+      panel <- panel_specification$
+        panel[
+          i
+        ]
+
+      x <- network_results[[
+        panel
+      ]]
+
+      tibble::tibble(
+        Panel =
+          panel,
+
+        Dataset =
+          panel_specification$
+            dataset[
+              i
+            ],
+
+        Pathway =
+          panel_specification$
+            pathway[
+              i
+            ],
+
+        Pathway_DE_bootstrap_genes =
+          nrow(
+            x$
+              pathway_genes
+          ),
+
+        STRING_mapped_genes =
+          nrow(
+            x$
+              mapped_genes
+          ),
+
+        Shared_pre_miRNAs_total =
+          nrow(
+            shared_mirna
+          ),
+
+        Shared_pre_miRNAs_linked_to_pathway =
+          dplyr::n_distinct(
+            x$
+              mirna_gene_edges$
+              pre_miRNA
+          ),
+
+        miRNA_supported_pathway_genes =
+          dplyr::n_distinct(
+            x$
+              mirna_gene_edges$
+              gene
+          ),
+
+        Validated_multiMiR_edges =
+          nrow(
+            x$
+              mirna_gene_edges
+          ),
+
+        Strong_experimental_edges =
+          sum(
+            x$
+              mirna_gene_edges$
+              strong_experimental,
+            na.rm =
+              TRUE
+          )
+      )
+    }
+  )
+)
+
+write.csv(
+  network_summary,
+  file.path(
+    table_dir,
+    "network_summary.csv"
+  ),
+  row.names =
+    FALSE
+)
+
+network_summary
+```
+
+```{r}
+workbook <- list(
+  Shared_pre_miRNAs =
+    shared_mirna,
+
+  Shared_pre_miRNA_summary =
+    shared_mirna_summary,
+
+  Mature_candidates =
+    shared_mature_candidates,
+
+  Experimental_evidence_audit =
+    evidence_audit,
+
+  Strong_assay_summary =
+    strong_assay_summary,
+
+  Panel_audit =
+    panel_audit,
+
+  Gene_audit =
+    gene_audit,
+
+  Network_summary =
+    network_summary
+)
+
+for (
+  panel in c(
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
+    "F"
+  )
+) {
+  workbook[[
+    paste0(
+      panel,
+      "_nodes"
+    )
+  ]] <-
+    network_results[[
+      panel
+    ]]$
+      nodes
+
+  workbook[[
+    paste0(
+      panel,
+      "_edges"
+    )
+  ]] <-
+    flatten_list_columns(
+      network_results[[
+        panel
+      ]]$
+        edges
+    )
+
+  workbook[[
+    paste0(
+      panel,
+      "_miRNA_gene"
+    )
+  ]] <-
+    flatten_list_columns(
+      network_results[[
+        panel
+      ]]$
+        mirna_gene_edges
+    )
+}
+
+openxlsx::write.xlsx(
+  workbook,
+  file =
+    file.path(
+      params$output_root,
+      "STRING_shared_pre_miRNA_strong_multiMiR_networks.xlsx"
+    ),
+  overwrite =
+    TRUE
+)
+```
+
+```{r}
+sessionInfo()
+```

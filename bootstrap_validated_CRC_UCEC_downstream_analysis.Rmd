@@ -1,0 +1,1420 @@
+```{r}
+params <- list(
+  
+  clinical_file = "data/clinical_data.csv",
+  ucec_clinical_file = "data/ucec_clinical.csv",
+  crc_counts_file = "data/prepared/counts_coad_read_HUGO_shortbarcodes.csv",
+  ucec_counts_file = "data/UCEC/count_gene_name.csv",
+
+  
+  original_crc_de_dir = "data/DE_results",
+  original_ucec_de_dir = "data/DE_results/ucec_gene_DE",
+
+  
+  crc_mrna_stability_file = "data/DE_results/stability_analysis/combined_primary_bootstrap_LOO_stability.csv",
+  ucec_mrna_stability_file = "data/DE_results/ucec_gene_DE/stability_analysis/combined_primary_bootstrap_LOO_stability.csv",
+  mrna_stability_flag_column = "bootstrap_robust_effect",
+
+  
+  crc_mirna_primary_dir = "data/DE_results/pre_miRNA/bootstrap_stability/CRC/primary_DE",
+  ucec_mirna_primary_dir = "data/DE_results/pre_miRNA/bootstrap_stability/UCEC/primary_DE",
+
+  
+  crc_mirna_stability_file = "data/DE_results/pre_miRNA/bootstrap_stability/CRC/stability_analysis/combined_primary_bootstrap_LOO_pre_miRNA_stability.csv",
+  ucec_mirna_stability_file = "data/DE_results/pre_miRNA/bootstrap_stability/UCEC/stability_analysis/combined_primary_bootstrap_LOO_pre_miRNA_stability.csv",
+  mirna_stability_flag_column = "bootstrap_stable",
+
+  
+  crc_mirna_model_file = "data/DE_results/pre_miRNA/bootstrap_stability/CRC/stability_analysis/primary_edgeR_model.rds",
+  ucec_mirna_model_file = "data/DE_results/pre_miRNA/bootstrap_stability/UCEC/stability_analysis/primary_edgeR_model.rds",
+  crc_mirna_clinical_file = "data/DE_results/pre_miRNA/bootstrap_stability/CRC/stability_analysis/clinical_data_used.csv",
+  ucec_mirna_clinical_file = "data/DE_results/pre_miRNA/bootstrap_stability/UCEC/stability_analysis/clinical_data_used.csv",
+
+  output_root = "bootstrap_validated_downstream_analysis",
+
+  fdr_cutoff = 0.05,
+  logfc_cutoff = 1,
+  pathway_logfc_cutoff = 0.03,
+
+  run_gprofiler = TRUE,
+  run_multimir = TRUE,
+  run_stringdb = TRUE
+)
+
+core_packages <- c(
+  "edgeR", "limma", "dplyr", "tidyr", "tibble", "stringr",
+  "ggplot2", "ggrepel", "ggVennDiagram", "svglite", "GSVA",
+  "msigdbr", "pheatmap", "openxlsx"
+)
+
+missing_core <- core_packages[
+  !vapply(core_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_core) > 0) {
+  stop(
+    "Missing required R packages: ",
+    paste(missing_core, collapse = ", ")
+  )
+}
+
+library(edgeR)
+library(limma)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(ggplot2)
+library(ggrepel)
+library(ggVennDiagram)
+library(svglite)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 9,
+  fig.height = 6
+)
+
+set.seed(20260805)
+
+contrast_names <- c(
+  "MSI_H_vs_MSS_TMB_H",
+  "MSI_H_vs_MSS_TMB_L",
+  "MSS_TMB_H_vs_MSS_TMB_L"
+)
+
+
+stable_crc_de_dir <- file.path(
+  params$output_root, "data", "DE_results", "CRC"
+)
+stable_crc_only_dir <- file.path(
+  stable_crc_de_dir, "stable_only"
+)
+
+stable_ucec_de_dir <- file.path(
+  params$output_root, "data", "DE_results", "UCEC"
+)
+stable_ucec_only_dir <- file.path(
+  stable_ucec_de_dir, "stable_only"
+)
+
+stable_coad_mir_dir <- file.path(
+  params$output_root, "data", "DE_results", "pre_miRNA", "CRC"
+)
+stable_coad_mir_only_dir <- file.path(
+  stable_coad_mir_dir, "stable_only"
+)
+
+stable_ucec_mir_dir <- file.path(
+  params$output_root, "data", "DE_results", "pre_miRNA", "UCEC"
+)
+stable_ucec_mir_only_dir <- file.path(
+  stable_ucec_mir_dir, "stable_only"
+)
+
+gsea_prepared_dir <- file.path(
+  params$output_root, "data", "prepared"
+)
+gsea_out_dir <- file.path(
+  params$output_root, "results", "GSEA"
+)
+deg_plot_dir <- file.path(
+  params$output_root, "results", "figures", "DEG"
+)
+mirna_plot_dir <- file.path(
+  params$output_root, "results", "figures", "pre_miRNA"
+)
+string_out_dir <- file.path(
+  params$output_root, "results", "STRING", "CRC"
+)
+
+output_dirs <- c(
+  stable_crc_de_dir,
+  stable_crc_only_dir,
+  stable_ucec_de_dir,
+  stable_ucec_only_dir,
+  stable_coad_mir_dir,
+  stable_coad_mir_only_dir,
+  stable_ucec_mir_dir,
+  stable_ucec_mir_only_dir,
+  gsea_prepared_dir,
+  gsea_out_dir,
+  deg_plot_dir,
+  mirna_plot_dir,
+  string_out_dir
+)
+
+invisible(
+  lapply(
+    output_dirs,
+    dir.create,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+)
+
+as_flag <- function(x) {
+  if (is.logical(x)) {
+    return(replace(x, is.na(x), FALSE))
+  }
+
+  if (is.numeric(x)) {
+    return(!is.na(x) & x != 0)
+  }
+
+  tolower(trimws(as.character(x))) %in%
+    c("true", "t", "1", "yes", "y")
+}
+
+save_placeholder_svg <- function(
+    file,
+    title,
+    detail = "No results available"
+) {
+  p <- ggplot() +
+    annotate(
+      "text",
+      x = 0,
+      y = 0.15,
+      label = title,
+      fontface = "bold",
+      size = 5
+    ) +
+    annotate(
+      "text",
+      x = 0,
+      y = -0.10,
+      label = detail,
+      size = 4
+    ) +
+    xlim(-1, 1) +
+    ylim(-1, 1) +
+    theme_void()
+
+  ggsave(
+    file,
+    p,
+    width = 7,
+    height = 5,
+    device = "svg"
+  )
+
+  invisible(p)
+}
+
+save_placeholder_pdf <- function(
+    file,
+    title,
+    detail = "No results available",
+    width = 8,
+    height = 6
+) {
+  grDevices::pdf(
+    file,
+    width = width,
+    height = height
+  )
+  plot.new()
+  title(
+    main = title,
+    sub = detail
+  )
+  grDevices::dev.off()
+}
+
+write_empty_csv <- function(file, columns) {
+  x <- as.data.frame(
+    setNames(
+      replicate(
+        length(columns),
+        logical(0),
+        simplify = FALSE
+      ),
+      columns
+    )
+  )
+
+  write.csv(
+    x,
+    file,
+    row.names = FALSE
+  )
+}
+```
+
+```{r}
+read_stability_table <- function(
+    stability_file,
+    id_column,
+    flag_column,
+    dataset_name
+) {
+  if (!file.exists(stability_file)) {
+    stop(
+      dataset_name,
+      " stability table not found: ",
+      stability_file
+    )
+  }
+
+  stability <- read.csv(
+    stability_file,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+
+  required_columns <- c(
+    "Contrast",
+    id_column
+  )
+
+  missing_columns <- setdiff(
+    required_columns,
+    names(stability)
+  )
+
+  if (length(missing_columns) > 0) {
+    stop(
+      dataset_name,
+      " stability table is missing columns: ",
+      paste(missing_columns, collapse = ", ")
+    )
+  }
+
+  if (flag_column %in% names(stability)) {
+    stability$selected_stable <- as_flag(
+      stability[[flag_column]]
+    )
+  } else if (
+    all(c("Method", "robust_effect") %in% names(stability))
+  ) {
+    stability <- stability[
+      grepl(
+        "bootstrap",
+        stability$Method,
+        ignore.case = TRUE
+      ),
+      ,
+      drop = FALSE
+    ]
+
+    stability$selected_stable <- as_flag(
+      stability$robust_effect
+    )
+  } else {
+    stop(
+      dataset_name,
+      ": could not find stability flag '",
+      flag_column,
+      "' or long-format Method/robust_effect columns."
+    )
+  }
+
+  stability %>%
+    transmute(
+      Contrast = trimws(
+        as.character(Contrast)
+      ),
+      Feature = trimws(
+        as.character(
+          .data[[id_column]]
+        )
+      ),
+      selected_stable =
+        selected_stable
+    ) %>%
+    filter(
+      !is.na(Contrast),
+      Contrast != "",
+      !is.na(Feature),
+      Feature != ""
+    ) %>%
+    group_by(
+      Contrast,
+      Feature
+    ) %>%
+    summarise(
+      selected_stable = any(
+        selected_stable,
+        na.rm = TRUE
+      ),
+      .groups = "drop"
+    )
+}
+
+build_validated_result_files <- function(
+    dataset_name,
+    original_dir,
+    stability_file,
+    output_dir,
+    stable_only_dir,
+    id_column,
+    stability_flag_column
+) {
+  stability <- read_stability_table(
+    stability_file = stability_file,
+    id_column = id_column,
+    flag_column = stability_flag_column,
+    dataset_name = dataset_name
+  )
+
+  assessed_contrasts <- unique(
+    stability$Contrast
+  )
+
+  count_rows <- vector(
+    "list",
+    length(contrast_names)
+  )
+
+  names(count_rows) <- contrast_names
+
+  for (contrast_name in contrast_names) {
+    source_file <- file.path(
+      original_dir,
+      paste0(contrast_name, ".csv")
+    )
+
+    if (!file.exists(source_file)) {
+      stop(
+        "Missing ",
+        dataset_name,
+        " result file: ",
+        source_file
+      )
+    }
+
+    tab <- read.csv(
+      source_file,
+      row.names = 1,
+      stringsAsFactors = FALSE,
+      check.names = FALSE
+    )
+
+    feature_ids <- trimws(
+      rownames(tab)
+    )
+
+    contrast_assessed <-
+      contrast_name %in% assessed_contrasts
+
+    stable_ids <- stability %>%
+      filter(
+        Contrast == contrast_name,
+        selected_stable
+      ) %>%
+      pull(Feature)
+
+    tab$bootstrap_assessed <-
+      contrast_assessed
+
+    tab$bootstrap_stable <-
+      contrast_assessed &
+      feature_ids %in% stable_ids
+
+    write.csv(
+      tab,
+      file.path(
+        output_dir,
+        paste0(contrast_name, ".csv")
+      )
+    )
+
+    write.csv(
+      tab[
+        tab$bootstrap_stable,
+        ,
+        drop = FALSE
+      ],
+      file.path(
+        stable_only_dir,
+        paste0(contrast_name, ".csv")
+      )
+    )
+
+    primary_significant <-
+      !is.na(tab$FDR) &
+      !is.na(tab$logFC) &
+      tab$FDR <= params$fdr_cutoff &
+      abs(tab$logFC) >= params$logfc_cutoff
+
+    count_rows[[contrast_name]] <- tibble(
+      Dataset = dataset_name,
+      Contrast = contrast_name,
+      Bootstrap_assessed =
+        contrast_assessed,
+      Features_tested = nrow(tab),
+      Primary_significant =
+        sum(primary_significant),
+      Bootstrap_stable_total =
+        sum(tab$bootstrap_stable),
+      Bootstrap_stable_significant =
+        sum(
+          primary_significant &
+            tab$bootstrap_stable
+        ),
+      Primary_significant_not_stable =
+        if (contrast_assessed) {
+          sum(
+            primary_significant &
+              !tab$bootstrap_stable
+          )
+        } else {
+          NA_integer_
+        }
+    )
+  }
+
+  bind_rows(count_rows)
+}
+
+crc_mrna_counts <- build_validated_result_files(
+  dataset_name = "CRC_mRNA",
+  original_dir = params$original_crc_de_dir,
+  stability_file = params$crc_mrna_stability_file,
+  output_dir = stable_crc_de_dir,
+  stable_only_dir = stable_crc_only_dir,
+  id_column = "Gene",
+  stability_flag_column =
+    params$mrna_stability_flag_column
+)
+
+ucec_mrna_counts <- build_validated_result_files(
+  dataset_name = "UCEC_mRNA",
+  original_dir = params$original_ucec_de_dir,
+  stability_file = params$ucec_mrna_stability_file,
+  output_dir = stable_ucec_de_dir,
+  stable_only_dir = stable_ucec_only_dir,
+  id_column = "Gene",
+  stability_flag_column =
+    params$mrna_stability_flag_column
+)
+
+mrna_validation_counts <- bind_rows(
+  crc_mrna_counts,
+  ucec_mrna_counts
+)
+
+write.csv(
+  mrna_validation_counts,
+  file.path(
+    params$output_root,
+    "CRC_UCEC_mRNA_bootstrap_validation_counts.csv"
+  ),
+  row.names = FALSE
+)
+
+knitr::kable(
+  mrna_validation_counts,
+  caption = "CRC and UCEC mRNA bootstrap-validation counts."
+)
+```
+
+```{r}
+input_files <- tibble(
+  Input = c(
+    "CRC mRNA stability",
+    "UCEC mRNA stability",
+    "CRC pre-miRNA primary directory",
+    "UCEC pre-miRNA primary directory",
+    "CRC pre-miRNA stability",
+    "UCEC pre-miRNA stability",
+    "CRC pre-miRNA model",
+    "UCEC pre-miRNA model"
+  ),
+  Path = c(
+    params$crc_mrna_stability_file,
+    params$ucec_mrna_stability_file,
+    params$crc_mirna_primary_dir,
+    params$ucec_mirna_primary_dir,
+    params$crc_mirna_stability_file,
+    params$ucec_mirna_stability_file,
+    params$crc_mirna_model_file,
+    params$ucec_mirna_model_file
+  ),
+  Exists = c(
+    file.exists(params$crc_mrna_stability_file),
+    file.exists(params$ucec_mrna_stability_file),
+    dir.exists(params$crc_mirna_primary_dir),
+    dir.exists(params$ucec_mirna_primary_dir),
+    file.exists(params$crc_mirna_stability_file),
+    file.exists(params$ucec_mirna_stability_file),
+    file.exists(params$crc_mirna_model_file),
+    file.exists(params$ucec_mirna_model_file)
+  )
+)
+
+knitr::kable(
+  input_files,
+  caption = "Bootstrap-derived inputs required by this report."
+)
+
+if (any(!input_files$Exists)) {
+  stop(
+    "One or more bootstrap-derived inputs are missing:\n",
+    paste(
+      input_files$Path[!input_files$Exists],
+      collapse = "\n"
+    )
+  )
+}
+```
+
+```{r}
+read_deg <- function(
+    file,
+    contrast_name,
+    flip_logfc = FALSE
+) {
+  df <- read.csv(
+    file,
+    row.names = 1,
+    check.names = FALSE
+  ) %>%
+    rownames_to_column(
+      "Gene"
+    ) %>%
+    as_tibble()
+
+  required_columns <- c(
+    "logFC",
+    "FDR",
+    "bootstrap_assessed",
+    "bootstrap_stable"
+  )
+
+  missing_columns <- setdiff(
+    required_columns,
+    names(df)
+  )
+
+  if (length(missing_columns) > 0) {
+    stop(
+      "Missing columns in ",
+      file,
+      ": ",
+      paste(missing_columns, collapse = ", ")
+    )
+  }
+
+  df$bootstrap_assessed <- as_flag(
+    df$bootstrap_assessed
+  )
+  df$bootstrap_stable <- as_flag(
+    df$bootstrap_stable
+  )
+
+  if (flip_logfc) {
+    df$logFC <- -df$logFC
+  }
+
+  df %>%
+    mutate(
+      contrast = contrast_name,
+      sig =
+        bootstrap_assessed &
+        bootstrap_stable &
+        !is.na(FDR) &
+        !is.na(logFC) &
+        FDR <= params$fdr_cutoff &
+        abs(logFC) >= params$logfc_cutoff,
+      direction = case_when(
+        sig & logFC > 0 ~
+          "Up in MSS/TMB-H",
+        sig & logFC < 0 ~
+          "Down in MSS/TMB-H",
+        TRUE ~
+          "Not significant"
+      ),
+      neglog10FDR =
+        -log10(
+          pmax(FDR, 1e-300)
+        )
+    )
+}
+
+plot_volcano <- function(df, title, file, label_n = 12) {
+  labels <- df %>% filter(sig) %>% arrange(FDR, desc(abs(logFC))) %>% slice_head(n = label_n)
+  p <- ggplot(df, aes(logFC, neglog10FDR)) +
+    geom_point(aes(color = direction), alpha = 0.75, size = 1.4) +
+    geom_vline(xintercept = c(-params$logfc_cutoff, params$logfc_cutoff), linetype = "dashed", linewidth = 0.35) +
+    geom_hline(yintercept = -log10(params$fdr_cutoff), linetype = "dashed", linewidth = 0.35) +
+    geom_text_repel(data = labels, aes(label = Gene), size = 3, max.overlaps = Inf) +
+    scale_color_manual(values = c(
+      "Up in MSS/TMB-H" = "#D55E00",
+      "Down in MSS/TMB-H" = "#0072B2",
+      "Not significant" = "grey75"
+    )) +
+    labs(title = title, x = "log2 fold-change", y = expression(-log[10]("FDR")), color = NULL) +
+    theme_classic(base_size = 13) +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5), legend.position = "top")
+  ggsave(file, p, width = 6.5, height = 5.2, device = "svg")
+  p
+}
+
+save_venn <- function(sets, title, file, high_color) {
+  if (all(vapply(sets, length, integer(1)) == 0)) {
+    save_placeholder_svg(file, title, "No bootstrap-stable significant features")
+    return(invisible(NULL))
+  }
+  p <- ggVennDiagram(sets, label_alpha = 0) +
+    scale_fill_gradient(low = "white", high = high_color) +
+    labs(title = title) +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5))
+  ggsave(file, p, width = 7, height = 6, device = "svg")
+  p
+}
+```
+
+```{r}
+crc_mssh_vs_msih <- read_deg(
+  file.path(stable_crc_de_dir, "MSI_H_vs_MSS_TMB_H.csv"),
+  "CRC_MSS/TMB-H_vs_MSI-H",
+  flip_logfc = TRUE
+)
+crc_mssh_vs_mssl <- read_deg(
+  file.path(stable_crc_de_dir, "MSS_TMB_H_vs_MSS_TMB_L.csv"),
+  "CRC_MSS/TMB-H_vs_MSS/TMB-L"
+)
+ucec_mssh_vs_msih <- read_deg(
+  file.path(stable_ucec_de_dir, "MSI_H_vs_MSS_TMB_H.csv"),
+  "UCEC_MSS/TMB-H_vs_MSI-H",
+  flip_logfc = TRUE
+)
+ucec_mssh_vs_mssl <- read_deg(
+  file.path(stable_ucec_de_dir, "MSS_TMB_H_vs_MSS_TMB_L.csv"),
+  "UCEC_MSS/TMB-H_vs_MSS/TMB-L"
+)
+
+plot_volcano(crc_mssh_vs_msih, "CRC: MSS/TMB-H vs MSI-H", file.path(deg_plot_dir, "volcano_CRC_MSS_TMB_H_vs_MSI_H.svg"))
+plot_volcano(crc_mssh_vs_mssl, "CRC: MSS/TMB-H vs MSS/TMB-L", file.path(deg_plot_dir, "volcano_CRC_MSS_TMB_H_vs_MSS_TMB_L.svg"))
+plot_volcano(ucec_mssh_vs_msih, "UCEC: MSS/TMB-H vs MSI-H", file.path(deg_plot_dir, "volcano_UCEC_MSS_TMB_H_vs_MSI_H.svg"))
+plot_volcano(ucec_mssh_vs_mssl, "UCEC: MSS/TMB-H vs MSS/TMB-L", file.path(deg_plot_dir, "volcano_UCEC_MSS_TMB_H_vs_MSS_TMB_L.svg"))
+
+crc_sets <- list(
+  "CRC: MSS/TMB-H vs MSI-H" = crc_mssh_vs_msih %>% filter(sig) %>% pull(Gene),
+  "CRC: MSS/TMB-H vs MSS/TMB-L" = crc_mssh_vs_mssl %>% filter(sig) %>% pull(Gene)
+)
+save_venn(crc_sets, "Overlap of bootstrap-stable DEGs in CRC", file.path(deg_plot_dir, "venn_CRC_significant_DEGs.svg"), "#56B4E9")
+
+combined_sets <- list(
+  "CRC\nMSS/TMB-H vs MSI-H" = crc_mssh_vs_msih %>% filter(sig) %>% pull(Gene),
+  "CRC\nMSS/TMB-H vs MSS/TMB-L" = crc_mssh_vs_mssl %>% filter(sig) %>% pull(Gene),
+  "UCEC\nMSS/TMB-H vs MSI-H" = ucec_mssh_vs_msih %>% filter(sig) %>% pull(Gene),
+  "UCEC\nMSS/TMB-H vs MSS/TMB-L" = ucec_mssh_vs_mssl %>% filter(sig) %>% pull(Gene)
+)
+save_venn(combined_sets, "Overlap of bootstrap-stable CRC and UCEC DEGs", file.path(deg_plot_dir, "venn_CRC_UCEC_significant_DEGs.svg"), "#CC79A7")
+```
+
+```{r}
+crc_mirna_counts <- build_validated_result_files(
+  dataset_name = "CRC_pre_miRNA",
+  original_dir = params$crc_mirna_primary_dir,
+  stability_file = params$crc_mirna_stability_file,
+  output_dir = stable_coad_mir_dir,
+  stable_only_dir = stable_coad_mir_only_dir,
+  id_column = "pre_miRNA",
+  stability_flag_column =
+    params$mirna_stability_flag_column
+)
+
+ucec_mirna_counts <- build_validated_result_files(
+  dataset_name = "UCEC_pre_miRNA",
+  original_dir = params$ucec_mirna_primary_dir,
+  stability_file = params$ucec_mirna_stability_file,
+  output_dir = stable_ucec_mir_dir,
+  stable_only_dir = stable_ucec_mir_only_dir,
+  id_column = "pre_miRNA",
+  stability_flag_column =
+    params$mirna_stability_flag_column
+)
+
+mirna_validation_counts <- bind_rows(
+  crc_mirna_counts,
+  ucec_mirna_counts
+)
+
+write.csv(
+  mirna_validation_counts,
+  file.path(
+    params$output_root,
+    "CRC_UCEC_pre_miRNA_bootstrap_validation_counts.csv"
+  ),
+  row.names = FALSE
+)
+
+knitr::kable(
+  mirna_validation_counts,
+  caption = "CRC and UCEC pre-miRNA bootstrap-validation counts."
+)
+```
+
+```{r}
+read_mir_de <- function(
+    file,
+    contrast_name,
+    dataset,
+    flip_logfc = FALSE
+) {
+  df <- read.csv(
+    file,
+    row.names = 1,
+    check.names = FALSE
+  ) %>%
+    rownames_to_column(
+      "pre_miRNA"
+    ) %>%
+    as_tibble()
+
+  required_columns <- c(
+    "logFC",
+    "FDR",
+    "bootstrap_assessed",
+    "bootstrap_stable"
+  )
+
+  missing_columns <- setdiff(
+    required_columns,
+    names(df)
+  )
+
+  if (length(missing_columns) > 0) {
+    stop(
+      "Missing columns in ",
+      file,
+      ": ",
+      paste(missing_columns, collapse = ", ")
+    )
+  }
+
+  df$bootstrap_assessed <- as_flag(
+    df$bootstrap_assessed
+  )
+  df$bootstrap_stable <- as_flag(
+    df$bootstrap_stable
+  )
+
+  if (flip_logfc) {
+    df$logFC <- -df$logFC
+  }
+
+  df %>%
+    mutate(
+      contrast = contrast_name,
+      dataset = dataset,
+      sig =
+        bootstrap_assessed &
+        bootstrap_stable &
+        !is.na(FDR) &
+        !is.na(logFC) &
+        FDR <= params$fdr_cutoff &
+        abs(logFC) >= params$logfc_cutoff,
+      direction = case_when(
+        sig & logFC > 0 ~
+          "Up in MSS/TMB-H",
+        sig & logFC < 0 ~
+          "Down in MSS/TMB-H",
+        TRUE ~
+          "Not significant"
+      ),
+      neglog10FDR =
+        -log10(
+          pmax(FDR, 1e-300)
+        )
+    )
+}
+
+coad_mssh_vs_msih <- read_mir_de(file.path(stable_coad_mir_dir, "MSI_H_vs_MSS_TMB_H.csv"), "MSS/TMB-H vs MSI-H", "COAD", TRUE)
+coad_mssh_vs_mssl <- read_mir_de(file.path(stable_coad_mir_dir, "MSS_TMB_H_vs_MSS_TMB_L.csv"), "MSS/TMB-H vs MSS/TMB-L", "COAD")
+ucec_mir_mssh_vs_msih <- read_mir_de(file.path(stable_ucec_mir_dir, "MSI_H_vs_MSS_TMB_H.csv"), "MSS/TMB-H vs MSI-H", "UCEC", TRUE)
+ucec_mir_mssh_vs_mssl <- read_mir_de(file.path(stable_ucec_mir_dir, "MSS_TMB_H_vs_MSS_TMB_L.csv"), "MSS/TMB-H vs MSS/TMB-L", "UCEC")
+
+plot_mir_volcano <- function(df, title, file, label_n = 10) {
+  labels <- df %>% filter(sig) %>% arrange(FDR, desc(abs(logFC))) %>% slice_head(n = label_n)
+  p <- ggplot(df, aes(logFC, neglog10FDR)) +
+    geom_point(aes(color = direction), alpha = 0.75, size = 1.6) +
+    geom_vline(xintercept = c(-params$logfc_cutoff, params$logfc_cutoff), linetype = "dashed", linewidth = 0.35) +
+    geom_hline(yintercept = -log10(params$fdr_cutoff), linetype = "dashed", linewidth = 0.35) +
+    geom_text_repel(data = labels, aes(label = pre_miRNA), size = 3, max.overlaps = Inf) +
+    scale_color_manual(values = c("Up in MSS/TMB-H" = "#D55E00", "Down in MSS/TMB-H" = "#0072B2", "Not significant" = "grey75")) +
+    labs(title = title, x = "log2 fold-change", y = expression(-log[10]("FDR")), color = NULL) +
+    theme_classic(base_size = 13) + theme(plot.title = element_text(face = "bold", hjust = 0.5), legend.position = "top")
+  ggsave(file, p, width = 6.5, height = 5.2, device = "svg")
+}
+
+plot_mir_volcano(coad_mssh_vs_msih, "COAD pre-miRNA: MSS/TMB-H vs MSI-H", file.path(mirna_plot_dir, "volcano_COAD_pre_miRNA_MSS_TMB_H_vs_MSI_H.svg"))
+plot_mir_volcano(coad_mssh_vs_mssl, "COAD pre-miRNA: MSS/TMB-H vs MSS/TMB-L", file.path(mirna_plot_dir, "volcano_COAD_pre_miRNA_MSS_TMB_H_vs_MSS_TMB_L.svg"))
+plot_mir_volcano(ucec_mir_mssh_vs_msih, "UCEC pre-miRNA: MSS/TMB-H vs MSI-H", file.path(mirna_plot_dir, "volcano_UCEC_pre_miRNA_MSS_TMB_H_vs_MSI_H.svg"))
+plot_mir_volcano(ucec_mir_mssh_vs_mssl, "UCEC pre-miRNA: MSS/TMB-H vs MSS/TMB-L", file.path(mirna_plot_dir, "volcano_UCEC_pre_miRNA_MSS_TMB_H_vs_MSS_TMB_L.svg"))
+
+sets_msih <- list(
+  "COAD\nMSS/TMB-H vs MSI-H" = coad_mssh_vs_msih %>% filter(sig) %>% pull(pre_miRNA),
+  "UCEC\nMSS/TMB-H vs MSI-H" = ucec_mir_mssh_vs_msih %>% filter(sig) %>% pull(pre_miRNA)
+)
+sets_mssl <- list(
+  "COAD\nMSS/TMB-H vs MSS/TMB-L" = coad_mssh_vs_mssl %>% filter(sig) %>% pull(pre_miRNA),
+  "UCEC\nMSS/TMB-H vs MSS/TMB-L" = ucec_mir_mssh_vs_mssl %>% filter(sig) %>% pull(pre_miRNA)
+)
+sets_all <- c(sets_msih, sets_mssl)
+
+save_venn(sets_msih, "Shared bootstrap-stable pre-miRNAs: MSS/TMB-H vs MSI-H", file.path(mirna_plot_dir, "venn_pre_miRNA_MSS_TMB_H_vs_MSI_H_COAD_UCEC.svg"), "#56B4E9")
+save_venn(sets_mssl, "Shared bootstrap-stable pre-miRNAs: MSS/TMB-H vs MSS/TMB-L", file.path(mirna_plot_dir, "venn_pre_miRNA_MSS_TMB_H_vs_MSS_TMB_L_COAD_UCEC.svg"), "#CC79A7")
+save_venn(sets_all, "Shared bootstrap-stable pre-miRNAs across cancers and contrasts", file.path(mirna_plot_dir, "venn_pre_miRNA_all_COAD_UCEC_contrasts.svg"), "#CC79A7")
+
+shared_msih_premir <- intersect(sets_msih[[1]], sets_msih[[2]])
+shared_mssl_premir <- intersect(sets_mssl[[1]], sets_mssl[[2]])
+write.csv(data.frame(pre_miRNA = shared_msih_premir), file.path(mirna_plot_dir, "shared_pre_miRNAs_MSS_TMB_H_vs_MSI_H_COAD_UCEC.csv"), row.names = FALSE)
+write.csv(data.frame(pre_miRNA = shared_mssl_premir), file.path(mirna_plot_dir, "shared_pre_miRNAs_MSS_TMB_H_vs_MSS_TMB_L_COAD_UCEC.csv"), row.names = FALSE)
+```
+
+```{r}
+all_premir_df <- bind_rows(coad_mssh_vs_msih, coad_mssh_vs_mssl, ucec_mir_mssh_vs_msih, ucec_mir_mssh_vs_mssl)
+premir_export <- all_premir_df %>%
+  select(
+    dataset,
+    contrast,
+    pre_miRNA,
+    logFC,
+    logCPM,
+    PValue,
+    FDR,
+    bootstrap_assessed,
+    bootstrap_stable,
+    sig,
+    direction
+  ) %>%
+  arrange(
+    dataset,
+    contrast,
+    FDR
+  )
+premir_sig_export <- premir_export %>% filter(sig)
+premir_summary <- premir_export %>% count(dataset, contrast, direction)
+shared_export <- dplyr::bind_rows(
+  data.frame(
+    comparison = rep("MSS/TMB-H vs MSI-H", length(shared_msih_premir)),
+    pre_miRNA = shared_msih_premir,
+    stringsAsFactors = FALSE
+  ),
+  data.frame(
+    comparison = rep("MSS/TMB-H vs MSS/TMB-L", length(shared_mssl_premir)),
+    pre_miRNA = shared_mssl_premir,
+    stringsAsFactors = FALSE
+  )
+)
+
+wb <- openxlsx::createWorkbook()
+for (nm in c("All_DE_results", "Significant_DE", "Summary_counts", "Shared_COAD_UCEC")) openxlsx::addWorksheet(wb, nm)
+openxlsx::writeData(wb, "All_DE_results", premir_export)
+openxlsx::writeData(wb, "Significant_DE", premir_sig_export)
+openxlsx::writeData(wb, "Summary_counts", premir_summary)
+openxlsx::writeData(wb, "Shared_COAD_UCEC", shared_export)
+openxlsx::saveWorkbook(wb, file.path(mirna_plot_dir, "pre_miRNA_DE_results_COAD_UCEC.xlsx"), overwrite = TRUE)
+```
+
+```{r}
+shared_premir <- unique(
+  c(
+    shared_msih_premir,
+    shared_mssl_premir
+  )
+)
+
+extract_model_expression <- function(
+    model_file,
+    clinical_file,
+    dataset_name,
+    selected_features
+) {
+  if (
+    !file.exists(model_file) ||
+    !file.exists(clinical_file)
+  ) {
+    warning(
+      dataset_name,
+      ": model or clinical file is missing."
+    )
+    return(tibble())
+  }
+
+  model <- readRDS(
+    model_file
+  )
+
+  if (
+    is.null(model$y) ||
+    is.null(model$y$counts)
+  ) {
+    warning(
+      dataset_name,
+      ": primary model does not contain a DGEList in model$y."
+    )
+    return(tibble())
+  }
+
+  clinical <- read.csv(
+    clinical_file,
+    row.names = 1,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+
+  logcpm <- edgeR::cpm(
+    model$y,
+    log = TRUE,
+    prior.count = 1
+  )
+
+  present_features <- intersect(
+    selected_features,
+    rownames(logcpm)
+  )
+
+  common_samples <- intersect(
+    colnames(logcpm),
+    rownames(clinical)
+  )
+
+  if (
+    length(present_features) == 0 ||
+    length(common_samples) == 0
+  ) {
+    return(tibble())
+  }
+
+  group_display <- dplyr::recode(
+    as.character(
+      clinical[
+        common_samples,
+        "MSI_TMB"
+      ]
+    ),
+    "MSI_H" = "MSI-H",
+    "MSS_TMB_H" = "MSS/TMB-H",
+    "MSS_TMB_L" = "MSS/TMB-L",
+    .default = as.character(
+      clinical[
+        common_samples,
+        "MSI_TMB"
+      ]
+    )
+  )
+
+  metadata <- tibble(
+    sample = common_samples,
+    dataset = dataset_name,
+    MSI_TMB = factor(
+      group_display,
+      levels = c(
+        "MSI-H",
+        "MSS/TMB-H",
+        "MSS/TMB-L"
+      )
+    )
+  )
+
+  as.data.frame(
+    t(
+      logcpm[
+        present_features,
+        common_samples,
+        drop = FALSE
+      ]
+    )
+  ) %>%
+    rownames_to_column(
+      "sample"
+    ) %>%
+    left_join(
+      metadata,
+      by = "sample"
+    ) %>%
+    pivot_longer(
+      cols = all_of(
+        present_features
+      ),
+      names_to = "pre_miRNA",
+      values_to = "logCPM"
+    )
+}
+
+mir_long <- bind_rows(
+  extract_model_expression(
+    model_file =
+      params$crc_mirna_model_file,
+    clinical_file =
+      params$crc_mirna_clinical_file,
+    dataset_name = "CRC",
+    selected_features =
+      shared_premir
+  ),
+  extract_model_expression(
+    model_file =
+      params$ucec_mirna_model_file,
+    clinical_file =
+      params$ucec_mirna_clinical_file,
+    dataset_name = "UCEC",
+    selected_features =
+      shared_premir
+  )
+)
+
+if (
+  length(shared_premir) == 0 ||
+  nrow(mir_long) == 0
+) {
+  save_placeholder_svg(
+    file.path(
+      mirna_plot_dir,
+      "shared_pre_miRNA_expression_boxplots_CRC_UCEC.svg"
+    ),
+    "Shared bootstrap-stable pre-miRNA expression"
+  )
+
+  save_placeholder_svg(
+    file.path(
+      mirna_plot_dir,
+      "shared_pre_miRNA_expression_barplots_CRC_UCEC.svg"
+    ),
+    "Shared bootstrap-stable pre-miRNA expression"
+  )
+} else {
+  p_box <- ggplot(
+    mir_long,
+    aes(
+      MSI_TMB,
+      logCPM,
+      fill = MSI_TMB
+    )
+  ) +
+    geom_boxplot(
+      outlier.shape = NA
+    ) +
+    geom_jitter(
+      width = 0.15,
+      alpha = 0.5,
+      size = 0.8
+    ) +
+    facet_grid(
+      dataset ~ pre_miRNA,
+      scales = "free_y"
+    ) +
+    scale_fill_manual(
+      values = c(
+        "MSI-H" = "#009E73",
+        "MSS/TMB-H" = "#D55E00",
+        "MSS/TMB-L" = "#0072B2"
+      )
+    ) +
+    labs(
+      title =
+        "Expression of shared bootstrap-stable pre-miRNAs in CRC and UCEC",
+      x = NULL,
+      y = "TMM-normalized logCPM"
+    ) +
+    theme_classic() +
+    theme(
+      axis.text.x =
+        element_text(
+          angle = 35,
+          hjust = 1
+        ),
+      legend.position =
+        "bottom"
+    )
+
+  ggsave(
+    file.path(
+      mirna_plot_dir,
+      "shared_pre_miRNA_expression_boxplots_CRC_UCEC.svg"
+    ),
+    p_box,
+    width = 14,
+    height = 6,
+    device = "svg"
+  )
+
+  mir_summary <- mir_long %>%
+    group_by(
+      dataset,
+      MSI_TMB,
+      pre_miRNA
+    ) %>%
+    summarise(
+      mean = mean(
+        logCPM,
+        na.rm = TRUE
+      ),
+      se = if (
+        sum(!is.na(logCPM)) > 1
+      ) {
+        sd(
+          logCPM,
+          na.rm = TRUE
+        ) /
+          sqrt(
+            sum(!is.na(logCPM))
+          )
+      } else {
+        0
+      },
+      .groups = "drop"
+    )
+
+  p_bar <- ggplot(
+    mir_summary,
+    aes(
+      MSI_TMB,
+      mean,
+      fill = MSI_TMB
+    )
+  ) +
+    geom_col() +
+    geom_errorbar(
+      aes(
+        ymin = mean - se,
+        ymax = mean + se
+      ),
+      width = 0.2
+    ) +
+    facet_grid(
+      dataset ~ pre_miRNA,
+      scales = "free_y"
+    ) +
+    scale_fill_manual(
+      values = c(
+        "MSI-H" = "#009E73",
+        "MSS/TMB-H" = "#D55E00",
+        "MSS/TMB-L" = "#0072B2"
+      )
+    ) +
+    labs(
+      title =
+        "Mean expression of shared bootstrap-stable pre-miRNAs",
+      x = NULL,
+      y =
+        "Mean TMM-normalized logCPM"
+    ) +
+    theme_classic() +
+    theme(
+      axis.text.x =
+        element_text(
+          angle = 35,
+          hjust = 1
+        ),
+      legend.position =
+        "bottom"
+    )
+
+  ggsave(
+    file.path(
+      mirna_plot_dir,
+      "shared_pre_miRNA_expression_barplots_CRC_UCEC.svg"
+    ),
+    p_bar,
+    width = 14,
+    height = 6,
+    device = "svg"
+  )
+}
+```
+
+```{r}
+premir_to_mature_base <- function(x) {
+  x %>% str_replace("^hsa-mir", "hsa-miR") %>% str_replace("^hsa-let", "hsa-let")
+}
+
+mir_query <- unique(c(
+  paste0(premir_to_mature_base(shared_mssl_premir), "-5p"),
+  paste0(premir_to_mature_base(shared_mssl_premir), "-3p")
+))
+mir_query <- mir_query[nzchar(mir_query)]
+
+mir_gene_raw <- tibble()
+if (params$run_multimir && length(mir_query) > 0 && requireNamespace("multiMiR", quietly = TRUE)) {
+  safe_get_multimir <- function(mir) {
+    tryCatch({
+      res <- multiMiR::get_multimir(mirna = mir, table = "validated", summary = TRUE)
+      if (is.null(res@data) || nrow(res@data) == 0) return(tibble())
+      as_tibble(res@data) %>% mutate(query_miRNA = mir)
+    }, error = function(e) {
+      warning("multiMiR failed for ", mir, ": ", conditionMessage(e))
+      tibble()
+    })
+  }
+  mir_gene_raw <- bind_rows(lapply(mir_query, safe_get_multimir))
+}
+
+if (nrow(mir_gene_raw) == 0) {
+  mir_gene_df <- tibble(
+    mature_mirna_id = character(),
+    target_symbol = character(),
+    database = character(),
+    pre_miRNA = character()
+  )
+} else {
+  mir_gene_df <- mir_gene_raw %>%
+    transmute(
+      mature_mirna_id,
+      target_symbol,
+      database,
+      pre_miRNA = mature_mirna_id %>%
+        str_remove("-5p$") %>% str_remove("-3p$") %>% str_replace("^hsa-miR", "hsa-mir")
+    ) %>% distinct()
+}
+
+write.csv(mir_gene_df, file.path(mirna_plot_dir, "pre_miRNA_gene_associations_validated.csv"), row.names = FALSE)
+
+stable_shared_mssl <- shared_mssl %>% filter(consistent) %>%
+  mutate(gene_direction = if_else(CRC > 0, "Up in MSS/TMB-H", "Down in MSS/TMB-H"))
+
+genes_supported_by_miRNA <- mir_gene_df %>%
+  inner_join(
+    stable_shared_mssl %>% select(target_symbol = Gene, gene_logFC_CRC = CRC, gene_logFC_UCEC = UCEC, gene_direction),
+    by = "target_symbol"
+  )
+
+wb_targets <- openxlsx::createWorkbook()
+openxlsx::addWorksheet(wb_targets, "All_associations")
+openxlsx::writeData(wb_targets, "All_associations", genes_supported_by_miRNA)
+openxlsx::addWorksheet(wb_targets, "Gene_summary")
+if (nrow(genes_supported_by_miRNA) > 0) {
+  gene_summary <- genes_supported_by_miRNA %>%
+    group_by(target_symbol, gene_logFC_CRC, gene_logFC_UCEC, gene_direction) %>%
+    summarise(
+      n_pre_miRNA = n_distinct(pre_miRNA),
+      pre_miRNAs = paste(sort(unique(pre_miRNA)), collapse = "; "),
+      mature_miRNAs = paste(sort(unique(mature_mirna_id)), collapse = "; "),
+      databases = paste(sort(unique(database)), collapse = "; "),
+      .groups = "drop"
+    )
+} else {
+  gene_summary <- tibble()
+}
+openxlsx::writeData(wb_targets, "Gene_summary", gene_summary)
+openxlsx::saveWorkbook(wb_targets, file.path(mirna_plot_dir, "pre_miRNA_supported_DE_genes.xlsx"), overwrite = TRUE)
+```
+
+```{r}
+mir_supported_up <- genes_supported_by_miRNA %>% filter(gene_direction == "Up in MSS/TMB-H") %>% pull(target_symbol) %>% unique()
+mir_supported_down <- genes_supported_by_miRNA %>% filter(gene_direction == "Down in MSS/TMB-H") %>% pull(target_symbol) %>% unique()
+
+mir_enrichment <- bind_rows(
+  extract_gost(safe_gost(mir_supported_up), "MSS/TMB-H vs MSS/TMB-L", "Up in MSS/TMB-H", 6),
+  extract_gost(safe_gost(mir_supported_down), "MSS/TMB-H vs MSS/TMB-L", "Down in MSS/TMB-H", 6)
+)
+write.csv(mir_enrichment, file.path(mirna_plot_dir, "GO_miRNA_supported_DE_genes_MSS_TMB_H_vs_MSS_TMB_L.csv"), row.names = FALSE)
+plot_enrichment(
+  mir_enrichment,
+  "Functional enrichment of miRNA-supported stable shared DE genes",
+  file.path(mirna_plot_dir, "GO_dotplot_miRNA_supported_DE_genes_MSS_TMB_H_vs_MSS_TMB_L.svg"),
+  direction_axis = TRUE
+)
+```
+
+```{r}
+plot_string_network <- function(string_db, mapped_df, title, score_min = 400) {
+  if (nrow(mapped_df) < 2) {
+    plot.new(); title(main = title, sub = "Not enough mapped proteins")
+    return(invisible(NULL))
+  }
+  edges <- tryCatch(string_db$get_interactions(mapped_df$STRING_id), error = function(e) NULL)
+  if (is.null(edges) || nrow(edges) == 0) {
+    plot.new(); title(main = title, sub = "No STRING interactions")
+    return(invisible(NULL))
+  }
+  edges <- edges[edges$combined_score >= score_min, , drop = FALSE]
+  vertices <- mapped_df %>% distinct(STRING_id, gene, logFC) %>%
+    mutate(
+      direction = if_else(logFC >= 0, "Up in MSS/TMB-H", "Down in MSS/TMB-H"),
+      logFC_bin = cut(abs(logFC), breaks = c(-Inf, 0.5, 1, 2, 3, Inf), labels = c("< 0.5", "0.5-1", "1-2", "2-3", ">= 3"))
+    )
+  keep_ids <- intersect(vertices$STRING_id, unique(c(edges$from, edges$to)))
+  vertices <- vertices %>% filter(STRING_id %in% keep_ids)
+  edges <- edges %>% filter(from %in% keep_ids, to %in% keep_ids)
+  if (nrow(vertices) < 2 || nrow(edges) == 0) {
+    plot.new(); title(main = title, sub = "Network collapsed after filtering")
+    return(invisible(NULL))
+  }
+
+  graph <- igraph::graph_from_data_frame(
+    edges %>% select(from, to),
+    directed = FALSE,
+    vertices = vertices %>% transmute(name = STRING_id, gene, direction, logFC_bin)
+  )
+  p <- ggraph::ggraph(graph, layout = "fr") +
+    ggraph::geom_edge_link(alpha = 0.25, colour = "grey70") +
+    ggraph::geom_node_point(aes(size = logFC_bin, fill = direction), shape = 21, colour = "black") +
+    ggraph::geom_node_text(aes(label = gene), repel = TRUE, size = 3.2, fontface = "bold") +
+    scale_fill_manual(values = c("Up in MSS/TMB-H" = "#ff8f8f", "Down in MSS/TMB-H" = "#74aeff")) +
+    scale_size_manual(values = c("< 0.5" = 3.5, "0.5-1" = 6, "1-2" = 9, "2-3" = 12, ">= 3" = 15)) +
+    labs(title = title, fill = "Direction", size = "|logFC|") +
+    theme_void() + theme(plot.title = element_text(hjust = 0.5, face = "bold"), legend.position = "bottom")
+  print(p)
+}
+```
+
+```{r}
+contrast <- "MSS_TMB_H_vs_MSS_TMB_L"
+selected_pathways <- c(
+  "HALLMARK_KRAS_SIGNALING_DN",
+  "HALLMARK_MTORC1_SIGNALING",
+  "HALLMARK_G2M_CHECKPOINT",
+  "HALLMARK_E2F_TARGETS"
+)
+
+string_all_pdf <- file.path(string_out_dir, paste0("all_", contrast, ".pdf"))
+string_by_path_pdf <- file.path(string_out_dir, paste0("by_pathway_", contrast, ".pdf"))
+
+if (!params$run_stringdb || !all(vapply(c("STRINGdb", "igraph", "ggraph"), requireNamespace, logical(1), quietly = TRUE))) {
+  save_placeholder_pdf(string_all_pdf, "STRING network", "STRING analysis disabled or packages missing")
+  save_placeholder_pdf(string_by_path_pdf, "STRING networks by pathway", "STRING analysis disabled or packages missing")
+} else {
+  dge <- read.csv(file.path(stable_crc_de_dir, paste0(contrast, ".csv")), row.names = 1, check.names = FALSE) %>%
+    rownames_to_column("gene") %>%
+    filter(bootstrap_stable, FDR < params$fdr_cutoff)
+
+  hallmark <- msigdbr::msigdbr(species = "Homo sapiens", collection = "H") %>%
+    filter(gs_name %in% selected_pathways) %>%
+    select(gs_name, gene_symbol)
+  selected <- inner_join(dge, hallmark, by = c("gene" = "gene_symbol"))
+
+  string_db <- tryCatch(
+    STRINGdb::STRINGdb$new(version = "11.5", species = 9606, score_threshold = 400),
+    error = function(e) NULL
+  )
+
+  if (is.null(string_db) || nrow(selected) == 0) {
+    save_placeholder_pdf(string_all_pdf, "STRING network", "No stable selected genes or STRING initialization failed")
+    save_placeholder_pdf(string_by_path_pdf, "STRING networks by pathway", "No stable selected genes or STRING initialization failed")
+  } else {
+    mapped <- tryCatch(
+      string_db$map(selected, "gene", removeUnmappedRows = TRUE),
+      error = function(e) data.frame()
+    )
+
+    grDevices::pdf(string_all_pdf, width = 16, height = 12)
+    plot_string_network(string_db, mapped, sprintf("STRING network: %s (n=%d proteins)", contrast, nrow(mapped)))
+    grDevices::dev.off()
+
+    grDevices::pdf(string_by_path_pdf, width = 8, height = 6)
+    for (pw in selected_pathways) {
+      sub <- mapped[mapped$gs_name == pw, , drop = FALSE]
+      plot_string_network(string_db, sub, sprintf("%s (n=%d proteins)", pw, nrow(sub)))
+    }
+    grDevices::dev.off()
+  }
+}
+```
+
+```{r}
+output_manifest <- list.files(params$output_root, recursive = TRUE, full.names = TRUE)
+writeLines(output_manifest, file.path(params$output_root, "output_manifest.txt"))
+cat(paste(output_manifest, collapse = "\n"))
+```
+
+```{r}
+sessionInfo()
+```

@@ -1,0 +1,700 @@
+```{r}
+required_packages <- c(
+  "dplyr",
+  "tibble",
+  "ggplot2",
+  "ggrepel",
+  "patchwork",
+  "svglite",
+  "openxlsx",
+  "knitr"
+)
+
+missing_packages <- required_packages[
+  !vapply(
+    required_packages,
+    requireNamespace,
+    logical(1),
+    quietly = TRUE
+  )
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing required packages: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(svglite)
+library(openxlsx)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 7,
+  fig.height = 5.5
+)
+```
+
+```{r}
+params <- list(
+  project_root = "combined_paper",
+
+  
+  crc_de_dir = file.path(
+    "data", "DE_results", "pre_miRNA", "bootstrap_stability",
+    "CRC", "primary_DE"
+  ),
+
+  ucec_de_dir = file.path(
+    "data", "DE_results", "pre_miRNA", "bootstrap_stability",
+    "UCEC", "primary_DE"
+  ),
+
+  
+  crc_stability_file = file.path(
+    "data", "DE_results", "pre_miRNA", "bootstrap_stability",
+    "CRC", "stability_analysis",
+    "combined_primary_bootstrap_LOO_pre_miRNA_stability.csv"
+  ),
+
+  ucec_stability_file = file.path(
+    "data", "DE_results", "pre_miRNA", "bootstrap_stability",
+    "UCEC", "stability_analysis",
+    "combined_primary_bootstrap_LOO_pre_miRNA_stability.csv"
+  ),
+
+  
+  stability_flag_column = "bootstrap_stable",
+
+  
+  fdr_cutoff = 0.05,
+
+  
+  label_n = 12L,
+
+  output_root = file.path(
+    "bootstrap_validated_downstream_analysis",
+    "pre_miRNA_volcano_bootstrap_status"
+  )
+)
+
+relative_paths <- c(
+  "crc_de_dir",
+  "ucec_de_dir",
+  "crc_stability_file",
+  "ucec_stability_file",
+  "output_root"
+)
+
+for (x in relative_paths) {
+  params[[x]] <- file.path(params$project_root, params[[x]])
+}
+
+plot_dir <- file.path(params$output_root, "plots")
+table_dir <- file.path(params$output_root, "tables")
+
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r}
+status_levels <- c(
+  "Up in MSS/TMB-H",
+  "Down in MSS/TMB-H",
+  "FDR significant, not bootstrap-stable",
+  "Not significant"
+)
+
+status_colors <- c(
+  "Up in MSS/TMB-H" = "#D55E00",
+  "Down in MSS/TMB-H" = "#0072B2",
+  "FDR significant, not bootstrap-stable" = "grey45",
+  "Not significant" = "grey85"
+)
+```
+
+```{r}
+as_flag <- function(x) {
+  if (is.logical(x)) {
+    return(replace(x, is.na(x), FALSE))
+  }
+
+  if (is.numeric(x)) {
+    return(!is.na(x) & x != 0)
+  }
+
+  tolower(trimws(as.character(x))) %in%
+    c("true", "t", "1", "yes", "y")
+}
+
+check_file <- function(file, description) {
+  if (!file.exists(file)) {
+    stop(description, " not found:\n", file)
+  }
+}
+
+read_feature_table <- function(file, feature_name = "pre_miRNA") {
+  check_file(file, "Input table")
+
+  x <- read.csv(
+    file,
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  )
+
+  candidates <- c(
+    feature_name,
+    "pre_miRNA",
+    "pre_mirna",
+    "miRNA",
+    "mirna",
+    "Gene",
+    "gene",
+    "X",
+    "...1"
+  )
+
+  found <- candidates[candidates %in% names(x)]
+
+  if (length(found) > 0) {
+    names(x)[names(x) == found[1]] <- feature_name
+  } else {
+    if (ncol(x) < 2) {
+      stop("Could not identify the pre-miRNA column in: ", file)
+    }
+    names(x)[1] <- feature_name
+  }
+
+  x[[feature_name]] <- trimws(as.character(x[[feature_name]]))
+
+  x <- x[
+    !is.na(x[[feature_name]]) & nzchar(x[[feature_name]]),
+    ,
+    drop = FALSE
+  ]
+
+  tibble::as_tibble(x)
+}
+
+read_stability_table <- function(file, dataset_name) {
+  tab <- read_feature_table(file, "pre_miRNA")
+
+  contrast_candidates <- c(
+    "Contrast", "contrast", "Comparison", "comparison"
+  )
+
+  contrast_column <- contrast_candidates[
+    contrast_candidates %in% names(tab)
+  ]
+
+  if (length(contrast_column) == 0) {
+    stop(
+      dataset_name,
+      " stability table has no contrast column: ",
+      file
+    )
+  }
+
+  names(tab)[names(tab) == contrast_column[1]] <- "Contrast"
+
+  required_columns <- c(
+    "Contrast",
+    "pre_miRNA",
+    params$stability_flag_column
+  )
+
+  missing_columns <- setdiff(required_columns, names(tab))
+
+  if (length(missing_columns) > 0) {
+    stop(
+      dataset_name,
+      " stability table is missing columns: ",
+      paste(missing_columns, collapse = ", ")
+    )
+  }
+
+  tab %>%
+    dplyr::transmute(
+      Contrast = as.character(Contrast),
+      pre_miRNA = as.character(pre_miRNA),
+      bootstrap_stable = as_flag(
+        .data[[params$stability_flag_column]]
+      )
+    ) %>%
+    dplyr::distinct(
+      Contrast,
+      pre_miRNA,
+      .keep_all = TRUE
+    )
+}
+
+read_primary_de <- function(
+    de_dir,
+    stability_table,
+    dataset_name,
+    source_contrast,
+    display_contrast,
+    flip_logfc = FALSE
+) {
+  de_file <- file.path(
+    de_dir,
+    paste0(source_contrast, ".csv")
+  )
+
+  df <- read_feature_table(
+    de_file,
+    feature_name = "pre_miRNA"
+  )
+
+  required_de_columns <- c(
+    "pre_miRNA",
+    "logFC",
+    "FDR"
+  )
+
+  missing_de_columns <- setdiff(
+    required_de_columns,
+    names(df)
+  )
+
+  if (length(missing_de_columns) > 0) {
+    stop(
+      dataset_name,
+      " DE file ",
+      basename(de_file),
+      " is missing columns: ",
+      paste(missing_de_columns, collapse = ", ")
+    )
+  }
+
+  df <- df %>%
+    dplyr::mutate(
+      pre_miRNA = as.character(pre_miRNA),
+      logFC = as.numeric(logFC),
+      FDR = as.numeric(FDR)
+    )
+
+  if (flip_logfc) {
+    df <- df %>%
+      dplyr::mutate(logFC = -logFC)
+  }
+
+  stability_for_contrast <- stability_table %>%
+    dplyr::filter(
+      Contrast == source_contrast
+    ) %>%
+    dplyr::select(
+      pre_miRNA,
+      bootstrap_stable
+    )
+
+  if (nrow(stability_for_contrast) == 0) {
+    stop(
+      dataset_name,
+      ": no stability records found for contrast ",
+      source_contrast,
+      "."
+    )
+  }
+
+  df %>%
+    dplyr::left_join(
+      stability_for_contrast,
+      by = "pre_miRNA"
+    ) %>%
+    dplyr::mutate(
+      
+      fdr_significant =
+        !is.na(FDR) &
+        FDR <= params$fdr_cutoff,
+
+      bootstrap_stable = dplyr::coalesce(
+        bootstrap_stable,
+        FALSE
+      ),
+
+      stable_significant =
+        fdr_significant & bootstrap_stable,
+
+      status = dplyr::case_when(
+        stable_significant & logFC > 0 ~
+          "Up in MSS/TMB-H",
+
+        stable_significant & logFC < 0 ~
+          "Down in MSS/TMB-H",
+
+        fdr_significant & !bootstrap_stable ~
+          "FDR significant, not bootstrap-stable",
+
+        TRUE ~
+          "Not significant"
+      ),
+
+      status = factor(
+        status,
+        levels = status_levels
+      ),
+
+      neglog10FDR = -log10(
+        pmax(FDR, 1e-300)
+      ),
+
+      dataset = dataset_name,
+      source_contrast = source_contrast,
+      contrast = display_contrast
+    )
+}
+```
+
+```{r}
+crc_stability <- read_stability_table(
+  file = params$crc_stability_file,
+  dataset_name = "CRC"
+)
+
+ucec_stability <- read_stability_table(
+  file = params$ucec_stability_file,
+  dataset_name = "UCEC"
+)
+
+cat("CRC stability contrasts:\n")
+print(sort(unique(crc_stability$Contrast)))
+
+cat("\nUCEC stability contrasts:\n")
+print(sort(unique(ucec_stability$Contrast)))
+```
+
+```{r}
+crc_mssh_vs_msih <- read_primary_de(
+  de_dir = params$crc_de_dir,
+  stability_table = crc_stability,
+  dataset_name = "CRC",
+  source_contrast = "MSI_H_vs_MSS_TMB_H",
+  display_contrast = "MSS/TMB-H vs MSI-H",
+  flip_logfc = TRUE
+)
+
+crc_mssh_vs_mssl <- read_primary_de(
+  de_dir = params$crc_de_dir,
+  stability_table = crc_stability,
+  dataset_name = "CRC",
+  source_contrast = "MSS_TMB_H_vs_MSS_TMB_L",
+  display_contrast = "MSS/TMB-H vs MSS/TMB-L",
+  flip_logfc = FALSE
+)
+
+ucec_mssh_vs_msih <- read_primary_de(
+  de_dir = params$ucec_de_dir,
+  stability_table = ucec_stability,
+  dataset_name = "UCEC",
+  source_contrast = "MSI_H_vs_MSS_TMB_H",
+  display_contrast = "MSS/TMB-H vs MSI-H",
+  flip_logfc = TRUE
+)
+
+ucec_mssh_vs_mssl <- read_primary_de(
+  de_dir = params$ucec_de_dir,
+  stability_table = ucec_stability,
+  dataset_name = "UCEC",
+  source_contrast = "MSS_TMB_H_vs_MSS_TMB_L",
+  display_contrast = "MSS/TMB-H vs MSS/TMB-L",
+  flip_logfc = FALSE
+)
+
+all_deg <- dplyr::bind_rows(
+  crc_mssh_vs_msih,
+  crc_mssh_vs_mssl,
+  ucec_mssh_vs_msih,
+  ucec_mssh_vs_mssl
+)
+```
+
+```{r}
+classification_summary <- all_deg %>%
+  dplyr::count(
+    dataset,
+    contrast,
+    status,
+    .drop = FALSE,
+    name = "n_pre_miRNAs"
+  ) %>%
+  dplyr::arrange(
+    dataset,
+    contrast,
+    status
+  )
+
+classification_summary
+
+write.csv(
+  classification_summary,
+  file.path(
+    table_dir,
+    "volcano_pre_miRNA_classification_counts.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+```{r}
+plot_volcano_stability <- function(
+    df,
+    title,
+    output_stub,
+    label_n = params$label_n
+) {
+  label_df <- df %>%
+    dplyr::filter(stable_significant) %>%
+    dplyr::arrange(
+      FDR,
+      dplyr::desc(abs(logFC))
+    ) %>%
+    dplyr::slice_head(n = label_n)
+
+  
+  
+  nonsig_df <- df %>%
+    dplyr::filter(status == "Not significant")
+
+  unstable_df <- df %>%
+    dplyr::filter(
+      status == "FDR significant, not bootstrap-stable"
+    )
+
+  stable_df <- df %>%
+    dplyr::filter(stable_significant)
+
+  p <- ggplot2::ggplot(
+    df,
+    ggplot2::aes(
+      x = logFC,
+      y = neglog10FDR
+    )
+  ) +
+    ggplot2::geom_point(
+      data = nonsig_df,
+      ggplot2::aes(color = status),
+      alpha = 0.55,
+      size = 1.35
+    ) +
+    ggplot2::geom_point(
+      data = unstable_df,
+      ggplot2::aes(color = status),
+      alpha = 0.75,
+      size = 1.45
+    ) +
+    ggplot2::geom_point(
+      data = stable_df,
+      ggplot2::aes(color = status),
+      alpha = 0.85,
+      size = 1.55
+    ) +
+    ggplot2::geom_hline(
+      yintercept = -log10(params$fdr_cutoff),
+      linetype = "dashed",
+      linewidth = 0.35,
+      color = "black"
+    ) +
+    ggrepel::geom_text_repel(
+      data = label_df,
+      ggplot2::aes(label = pre_miRNA),
+      size = 3,
+      max.overlaps = Inf,
+      box.padding = 0.35,
+      point.padding = 0.20,
+      min.segment.length = 0,
+      seed = 20260810
+    ) +
+    ggplot2::scale_color_manual(
+      values = status_colors,
+      breaks = status_levels,
+      limits = status_levels,
+      drop = FALSE,
+      name = NULL
+    ) +
+    ggplot2::labs(
+      title = title,
+      x = expression(log[2] * " fold-change"),
+      y = expression(-log[10]("FDR"))
+    ) +
+    ggplot2::theme_classic(base_size = 13) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(
+        face = "bold",
+        hjust = 0.5
+      ),
+      legend.position = "top",
+      legend.text = ggplot2::element_text(size = 9)
+    )
+
+  svg_file <- file.path(
+    plot_dir,
+    paste0(output_stub, ".svg")
+  )
+
+  pdf_file <- file.path(
+    plot_dir,
+    paste0(output_stub, ".pdf")
+  )
+
+  ggplot2::ggsave(
+    filename = svg_file,
+    plot = p,
+    width = 7.2,
+    height = 5.6,
+    device = "svg"
+  )
+
+  ggplot2::ggsave(
+    filename = pdf_file,
+    plot = p,
+    width = 7.2,
+    height = 5.6,
+    device = grDevices::cairo_pdf
+  )
+
+  p
+}
+```
+
+```{r}
+p_crc_msih <- plot_volcano_stability(
+  df = crc_mssh_vs_msih,
+  title = "CRC: MSS/TMB-H vs MSI-H",
+  output_stub =
+    "volcano_pre_miRNA_CRC_MSS_TMB_H_vs_MSI_H_bootstrap_status"
+)
+
+p_crc_mssl <- plot_volcano_stability(
+  df = crc_mssh_vs_mssl,
+  title = "CRC: MSS/TMB-H vs MSS/TMB-L",
+  output_stub =
+    "volcano_pre_miRNA_CRC_MSS_TMB_H_vs_MSS_TMB_L_bootstrap_status"
+)
+
+crc_combined <- (
+  p_crc_msih + p_crc_mssl
+) +
+  patchwork::plot_layout(guides = "collect") &
+  ggplot2::theme(legend.position = "top")
+
+crc_combined
+```
+
+```{r}
+p_ucec_msih <- plot_volcano_stability(
+  df = ucec_mssh_vs_msih,
+  title = "UCEC: MSS/TMB-H vs MSI-H",
+  output_stub =
+    "volcano_pre_miRNA_UCEC_MSS_TMB_H_vs_MSI_H_bootstrap_status"
+)
+
+p_ucec_mssl <- plot_volcano_stability(
+  df = ucec_mssh_vs_mssl,
+  title = "UCEC: MSS/TMB-H vs MSS/TMB-L",
+  output_stub =
+    "volcano_pre_miRNA_UCEC_MSS_TMB_H_vs_MSS_TMB_L_bootstrap_status"
+)
+
+ucec_combined <- (
+  p_ucec_msih + p_ucec_mssl
+) +
+  patchwork::plot_layout(guides = "collect") &
+  ggplot2::theme(legend.position = "top")
+
+ucec_combined
+```
+
+```{r}
+combined_volcano <- patchwork::wrap_plots(
+  p_crc_msih,
+  p_crc_mssl,
+  p_ucec_msih,
+  p_ucec_mssl,
+  ncol = 2,
+  guides = "collect"
+) +
+  patchwork::plot_annotation(tag_levels = "A") &
+  ggplot2::theme(
+    legend.position = "top",
+    plot.tag = ggplot2::element_text(
+      face = "bold",
+      size = 14
+    )
+  )
+
+combined_volcano
+
+ggplot2::ggsave(
+  filename = file.path(
+    plot_dir,
+    "volcano_pre_miRNA_CRC_UCEC_all_comparisons_bootstrap_status.svg"
+  ),
+  plot = combined_volcano,
+  width = 14.4,
+  height = 11,
+  device = "svg"
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    plot_dir,
+    "volcano_pre_miRNA_CRC_UCEC_all_comparisons_bootstrap_status.pdf"
+  ),
+  plot = combined_volcano,
+  width = 14.4,
+  height = 11,
+  device = grDevices::cairo_pdf
+)
+```
+
+```{r}
+write.csv(
+  all_deg,
+  file.path(
+    table_dir,
+    "pre_miRNA_volcano_all_results_with_bootstrap_status.csv"
+  ),
+  row.names = FALSE
+)
+
+stable_pre_mirna <- all_deg %>%
+  dplyr::filter(stable_significant)
+
+write.csv(
+  stable_pre_mirna,
+  file.path(
+    table_dir,
+    "pre_miRNA_volcano_bootstrap_stable_significant.csv"
+  ),
+  row.names = FALSE
+)
+
+wb <- openxlsx::createWorkbook()
+
+openxlsx::addWorksheet(wb, "classification_counts")
+openxlsx::writeData(wb, "classification_counts", classification_summary)
+
+openxlsx::addWorksheet(wb, "all_results")
+openxlsx::writeData(wb, "all_results", all_deg)
+
+openxlsx::addWorksheet(wb, "stable_significant")
+openxlsx::writeData(wb, "stable_significant", stable_pre_mirna)
+
+openxlsx::saveWorkbook(
+  wb,
+  file.path(
+    table_dir,
+    "CRC_UCEC_pre_miRNA_volcano_bootstrap_status.xlsx"
+  ),
+  overwrite = TRUE
+)
+```

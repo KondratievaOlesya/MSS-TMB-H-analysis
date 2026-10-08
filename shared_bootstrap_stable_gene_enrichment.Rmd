@@ -1,0 +1,1542 @@
+```{r}
+params <- list(
+  
+  original_crc_de_dir =
+    "data/DE_results",
+
+  original_ucec_de_dir =
+    "data/DE_results/ucec_gene_DE",
+
+  
+  crc_mrna_stability_file =
+    "data/DE_results/stability_analysis/combined_primary_bootstrap_LOO_stability.csv",
+
+  ucec_mrna_stability_file =
+    "data/DE_results/ucec_gene_DE/stability_analysis/combined_primary_bootstrap_LOO_stability.csv",
+
+  stability_flag_column =
+    "bootstrap_robust_effect",
+
+  
+  output_root =
+    "bootstrap_validated_downstream_analysis/results/shared_stable_gene_enrichment",
+
+  
+  fdr_cutoff = 0.05,
+  logfc_cutoff = 1,
+
+  
+  minimum_query_size = 3L,
+
+  
+  run_gprofiler = TRUE,
+  organism = "hsapiens",
+
+  
+  domain_scope = "custom_annotated",
+
+  
+  enrichment_sources = c(
+    "GO:BP",
+    "GO:MF",
+    "GO:CC",
+    "REAC",
+    "KEGG",
+    "WP",
+    "CORUM",
+    "HPA",
+    "HP",
+    "MIRNA",
+    "TF"
+  ),
+
+  
+  top_terms_per_query = 30L,
+  exploratory_top_terms_per_query = 20L
+)
+
+required_packages <- c(
+  "dplyr",
+  "tidyr",
+  "tibble",
+  "stringr",
+  "ggplot2",
+  "ggrepel",
+  "ggVennDiagram",
+  "gprofiler2",
+  "openxlsx",
+  "svglite",
+  "knitr"
+)
+
+missing_packages <- required_packages[
+  !vapply(
+    required_packages,
+    requireNamespace,
+    logical(1),
+    quietly = TRUE
+  )
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing required R packages: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(ggplot2)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 10,
+  fig.height = 7
+)
+
+dir.create(
+  params$output_root,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+contrast_config <- tibble::tribble(
+  ~Contrast, ~Comparison_label, ~Flip_logFC,
+  "MSI_H_vs_MSS_TMB_H", "MSS/TMB-H vs MSI-H", TRUE,
+  "MSS_TMB_H_vs_MSS_TMB_L", "MSS/TMB-H vs MSS/TMB-L", FALSE
+)
+
+as_flag <- function(x) {
+  if (is.logical(x)) {
+    return(replace(x, is.na(x), FALSE))
+  }
+
+  if (is.numeric(x)) {
+    return(!is.na(x) & x != 0)
+  }
+
+  tolower(trimws(as.character(x))) %in%
+    c("true", "t", "1", "yes", "y")
+}
+```
+
+```{r}
+save_placeholder_svg <- function(
+    file,
+    title,
+    detail = "No results available"
+) {
+  p <- ggplot2::ggplot() +
+    ggplot2::annotate(
+      "text",
+      x = 0,
+      y = 0.15,
+      label = title,
+      fontface = "bold",
+      size = 5
+    ) +
+    ggplot2::annotate(
+      "text",
+      x = 0,
+      y = -0.10,
+      label = detail,
+      size = 4
+    ) +
+    ggplot2::xlim(-1, 1) +
+    ggplot2::ylim(-1, 1) +
+    ggplot2::theme_void()
+
+  ggplot2::ggsave(
+    file,
+    p,
+    width = 8,
+    height = 5,
+    device = "svg"
+  )
+
+  invisible(p)
+}
+```
+
+```{r}
+read_original_de <- function(
+    file,
+    contrast_name,
+    dataset_name,
+    flip_logfc = FALSE
+) {
+  if (!file.exists(file)) {
+    stop(
+      "Missing original DEG file: ",
+      file
+    )
+  }
+
+  tab <- read.csv(
+    file,
+    row.names = 1,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  ) %>%
+    tibble::rownames_to_column("Gene") %>%
+    tibble::as_tibble()
+
+  required_columns <- c(
+    "Gene",
+    "logFC",
+    "FDR"
+  )
+
+  missing_columns <- setdiff(
+    required_columns,
+    names(tab)
+  )
+
+  if (length(missing_columns) > 0) {
+    stop(
+      "Missing columns in ",
+      file,
+      ": ",
+      paste(missing_columns, collapse = ", ")
+    )
+  }
+
+  tab <- tab %>%
+    dplyr::mutate(
+      Gene = trimws(as.character(Gene)),
+      logFC = as.numeric(logFC),
+      FDR = as.numeric(FDR)
+    )
+
+  if (flip_logfc) {
+    tab$logFC <- -tab$logFC
+  }
+
+  if (anyDuplicated(tab$Gene)) {
+    warning(
+      dataset_name,
+      " ",
+      contrast_name,
+      ": duplicated genes were found. ",
+      "The row with the smallest FDR is retained."
+    )
+
+    tab <- tab %>%
+      dplyr::arrange(FDR) %>%
+      dplyr::distinct(Gene, .keep_all = TRUE)
+  }
+
+  tab %>%
+    dplyr::mutate(
+      Dataset = dataset_name,
+      Contrast = contrast_name,
+      .before = 1
+    )
+}
+```
+
+```{r}
+read_stability_table <- function(
+    file,
+    dataset_name
+) {
+  if (!file.exists(file)) {
+    stop(
+      "Missing bootstrap stability file: ",
+      file
+    )
+  }
+
+  tab <- read.csv(
+    file,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+
+  required_columns <- c(
+    "Contrast",
+    "Gene",
+    params$stability_flag_column
+  )
+
+  missing_columns <- setdiff(
+    required_columns,
+    names(tab)
+  )
+
+  if (length(missing_columns) > 0) {
+    stop(
+      dataset_name,
+      " stability table is missing columns: ",
+      paste(missing_columns, collapse = ", "),
+      "\nAvailable columns: ",
+      paste(names(tab), collapse = ", ")
+    )
+  }
+
+  tab %>%
+    dplyr::transmute(
+      Dataset = dataset_name,
+      Contrast = trimws(as.character(Contrast)),
+      Gene = trimws(as.character(Gene)),
+      bootstrap_stable = as_flag(
+        .data[[params$stability_flag_column]]
+      )
+    ) %>%
+    dplyr::filter(
+      !is.na(Contrast),
+      Contrast != "",
+      !is.na(Gene),
+      Gene != ""
+    ) %>%
+    dplyr::group_by(
+      Dataset,
+      Contrast,
+      Gene
+    ) %>%
+    dplyr::summarise(
+      bootstrap_stable = any(
+        bootstrap_stable,
+        na.rm = TRUE
+      ),
+      .groups = "drop"
+    )
+}
+```
+
+```{r}
+build_validated_de <- function(
+    original_table,
+    stability_table
+) {
+  original_table %>%
+    dplyr::left_join(
+      stability_table %>%
+        dplyr::select(
+          Contrast,
+          Gene,
+          bootstrap_stable
+        ),
+      by = c(
+        "Contrast",
+        "Gene"
+      )
+    ) %>%
+    dplyr::mutate(
+      stability_record_found =
+        !is.na(bootstrap_stable),
+
+      bootstrap_stable =
+        dplyr::coalesce(
+          bootstrap_stable,
+          FALSE
+        ),
+
+      original_significant =
+        !is.na(FDR) &
+        !is.na(logFC) &
+        FDR <= params$fdr_cutoff &
+        abs(logFC) >= params$logfc_cutoff,
+
+      sig =
+        original_significant &
+        bootstrap_stable,
+
+      Direction = dplyr::case_when(
+        sig & logFC > 0 ~
+          "Up in MSS/TMB-H",
+
+        sig & logFC < 0 ~
+          "Down in MSS/TMB-H",
+
+        TRUE ~
+          "Not selected"
+      )
+    )
+}
+```
+
+```{r}
+crc_stability <- read_stability_table(
+  params$crc_mrna_stability_file,
+  "CRC"
+)
+
+ucec_stability <- read_stability_table(
+  params$ucec_mrna_stability_file,
+  "UCEC"
+)
+
+analysis_objects <- list()
+
+for (i in seq_len(nrow(contrast_config))) {
+  contrast_name <- contrast_config$Contrast[i]
+  comparison_label <- contrast_config$Comparison_label[i]
+  flip_logfc <- contrast_config$Flip_logFC[i]
+
+  crc_original <- read_original_de(
+    file.path(
+      params$original_crc_de_dir,
+      paste0(contrast_name, ".csv")
+    ),
+    contrast_name = contrast_name,
+    dataset_name = "CRC",
+    flip_logfc = flip_logfc
+  )
+
+  ucec_original <- read_original_de(
+    file.path(
+      params$original_ucec_de_dir,
+      paste0(contrast_name, ".csv")
+    ),
+    contrast_name = contrast_name,
+    dataset_name = "UCEC",
+    flip_logfc = flip_logfc
+  )
+
+  crc_validated <- build_validated_de(
+    crc_original,
+    crc_stability %>%
+      dplyr::filter(
+        Contrast == contrast_name
+      )
+  )
+
+  ucec_validated <- build_validated_de(
+    ucec_original,
+    ucec_stability %>%
+      dplyr::filter(
+        Contrast == contrast_name
+      )
+  )
+
+  
+  
+  tested_background <- intersect(
+    crc_original$Gene,
+    ucec_original$Gene
+  ) %>%
+    unique() %>%
+    sort()
+
+  shared_table <- dplyr::inner_join(
+    crc_validated %>%
+      dplyr::filter(sig) %>%
+      dplyr::select(
+        Gene,
+        CRC_logFC = logFC,
+        CRC_FDR = FDR,
+        CRC_bootstrap_stable =
+          bootstrap_stable
+      ),
+    ucec_validated %>%
+      dplyr::filter(sig) %>%
+      dplyr::select(
+        Gene,
+        UCEC_logFC = logFC,
+        UCEC_FDR = FDR,
+        UCEC_bootstrap_stable =
+          bootstrap_stable
+      ),
+    by = "Gene"
+  ) %>%
+    dplyr::mutate(
+      Direction_consistent =
+        sign(CRC_logFC) ==
+        sign(UCEC_logFC),
+
+      Direction = dplyr::case_when(
+        Direction_consistent &
+          CRC_logFC > 0 ~
+          "Up in MSS/TMB-H",
+
+        Direction_consistent &
+          CRC_logFC < 0 ~
+          "Down in MSS/TMB-H",
+
+        TRUE ~
+          "Opposite directions"
+      )
+    ) %>%
+    dplyr::arrange(
+      dplyr::desc(Direction_consistent),
+      pmax(CRC_FDR, UCEC_FDR)
+    )
+
+  consistent_shared <- shared_table %>%
+    dplyr::filter(
+      Direction_consistent
+    )
+
+  queries <- list(
+    All_direction_consistent =
+      consistent_shared$Gene,
+
+    Up_in_MSS_TMB_H =
+      consistent_shared %>%
+      dplyr::filter(
+        Direction ==
+          "Up in MSS/TMB-H"
+      ) %>%
+      dplyr::pull(Gene),
+
+    Down_in_MSS_TMB_H =
+      consistent_shared %>%
+      dplyr::filter(
+        Direction ==
+          "Down in MSS/TMB-H"
+      ) %>%
+      dplyr::pull(Gene)
+  )
+
+  analysis_objects[[contrast_name]] <- list(
+    contrast = contrast_name,
+    comparison_label = comparison_label,
+    crc_original = crc_original,
+    ucec_original = ucec_original,
+    crc_validated = crc_validated,
+    ucec_validated = ucec_validated,
+    background = tested_background,
+    shared_table = shared_table,
+    consistent_shared = consistent_shared,
+    queries = queries
+  )
+}
+```
+
+```{r}
+diagnostic_summary <- dplyr::bind_rows(
+  lapply(
+    analysis_objects,
+    function(x) {
+      tibble::tibble(
+        Contrast = x$contrast,
+        Comparison = x$comparison_label,
+        CRC_tested_genes =
+          nrow(x$crc_original),
+        UCEC_tested_genes =
+          nrow(x$ucec_original),
+        Shared_tested_background =
+          length(x$background),
+        CRC_bootstrap_stable_DEGs =
+          sum(x$crc_validated$sig),
+        UCEC_bootstrap_stable_DEGs =
+          sum(x$ucec_validated$sig),
+        Shared_stable_DEGs =
+          nrow(x$shared_table),
+        Shared_direction_consistent =
+          nrow(x$consistent_shared),
+        Shared_up =
+          length(
+            x$queries$Up_in_MSS_TMB_H
+          ),
+        Shared_down =
+          length(
+            x$queries$Down_in_MSS_TMB_H
+          )
+      )
+    }
+  )
+)
+
+write.csv(
+  diagnostic_summary,
+  file.path(
+    params$output_root,
+    "shared_gene_enrichment_input_summary.csv"
+  ),
+  row.names = FALSE
+)
+
+knitr::kable(
+  diagnostic_summary,
+  caption =
+    "Gene sets and custom backgrounds used for enrichment."
+)
+```
+
+```{r}
+for (contrast_name in names(analysis_objects)) {
+  object <- analysis_objects[[contrast_name]]
+
+  contrast_dir <- file.path(
+    params$output_root,
+    contrast_name
+  )
+
+  dir.create(
+    contrast_dir,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+
+  write.csv(
+    object$shared_table,
+    file.path(
+      contrast_dir,
+      "shared_bootstrap_stable_DEGs_all_directions.csv"
+    ),
+    row.names = FALSE
+  )
+
+  write.csv(
+    object$consistent_shared,
+    file.path(
+      contrast_dir,
+      "shared_direction_consistent_bootstrap_stable_DEGs.csv"
+    ),
+    row.names = FALSE
+  )
+
+  write.csv(
+    tibble::tibble(
+      Gene = object$background
+    ),
+    file.path(
+      contrast_dir,
+      "custom_background_genes_tested_in_both_cancers.csv"
+    ),
+    row.names = FALSE
+  )
+
+  for (query_name in names(object$queries)) {
+    write.csv(
+      tibble::tibble(
+        Gene = object$queries[[query_name]]
+      ),
+      file.path(
+        contrast_dir,
+        paste0(
+          "query_genes_",
+          query_name,
+          ".csv"
+        )
+      ),
+      row.names = FALSE
+    )
+  }
+}
+```
+
+```{r}
+for (contrast_name in names(analysis_objects)) {
+  object <- analysis_objects[[contrast_name]]
+
+  contrast_dir <- file.path(
+    params$output_root,
+    contrast_name
+  )
+
+  sets <- list(
+    CRC = object$crc_validated %>%
+      dplyr::filter(sig) %>%
+      dplyr::pull(Gene),
+
+    UCEC = object$ucec_validated %>%
+      dplyr::filter(sig) %>%
+      dplyr::pull(Gene)
+  )
+
+  if (all(vapply(sets, length, integer(1)) == 0)) {
+    save_placeholder_svg(
+      file.path(
+        contrast_dir,
+        "venn_bootstrap_stable_DEGs_CRC_UCEC.svg"
+      ),
+      paste0(
+        object$comparison_label,
+        ": bootstrap-stable DEG overlap"
+      ),
+      "No bootstrap-stable DEGs"
+    )
+  } else {
+    p_venn <- ggVennDiagram::ggVennDiagram(
+      sets,
+      label_alpha = 0
+    ) +
+      ggplot2::scale_fill_gradient(
+        low = "white",
+        high = "#CC79A7"
+      ) +
+      ggplot2::labs(
+        title = paste0(
+          object$comparison_label,
+          ": bootstrap-stable DEG overlap"
+        )
+      ) +
+      ggplot2::theme(
+        plot.title = ggplot2::element_text(
+          face = "bold",
+          hjust = 0.5
+        )
+      )
+
+    ggplot2::ggsave(
+      file.path(
+        contrast_dir,
+        "venn_bootstrap_stable_DEGs_CRC_UCEC.svg"
+      ),
+      p_venn,
+      width = 7,
+      height = 6,
+      device = "svg"
+    )
+  }
+}
+```
+
+```{r}
+empty_gost_table <- function() {
+  tibble::tibble(
+    query = character(),
+    significant = logical(),
+    p_value = numeric(),
+    term_size = integer(),
+    query_size = integer(),
+    intersection_size = integer(),
+    precision = numeric(),
+    recall = numeric(),
+    source = character(),
+    term_id = character(),
+    term_name = character(),
+    effective_domain_size = integer(),
+    source_order = integer(),
+    parents = character(),
+    Correction_method = character(),
+    Analysis_type = character(),
+    Comparison = character(),
+    neglog10_p = numeric(),
+    term_label = character()
+  )
+}
+```
+
+```{r}
+safe_gost <- function(
+    query_list,
+    background,
+    comparison,
+    correction_method = "g_SCS",
+    significant_only = TRUE,
+    analysis_type = "Confirmatory"
+) {
+  if (!isTRUE(params$run_gprofiler)) {
+    return(
+      list(
+        object = NULL,
+        table = empty_gost_table(),
+        error = "g:Profiler analysis disabled."
+      )
+    )
+  }
+
+  query_list <- lapply(
+    query_list,
+    function(x) {
+      unique(
+        na.omit(
+          trimws(
+            as.character(x)
+          )
+        )
+      )
+    }
+  )
+
+  query_list <- query_list[
+    vapply(
+      query_list,
+      length,
+      integer(1)
+    ) >= params$minimum_query_size
+  ]
+
+  background <- unique(
+    na.omit(
+      trimws(
+        as.character(background)
+      )
+    )
+  )
+
+  if (length(query_list) == 0) {
+    return(
+      list(
+        object = NULL,
+        table = empty_gost_table(),
+        error =
+          "All query lists contained fewer than the minimum number of genes."
+      )
+    )
+  }
+
+  if (length(background) == 0) {
+    return(
+      list(
+        object = NULL,
+        table = empty_gost_table(),
+        error = "The custom background was empty."
+      )
+    )
+  }
+
+  
+  query_list <- lapply(
+    query_list,
+    intersect,
+    y = background
+  )
+
+  query_list <- query_list[
+    vapply(
+      query_list,
+      length,
+      integer(1)
+    ) >= params$minimum_query_size
+  ]
+
+  if (length(query_list) == 0) {
+    return(
+      list(
+        object = NULL,
+        table = empty_gost_table(),
+        error =
+          "No query retained the minimum number of genes after intersection with the background."
+      )
+    )
+  }
+
+  result_object <- tryCatch(
+    gprofiler2::gost(
+      query = query_list,
+      organism = params$organism,
+      ordered_query = FALSE,
+      multi_query = FALSE,
+      significant = significant_only,
+      exclude_iea = FALSE,
+      measure_underrepresentation = FALSE,
+      evcodes = TRUE,
+      user_threshold = if (significant_only) {
+        params$fdr_cutoff
+      } else {
+        1.0
+      },
+      correction_method = correction_method,
+      domain_scope = params$domain_scope,
+      custom_bg = background,
+      sources = params$enrichment_sources,
+      highlight = TRUE
+    ),
+    error = function(e) e
+  )
+
+  if (inherits(result_object, "error")) {
+    return(
+      list(
+        object = NULL,
+        table = empty_gost_table(),
+        error = conditionMessage(result_object)
+      )
+    )
+  }
+
+  if (
+    is.null(result_object) ||
+    is.null(result_object$result) ||
+    nrow(result_object$result) == 0
+  ) {
+    return(
+      list(
+        object = result_object,
+        table = empty_gost_table(),
+        error = NA_character_
+      )
+    )
+  }
+
+  result_table <- tibble::as_tibble(
+    result_object$result
+  )
+
+  
+  if ("parents" %in% names(result_table)) {
+    result_table$parents <- vapply(
+      result_table$parents,
+      function(x) {
+        paste(
+          as.character(x),
+          collapse = "; "
+        )
+      },
+      character(1)
+    )
+  }
+
+  if ("intersection" %in% names(result_table)) {
+    result_table$intersection <- vapply(
+      result_table$intersection,
+      function(x) {
+        paste(
+          as.character(x),
+          collapse = "; "
+        )
+      },
+      character(1)
+    )
+  }
+
+  result_table <- result_table %>%
+    dplyr::mutate(
+      Correction_method =
+        correction_method,
+
+      Analysis_type =
+        analysis_type,
+
+      Comparison =
+        comparison,
+
+      neglog10_p =
+        -log10(
+          pmax(
+            p_value,
+            1e-300
+          )
+        ),
+
+      term_label =
+        paste0(
+          source,
+          ": ",
+          stringr::str_trunc(
+            term_name,
+            70
+          )
+        )
+    )
+
+  list(
+    object = result_object,
+    table = result_table,
+    error = NA_character_
+  )
+}
+```
+
+```{r}
+select_top_terms <- function(
+    table,
+    top_n
+) {
+  if (nrow(table) == 0) {
+    return(table)
+  }
+
+  table %>%
+    dplyr::group_by(query) %>%
+    dplyr::arrange(
+      p_value,
+      dplyr::desc(intersection_size),
+      .by_group = TRUE
+    ) %>%
+    dplyr::slice_head(
+      n = top_n
+    ) %>%
+    dplyr::ungroup()
+}
+
+
+plot_enrichment_dotplot <- function(
+    table,
+    title,
+    file,
+    exploratory = FALSE
+) {
+  if (nrow(table) == 0) {
+    save_placeholder_svg(
+      file,
+      title,
+      if (exploratory) {
+        "No enrichment results returned"
+      } else {
+        "No statistically significant enrichment"
+      }
+    )
+
+    return(invisible(NULL))
+  }
+
+  plot_table <- table %>%
+    dplyr::mutate(
+      query = dplyr::recode(
+        query,
+        All_direction_consistent =
+          "All consistent",
+        Up_in_MSS_TMB_H =
+          "Up in MSS/TMB-H",
+        Down_in_MSS_TMB_H =
+          "Down in MSS/TMB-H"
+      ),
+      plot_label = paste0(
+        term_label,
+        " [",
+        query,
+        "]"
+      )
+    ) %>%
+    dplyr::arrange(
+      p_value
+    ) %>%
+    dplyr::mutate(
+      plot_label = factor(
+        plot_label,
+        levels = rev(
+          unique(plot_label)
+        )
+      )
+    )
+
+  p <- ggplot2::ggplot(
+    plot_table,
+    ggplot2::aes(
+      neglog10_p,
+      plot_label
+    )
+  ) +
+    ggplot2::geom_point(
+      ggplot2::aes(
+        size = intersection_size,
+        color = source,
+        shape = query
+      ),
+      alpha = 0.9
+    ) +
+    ggplot2::labs(
+      title = title,
+      subtitle = if (exploratory) {
+        paste0(
+          "Exploratory ranking only; terms are not necessarily significant. ",
+          "The x-axis uses corrected p-values."
+        )
+      } else {
+        paste0(
+          "Custom background: genes tested in both CRC and UCEC; ",
+          params$domain_scope
+        )
+      },
+      x = expression(-log[10]("corrected p-value")),
+      y = NULL,
+      size = "Shared genes",
+      color = "Source",
+      shape = "Gene query"
+    ) +
+    ggplot2::theme_classic(
+      base_size = 11
+    ) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(
+        face = "bold",
+        hjust = 0.5
+      ),
+      plot.subtitle = ggplot2::element_text(
+        hjust = 0.5
+      ),
+      legend.position = "right"
+    )
+
+  ggplot2::ggsave(
+    file,
+    p,
+    width = 12,
+    height = max(
+      7,
+      0.24 * nrow(plot_table) + 2
+    ),
+    device = "svg",
+    limitsize = FALSE
+  )
+
+  invisible(p)
+}
+
+
+plot_source_summary <- function(
+    table,
+    title,
+    file
+) {
+  if (nrow(table) == 0) {
+    save_placeholder_svg(
+      file,
+      title,
+      "No statistically significant enrichment"
+    )
+
+    return(invisible(NULL))
+  }
+
+  source_summary <- table %>%
+    dplyr::count(
+      query,
+      source,
+      name = "Number_of_terms"
+    )
+
+  p <- ggplot2::ggplot(
+    source_summary,
+    ggplot2::aes(
+      source,
+      Number_of_terms,
+      fill = query
+    )
+  ) +
+    ggplot2::geom_col(
+      position =
+        ggplot2::position_dodge(
+          width = 0.8
+        )
+    ) +
+    ggplot2::labs(
+      title = title,
+      x = NULL,
+      y = "Number of significant terms",
+      fill = "Gene query"
+    ) +
+    ggplot2::theme_classic(
+      base_size = 11
+    ) +
+    ggplot2::theme(
+      axis.text.x =
+        ggplot2::element_text(
+          angle = 35,
+          hjust = 1
+        ),
+      plot.title =
+        ggplot2::element_text(
+          face = "bold",
+          hjust = 0.5
+        )
+    )
+
+  ggplot2::ggsave(
+    file,
+    p,
+    width = 10,
+    height = 5.5,
+    device = "svg"
+  )
+
+  invisible(p)
+}
+```
+
+```{r}
+enrichment_results <- list()
+error_log <- list()
+
+for (contrast_name in names(analysis_objects)) {
+  object <- analysis_objects[[contrast_name]]
+
+  contrast_dir <- file.path(
+    params$output_root,
+    contrast_name
+  )
+
+  queries <- object$queries
+  background <- object$background
+
+  primary_result <- safe_gost(
+    query_list = queries,
+    background = background,
+    comparison =
+      object$comparison_label,
+    correction_method = "g_SCS",
+    significant_only = TRUE,
+    analysis_type =
+      "Confirmatory g:SCS"
+  )
+
+  fdr_result <- safe_gost(
+    query_list = queries,
+    background = background,
+    comparison =
+      object$comparison_label,
+    correction_method = "fdr",
+    significant_only = TRUE,
+    analysis_type =
+      "Sensitivity FDR"
+  )
+
+  exploratory_result <- safe_gost(
+    query_list = queries,
+    background = background,
+    comparison =
+      object$comparison_label,
+    correction_method = "fdr",
+    significant_only = FALSE,
+    analysis_type =
+      "Exploratory FDR ranking"
+  )
+
+  primary_table <- primary_result$table
+  fdr_table <- fdr_result$table
+  exploratory_table <-
+    exploratory_result$table
+
+  write.csv(
+    primary_table,
+    file.path(
+      contrast_dir,
+      "enrichment_confirmatory_gSCS_significant.csv"
+    ),
+    row.names = FALSE
+  )
+
+  write.csv(
+    fdr_table,
+    file.path(
+      contrast_dir,
+      "enrichment_sensitivity_FDR_significant.csv"
+    ),
+    row.names = FALSE
+  )
+
+  write.csv(
+    exploratory_table,
+    file.path(
+      contrast_dir,
+      "enrichment_exploratory_FDR_all_terms.csv"
+    ),
+    row.names = FALSE
+  )
+
+  primary_top <- select_top_terms(
+    primary_table,
+    params$top_terms_per_query
+  )
+
+  fdr_top <- select_top_terms(
+    fdr_table,
+    params$top_terms_per_query
+  )
+
+  exploratory_top <- select_top_terms(
+    exploratory_table,
+    params$exploratory_top_terms_per_query
+  )
+
+  write.csv(
+    exploratory_top,
+    file.path(
+      contrast_dir,
+      "enrichment_exploratory_FDR_top_terms.csv"
+    ),
+    row.names = FALSE
+  )
+
+  plot_enrichment_dotplot(
+    primary_top,
+    paste0(
+      object$comparison_label,
+      ": shared stable DEG enrichment (g:SCS)"
+    ),
+    file.path(
+      contrast_dir,
+      "enrichment_confirmatory_gSCS_dotplot.svg"
+    ),
+    exploratory = FALSE
+  )
+
+  plot_enrichment_dotplot(
+    fdr_top,
+    paste0(
+      object$comparison_label,
+      ": shared stable DEG enrichment (FDR sensitivity)"
+    ),
+    file.path(
+      contrast_dir,
+      "enrichment_sensitivity_FDR_dotplot.svg"
+    ),
+    exploratory = FALSE
+  )
+
+  plot_enrichment_dotplot(
+    exploratory_top,
+    paste0(
+      object$comparison_label,
+      ": top enrichment trends"
+    ),
+    file.path(
+      contrast_dir,
+      "enrichment_exploratory_FDR_top_terms.svg"
+    ),
+    exploratory = TRUE
+  )
+
+  plot_source_summary(
+    primary_table,
+    paste0(
+      object$comparison_label,
+      ": significant terms by source (g:SCS)"
+    ),
+    file.path(
+      contrast_dir,
+      "enrichment_confirmatory_gSCS_source_counts.svg"
+    )
+  )
+
+  query_count_table <- tibble::tibble(
+    Query = names(queries),
+    Number_of_genes = vapply(
+      queries,
+      length,
+      integer(1)
+    )
+  )
+
+  write.csv(
+    query_count_table,
+    file.path(
+      contrast_dir,
+      "query_gene_counts.csv"
+    ),
+    row.names = FALSE
+  )
+
+  enrichment_results[[contrast_name]] <- list(
+    primary_object =
+      primary_result$object,
+    primary_table =
+      primary_table,
+    fdr_object =
+      fdr_result$object,
+    fdr_table =
+      fdr_table,
+    exploratory_object =
+      exploratory_result$object,
+    exploratory_table =
+      exploratory_table,
+    exploratory_top =
+      exploratory_top
+  )
+
+  error_log[[contrast_name]] <- tibble::tibble(
+    Contrast = contrast_name,
+    Analysis = c(
+      "Confirmatory g:SCS",
+      "Sensitivity FDR",
+      "Exploratory FDR ranking"
+    ),
+    Error = c(
+      primary_result$error,
+      fdr_result$error,
+      exploratory_result$error
+    )
+  )
+}
+
+error_table <- dplyr::bind_rows(
+  error_log
+)
+
+write.csv(
+  error_table,
+  file.path(
+    params$output_root,
+    "gprofiler_error_log.csv"
+  ),
+  row.names = FALSE
+)
+
+knitr::kable(
+  error_table,
+  caption = "g:Profiler query status."
+)
+```
+
+```{r}
+enrichment_summary <- dplyr::bind_rows(
+  lapply(
+    names(enrichment_results),
+    function(contrast_name) {
+      result <- enrichment_results[[contrast_name]]
+      object <- analysis_objects[[contrast_name]]
+
+      tibble::tibble(
+        Contrast = contrast_name,
+        Comparison =
+          object$comparison_label,
+        Background_genes =
+          length(object$background),
+        Consistent_shared_genes =
+          length(
+            object$queries$All_direction_consistent
+          ),
+        Up_genes =
+          length(
+            object$queries$Up_in_MSS_TMB_H
+          ),
+        Down_genes =
+          length(
+            object$queries$Down_in_MSS_TMB_H
+          ),
+        Significant_gSCS_terms =
+          nrow(result$primary_table),
+        Significant_FDR_terms =
+          nrow(result$fdr_table),
+        Exploratory_terms_returned =
+          nrow(result$exploratory_table)
+      )
+    }
+  )
+)
+
+write.csv(
+  enrichment_summary,
+  file.path(
+    params$output_root,
+    "enrichment_result_summary.csv"
+  ),
+  row.names = FALSE
+)
+
+knitr::kable(
+  enrichment_summary,
+  caption =
+    "Summary of shared-gene enrichment results."
+)
+```
+
+```{r}
+gprofiler_version_info <- tryCatch(
+  gprofiler2::get_version_info(
+    organism = params$organism
+  ),
+  error = function(e) {
+    list(
+      error = conditionMessage(e)
+    )
+  }
+)
+
+saveRDS(
+  gprofiler_version_info,
+  file.path(
+    params$output_root,
+    "gprofiler_data_versions.rds"
+  )
+)
+
+capture.output(
+  str(
+    gprofiler_version_info
+  ),
+  file = file.path(
+    params$output_root,
+    "gprofiler_data_versions.txt"
+  )
+)
+```
+
+```{r}
+workbook_sheets <- list(
+  Input_summary =
+    diagnostic_summary,
+
+  Result_summary =
+    enrichment_summary,
+
+  Error_log =
+    error_table
+)
+
+for (contrast_name in names(analysis_objects)) {
+  object <- analysis_objects[[contrast_name]]
+  result <- enrichment_results[[contrast_name]]
+
+  sheet_prefix <- if (
+    contrast_name ==
+      "MSI_H_vs_MSS_TMB_H"
+  ) {
+    "MSSH_vs_MSIH"
+  } else {
+    "MSSH_vs_MSSL"
+  }
+
+  workbook_sheets[[
+    paste0(
+      sheet_prefix,
+      "_shared"
+    )
+  ]] <- object$shared_table
+
+  workbook_sheets[[
+    paste0(
+      sheet_prefix,
+      "_consistent"
+    )
+  ]] <- object$consistent_shared
+
+  workbook_sheets[[
+    paste0(
+      sheet_prefix,
+      "_gSCS"
+    )
+  ]] <- result$primary_table
+
+  workbook_sheets[[
+    paste0(
+      sheet_prefix,
+      "_FDR"
+    )
+  ]] <- result$fdr_table
+
+  workbook_sheets[[
+    paste0(
+      sheet_prefix,
+      "_exploratory"
+    )
+  ]] <- result$exploratory_top
+}
+
+openxlsx::write.xlsx(
+  workbook_sheets,
+  file = file.path(
+    params$output_root,
+    "shared_bootstrap_stable_gene_enrichment.xlsx"
+  ),
+  overwrite = TRUE
+)
+```
+
+```{r}
+output_manifest <- list.files(
+  params$output_root,
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+writeLines(
+  output_manifest,
+  file.path(
+    params$output_root,
+    "output_manifest.txt"
+  )
+)
+
+cat(
+  paste(
+    output_manifest,
+    collapse = "\n"
+  )
+)
+```
+
+```{r}
+sessionInfo()
+```

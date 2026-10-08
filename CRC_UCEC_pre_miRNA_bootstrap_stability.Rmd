@@ -1,0 +1,3110 @@
+```{r}
+required_packages <- c(
+  "edgeR",
+  "limma",
+  "dplyr",
+  "tibble",
+  "tidyr",
+  "ggplot2",
+  "fs",
+  "knitr",
+  "BiocParallel",
+  "openxlsx",
+  "svglite"
+)
+
+missing_packages <- required_packages[
+  !vapply(
+    required_packages,
+    requireNamespace,
+    logical(1),
+    quietly = TRUE
+  )
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "The following required R packages are not installed: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+library(edgeR)
+library(limma)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(ggplot2)
+library(fs)
+library(knitr)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 10,
+  fig.height = 6
+)
+
+set.seed(as.integer(params$random_seed))
+
+fs::dir_create(params$output_root)
+
+stability_contrasts <- c(
+  "MSI_H_vs_MSS_TMB_H",
+  "MSS_TMB_H_vs_MSS_TMB_L"
+)
+
+all_contrasts <- c(
+  "MSI_H_vs_MSS_TMB_H",
+  "MSI_H_vs_MSS_TMB_L",
+  "MSS_TMB_H_vs_MSS_TMB_L"
+)
+
+as_flag <- function(x) {
+  if (is.logical(x)) {
+    return(replace(x, is.na(x), FALSE))
+  }
+
+  if (is.numeric(x)) {
+    return(!is.na(x) & x != 0)
+  }
+
+  tolower(trimws(as.character(x))) %in%
+    c("true", "t", "1", "yes", "y")
+}
+
+safe_divide <- function(numerator, denominator) {
+  ifelse(
+    is.na(denominator) | denominator == 0,
+    NA_real_,
+    numerator / denominator
+  )
+}
+
+write_empty_csv <- function(file, columns) {
+  empty <- as.data.frame(
+    setNames(
+      replicate(
+        length(columns),
+        character(0),
+        simplify = FALSE
+      ),
+      columns
+    ),
+    stringsAsFactors = FALSE
+  )
+
+  write.csv(
+    empty,
+    file,
+    row.names = FALSE
+  )
+}
+params <- list(
+  crc_clinical_file =
+    "data/clinical_data.csv",
+
+  crc_mirna_counts_file =
+    "data/coad/miRNA_counts_matrix.csv",
+
+  ucec_clinical_file =
+    "data/ucec_clinical.csv",
+
+  
+  ucec_mirna_counts_file = NULL,
+
+  output_root =
+    "data/DE_results/pre_miRNA/bootstrap_stability",
+
+  bootstrap_iterations = 500L,
+  random_seed = 20260805L,
+  parallel_workers = 23L,
+  bootstrap_batch_size = 5L,
+
+  fdr_threshold = 0.05,
+  logfc_threshold = 1,
+  min_count = 5L,
+  sign_consistency_threshold = 0.90,
+  repeated_significance_threshold = 0.70,
+
+  run_leave_one_out = TRUE
+)
+```
+
+```{r}
+resolve_existing_file <- function(
+    explicit_file,
+    candidate_files = character(),
+    search_roots = character(),
+    search_pattern = "(?i)mirna.*count.*\\.csv$",
+    dataset_name
+) {
+  explicit_valid <-
+    length(explicit_file) == 1 &&
+    !is.null(explicit_file) &&
+    !is.na(explicit_file) &&
+    nzchar(trimws(as.character(explicit_file)))
+
+  if (explicit_valid) {
+    explicit_file <- path.expand(
+      as.character(explicit_file)
+    )
+
+    if (!file.exists(explicit_file)) {
+      stop(
+        dataset_name,
+        " file specified in YAML does not exist: ",
+        explicit_file
+      )
+    }
+
+    return(normalizePath(explicit_file))
+  }
+
+  candidate_files <- unique(
+    path.expand(candidate_files)
+  )
+
+  candidates_found <- candidate_files[
+    file.exists(candidate_files)
+  ]
+
+  searchable_roots <- search_roots[
+    dir.exists(search_roots)
+  ]
+
+  discovered_files <- unique(
+    unlist(
+      lapply(
+        searchable_roots,
+        function(root) {
+          list.files(
+            root,
+            pattern = search_pattern,
+            recursive = TRUE,
+            full.names = TRUE
+          )
+        }
+      ),
+      use.names = FALSE
+    )
+  )
+
+  
+  discovered_files <- discovered_files[
+    !grepl(
+      "DE_results|stability|bootstrap|primary_DE|sig_genes",
+      discovered_files,
+      ignore.case = TRUE
+    )
+  ]
+
+  all_found <- unique(
+    c(
+      candidates_found,
+      discovered_files
+    )
+  )
+
+  if (length(all_found) == 1) {
+    message(
+      "Automatically selected ",
+      dataset_name,
+      " file: ",
+      all_found
+    )
+
+    return(normalizePath(all_found))
+  }
+
+  if (length(all_found) == 0) {
+    stop(
+      "Could not find the ",
+      dataset_name,
+      " file. Set the corresponding YAML parameter explicitly."
+    )
+  }
+
+  stop(
+    "Several possible ",
+    dataset_name,
+    " files were found. Set the YAML parameter explicitly:\n",
+    paste(all_found, collapse = "\n")
+  )
+}
+
+crc_counts_file <- resolve_existing_file(
+  explicit_file = params$crc_mirna_counts_file,
+  dataset_name = "CRC miRNA count matrix"
+)
+
+ucec_counts_file <- resolve_existing_file(
+  explicit_file = params$ucec_mirna_counts_file,
+  candidate_files = c(
+    "data/coad/miRNA_counts_matrix.csv"
+  ),
+  search_roots = c(
+    "data/UCEC",
+    "data/ucec",
+    "data/TCGA-UCEC",
+    "data/tcga_ucec"
+  ),
+  dataset_name = "UCEC miRNA count matrix"
+)
+
+input_files <- tibble(
+  Dataset = c("CRC", "UCEC"),
+  Clinical_file = c(
+    params$crc_clinical_file,
+    params$ucec_clinical_file
+  ),
+  miRNA_counts_file = c(
+    crc_counts_file,
+    ucec_counts_file
+  )
+)
+
+missing_clinical <- input_files$Clinical_file[
+  !file.exists(input_files$Clinical_file)
+]
+
+if (length(missing_clinical) > 0) {
+  stop(
+    "Clinical files do not exist:\n",
+    paste(missing_clinical, collapse = "\n")
+  )
+}
+
+knitr::kable(
+  input_files,
+  caption = "Input files used by the analysis."
+)
+```
+
+```{r}
+normalize_tcga_sample_id <- function(x) {
+  x <- trimws(as.character(x))
+
+  
+  
+  is_tcga <- grepl(
+    "^TCGA-[A-Za-z0-9]{2}-[A-Za-z0-9]{4}",
+    x
+  )
+
+  x[is_tcga] <- substr(
+    x[is_tcga],
+    1,
+    16
+  )
+
+  x
+}
+```
+
+```{r}
+read_clinical_data <- function(
+    file,
+    dataset_name,
+    output_dir
+) {
+  if (!file.exists(file)) {
+    stop(
+      dataset_name,
+      " clinical file does not exist: ",
+      file
+    )
+  }
+
+  clinical <- read.csv(
+    file,
+    header = TRUE,
+    stringsAsFactors = FALSE,
+    fileEncoding = "UTF-8",
+    na.strings = c("NA", "")
+  )
+
+  required_columns <- c(
+    "sample_submitter_id",
+    "MSI_TMB"
+  )
+
+  missing_columns <- setdiff(
+    required_columns,
+    names(clinical)
+  )
+
+  if (length(missing_columns) > 0) {
+    stop(
+      dataset_name,
+      " clinical file is missing columns: ",
+      paste(missing_columns, collapse = ", ")
+    )
+  }
+
+  clinical$sample_submitter_id_original <-
+    clinical$sample_submitter_id
+
+  clinical$sample_submitter_id <-
+    normalize_tcga_sample_id(
+      clinical$sample_submitter_id
+    )
+
+  duplicate_clinical <- clinical %>%
+    count(
+      sample_submitter_id,
+      name = "Number_of_rows"
+    ) %>%
+    filter(
+      Number_of_rows > 1
+    )
+
+  write.csv(
+    duplicate_clinical,
+    file.path(
+      output_dir,
+      "duplicated_clinical_sample_ids.csv"
+    ),
+    row.names = FALSE
+  )
+
+  if (nrow(duplicate_clinical) > 0) {
+    warning(
+      dataset_name,
+      ": duplicated clinical sample IDs were found after barcode normalization. ",
+      "The first row for each sample is retained."
+    )
+
+    clinical <- clinical[
+      !duplicated(clinical$sample_submitter_id),
+      ,
+      drop = FALSE
+    ]
+  }
+
+  group_mapping <- c(
+    "MSI-H" = "MSI_H",
+    "MSI_H" = "MSI_H",
+    "MSS/TMB-H" = "MSS_TMB_H",
+    "MSS_TMB_H" = "MSS_TMB_H",
+    "MSS/TMB-L" = "MSS_TMB_L",
+    "MSS_TMB_L" = "MSS_TMB_L"
+  )
+
+  clinical$MSI_TMB_original <- clinical$MSI_TMB
+
+  clinical$MSI_TMB <- unname(
+    group_mapping[
+      trimws(
+        as.character(clinical$MSI_TMB)
+      )
+    ]
+  )
+
+  clinical$MSI_TMB <- factor(
+    clinical$MSI_TMB,
+    levels = c(
+      "MSI_H",
+      "MSS_TMB_H",
+      "MSS_TMB_L"
+    )
+  )
+
+  unsupported <- clinical[
+    is.na(clinical$MSI_TMB),
+    ,
+    drop = FALSE
+  ]
+
+  write.csv(
+    unsupported,
+    file.path(
+      output_dir,
+      "clinical_samples_removed_unsupported_group.csv"
+    ),
+    row.names = FALSE
+  )
+
+  clinical <- clinical[
+    !is.na(clinical$MSI_TMB),
+    ,
+    drop = FALSE
+  ]
+
+  rownames(clinical) <-
+    clinical$sample_submitter_id
+
+  clinical
+}
+```
+
+```{r}
+collapse_duplicate_sample_columns <- function(
+    counts,
+    dataset_name,
+    output_dir
+) {
+  sample_ids <- colnames(counts)
+
+  duplicate_ids <- unique(
+    sample_ids[
+      duplicated(sample_ids) |
+        duplicated(sample_ids, fromLast = TRUE)
+    ]
+  )
+
+  if (length(duplicate_ids) == 0) {
+    write_empty_csv(
+      file.path(
+        output_dir,
+        "duplicated_count_sample_columns_removed.csv"
+      ),
+      c(
+        "Sample",
+        "Original_column",
+        "Library_size",
+        "Action"
+      )
+    )
+
+    return(counts)
+  }
+
+  duplicate_log <- bind_rows(
+    lapply(
+      duplicate_ids,
+      function(sample_id) {
+        indices <- which(
+          sample_ids == sample_id
+        )
+
+        library_sizes <- colSums(
+          counts[
+            ,
+            indices,
+            drop = FALSE
+          ],
+          na.rm = TRUE
+        )
+
+        retained_local <- which.max(
+          library_sizes
+        )
+
+        tibble(
+          Sample = sample_id,
+          Original_column = indices,
+          Library_size = as.numeric(
+            library_sizes
+          ),
+          Action = ifelse(
+            seq_along(indices) == retained_local,
+            "retained_largest_library",
+            "removed_duplicate"
+          )
+        )
+      }
+    )
+  )
+
+  write.csv(
+    duplicate_log,
+    file.path(
+      output_dir,
+      "duplicated_count_sample_columns_removed.csv"
+    ),
+    row.names = FALSE
+  )
+
+  retained_indices <- unlist(
+    lapply(
+      unique(sample_ids),
+      function(sample_id) {
+        indices <- which(
+          sample_ids == sample_id
+        )
+
+        if (length(indices) == 1) {
+          return(indices)
+        }
+
+        library_sizes <- colSums(
+          counts[
+            ,
+            indices,
+            drop = FALSE
+          ],
+          na.rm = TRUE
+        )
+
+        indices[
+          which.max(library_sizes)
+        ]
+      }
+    ),
+    use.names = FALSE
+  )
+
+  message(
+    dataset_name,
+    ": removed ",
+    ncol(counts) - length(retained_indices),
+    " duplicated sample columns; retained the largest library for each sample."
+  )
+
+  counts <- counts[
+    ,
+    retained_indices,
+    drop = FALSE
+  ]
+
+  stopifnot(
+    !anyDuplicated(colnames(counts))
+  )
+
+  counts
+}
+
+read_mirna_counts <- function(
+    file,
+    dataset_name,
+    output_dir
+) {
+  if (!file.exists(file)) {
+    stop(
+      dataset_name,
+      " miRNA count file does not exist: ",
+      file
+    )
+  }
+
+  counts_df <- read.csv(
+    file,
+    row.names = 1,
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  )
+
+  counts <- as.matrix(
+    counts_df
+  )
+
+  suppressWarnings(
+    storage.mode(counts) <- "numeric"
+  )
+
+  if (anyNA(counts)) {
+    stop(
+      dataset_name,
+      ": count matrix contains missing or non-numeric values."
+    )
+  }
+
+  if (any(counts < 0)) {
+    stop(
+      dataset_name,
+      ": count matrix contains negative values."
+    )
+  }
+
+  if (is.null(rownames(counts))) {
+    stop(
+      dataset_name,
+      ": count matrix does not have pre-miRNA row names."
+    )
+  }
+
+  original_feature_count <- nrow(counts)
+
+  if (anyDuplicated(rownames(counts))) {
+    duplicated_features <- tibble(
+      pre_miRNA = unique(
+        rownames(counts)[
+          duplicated(rownames(counts)) |
+            duplicated(
+              rownames(counts),
+              fromLast = TRUE
+            )
+        ]
+      )
+    )
+
+    write.csv(
+      duplicated_features,
+      file.path(
+        output_dir,
+        "duplicated_pre_miRNA_rows_collapsed.csv"
+      ),
+      row.names = FALSE
+    )
+
+    counts <- rowsum(
+      counts,
+      group = rownames(counts),
+      reorder = FALSE
+    )
+
+    message(
+      dataset_name,
+      ": collapsed ",
+      original_feature_count - nrow(counts),
+      " duplicated pre-miRNA rows by summing counts."
+    )
+  } else {
+    write_empty_csv(
+      file.path(
+        output_dir,
+        "duplicated_pre_miRNA_rows_collapsed.csv"
+      ),
+      "pre_miRNA"
+    )
+  }
+
+  colnames(counts) <-
+    normalize_tcga_sample_id(
+      colnames(counts)
+    )
+
+  counts <- collapse_duplicate_sample_columns(
+    counts = counts,
+    dataset_name = dataset_name,
+    output_dir = output_dir
+  )
+
+  counts
+}
+```
+
+```{r}
+fit_edger_model <- function(
+    counts_mat,
+    metadata,
+    genes_to_keep = NULL,
+    min_count = 5
+) {
+  stopifnot(
+    identical(
+      colnames(counts_mat),
+      rownames(metadata)
+    )
+  )
+
+  expected_levels <- c(
+    "MSI_H",
+    "MSS_TMB_H",
+    "MSS_TMB_L"
+  )
+
+  group <- factor(
+    as.character(metadata$MSI_TMB),
+    levels = expected_levels
+  )
+
+  if (anyNA(group)) {
+    stop(
+      "Some samples have an unsupported MSI_TMB group."
+    )
+  }
+
+  current_group_sizes <- table(
+    group
+  )
+
+  if (any(current_group_sizes == 0)) {
+    stop(
+      "At least one MSI/TMB group is absent."
+    )
+  }
+
+  y <- edgeR::DGEList(
+    counts = counts_mat,
+    group = group
+  )
+
+  if (is.null(genes_to_keep)) {
+    keep <- edgeR::filterByExpr(
+      y,
+      group = group,
+      min.count = min_count
+    )
+  } else {
+    keep <-
+      rownames(y) %in% genes_to_keep &
+      rowSums(y$counts) > 0
+  }
+
+  y <- y[
+    keep,
+    ,
+    keep.lib.sizes = FALSE
+  ]
+
+  if (nrow(y) == 0) {
+    stop(
+      "No pre-miRNAs remain after expression filtering."
+    )
+  }
+
+  y <- edgeR::calcNormFactors(
+    y,
+    method = "TMM"
+  )
+
+  design <- stats::model.matrix(
+    ~ 0 + group
+  )
+
+  colnames(design) <- levels(
+    group
+  )
+
+  y <- edgeR::estimateDisp(
+    y,
+    design,
+    robust = TRUE
+  )
+
+  fit <- edgeR::glmQLFit(
+    y,
+    design,
+    robust = TRUE
+  )
+
+  contrasts <- list(
+    MSI_H_vs_MSS_TMB_H =
+      limma::makeContrasts(
+        MSI_H - MSS_TMB_H,
+        levels = design
+      ),
+
+    MSI_H_vs_MSS_TMB_L =
+      limma::makeContrasts(
+        MSI_H - MSS_TMB_L,
+        levels = design
+      ),
+
+    MSS_TMB_H_vs_MSS_TMB_L =
+      limma::makeContrasts(
+        MSS_TMB_H - MSS_TMB_L,
+        levels = design
+      )
+  )
+
+  list(
+    y = y,
+    fit = fit,
+    design = design,
+    contrasts = contrasts,
+    kept_genes = rownames(y)
+  )
+}
+
+extract_contrast_results <- function(
+    model_object
+) {
+  lapply(
+    model_object$contrasts,
+    function(contrast_vector) {
+      qlf <- edgeR::glmQLFTest(
+        model_object$fit,
+        contrast = contrast_vector
+      )
+
+      edgeR::topTags(
+        qlf,
+        n = Inf,
+        sort.by = "PValue"
+      )$table
+    }
+  )
+}
+```
+
+```{r}
+stratified_bootstrap_indices <- function(
+    group
+) {
+  group <- droplevels(
+    group
+  )
+
+  unlist(
+    lapply(
+      levels(group),
+      function(group_name) {
+        available_indices <- which(
+          group == group_name
+        )
+
+        sample(
+          available_indices,
+          size = length(available_indices),
+          replace = TRUE
+        )
+      }
+    ),
+    use.names = FALSE
+  )
+}
+```
+
+```{r}
+run_resampling_analysis <- function(
+    index_list,
+    resample_names,
+    counts_mat,
+    metadata,
+    genes_to_keep,
+    target_genes,
+    contrasts_to_test,
+    fdr_cutoff = 0.05
+) {
+  n_resamples <- length(index_list)
+
+  if (length(resample_names) != n_resamples) {
+    stop("resample_names and index_list must have the same length.")
+  }
+
+  missing_contrasts <- setdiff(
+    contrasts_to_test,
+    names(target_genes)
+  )
+
+  if (length(missing_contrasts) > 0) {
+    stop(
+      "Missing target-gene entries for contrasts: ",
+      paste(missing_contrasts, collapse = ", ")
+    )
+  }
+
+  logFC_matrices <- setNames(
+    lapply(
+      contrasts_to_test,
+      function(contrast_name) {
+        genes <- target_genes[[contrast_name]]
+
+        matrix(
+          NA_real_,
+          nrow = length(genes),
+          ncol = n_resamples,
+          dimnames = list(
+            genes,
+            resample_names
+          )
+        )
+      }
+    ),
+    contrasts_to_test
+  )
+
+  FDR_matrices <- setNames(
+    lapply(
+      contrasts_to_test,
+      function(contrast_name) {
+        genes <- target_genes[[contrast_name]]
+
+        matrix(
+          NA_real_,
+          nrow = length(genes),
+          ncol = n_resamples,
+          dimnames = list(
+            genes,
+            resample_names
+          )
+        )
+      }
+    ),
+    contrasts_to_test
+  )
+
+  total_DE <- matrix(
+    NA_integer_,
+    nrow = n_resamples,
+    ncol = length(contrasts_to_test),
+    dimnames = list(
+      resample_names,
+      contrasts_to_test
+    )
+  )
+
+  failure_messages <- rep(
+    NA_character_,
+    n_resamples
+  )
+
+  for (i in seq_len(n_resamples)) {
+    sample_indices <- index_list[[i]]
+
+    if (
+      length(sample_indices) == 0 ||
+      anyNA(sample_indices)
+    ) {
+      failure_messages[i] <-
+        "Empty or invalid sample-index vector."
+
+      next
+    }
+
+    counts_i <- counts_mat[
+      genes_to_keep,
+      sample_indices,
+      drop = FALSE
+    ]
+
+    metadata_i <- metadata[
+      sample_indices,
+      ,
+      drop = FALSE
+    ]
+
+    
+    
+    unique_names <- paste0(
+      "resample_",
+      i,
+      "_sample_",
+      seq_len(ncol(counts_i))
+    )
+
+    colnames(counts_i) <- unique_names
+    rownames(metadata_i) <- unique_names
+
+    model_i <- tryCatch(
+      fit_edger_model(
+        counts_mat = counts_i,
+        metadata = metadata_i,
+        genes_to_keep = genes_to_keep,
+        min_count = params$min_count
+      ),
+      error = function(e) e
+    )
+
+    if (inherits(model_i, "error")) {
+      failure_messages[i] <-
+        conditionMessage(model_i)
+
+      next
+    }
+
+    for (contrast_name in contrasts_to_test) {
+      if (
+        !contrast_name %in%
+          names(model_i$contrasts)
+      ) {
+        failure_messages[i] <- paste0(
+          "Contrast missing from fitted model: ",
+          contrast_name
+        )
+
+        next
+      }
+
+      qlf_i <- tryCatch(
+        edgeR::glmQLFTest(
+          model_i$fit,
+          contrast =
+            model_i$contrasts[[contrast_name]]
+        ),
+        error = function(e) e
+      )
+
+      if (inherits(qlf_i, "error")) {
+        failure_messages[i] <- paste0(
+          contrast_name,
+          ": ",
+          conditionMessage(qlf_i)
+        )
+
+        next
+      }
+
+      tab_i <- qlf_i$table
+
+      tab_i$FDR <- p.adjust(
+        tab_i$PValue,
+        method = "BH"
+      )
+
+      total_DE[i, contrast_name] <- sum(
+        !is.na(tab_i$FDR) &
+          tab_i$FDR <= fdr_cutoff
+      )
+
+      genes <- target_genes[[contrast_name]]
+
+      if (length(genes) == 0) {
+        next
+      }
+
+      gene_positions <- match(
+        genes,
+        rownames(tab_i)
+      )
+
+      found <- !is.na(gene_positions)
+
+      if (any(found)) {
+        logFC_matrices[[contrast_name]][found, i] <-
+          tab_i$logFC[
+            gene_positions[found]
+          ]
+
+        FDR_matrices[[contrast_name]][found, i] <-
+          tab_i$FDR[
+            gene_positions[found]
+          ]
+      }
+    }
+  }
+
+  list(
+    logFC = logFC_matrices,
+    FDR = FDR_matrices,
+    total_DE = total_DE,
+    failures = failure_messages
+  )
+}
+
+
+run_resampling_parallel <- function(
+    index_list,
+    resample_names,
+    counts_mat,
+    metadata,
+    genes_to_keep,
+    target_genes,
+    contrasts_to_test,
+    fdr_cutoff,
+    n_workers,
+    batch_size,
+    random_seed
+) {
+  n_resamples <- length(index_list)
+
+  if (n_resamples == 0) {
+    stop("No resamples were supplied.")
+  }
+
+  if (length(resample_names) != n_resamples) {
+    stop(
+      "resample_names and index_list must have the same length."
+    )
+  }
+
+  available_cores <- parallel::detectCores(
+    logical = FALSE
+  )
+
+  if (
+    is.na(available_cores) ||
+    available_cores < 1
+  ) {
+    available_cores <- 1L
+  }
+
+  n_workers <- max(
+    1L,
+    min(
+      as.integer(n_workers),
+      as.integer(available_cores),
+      n_resamples
+    )
+  )
+
+  batch_size <- max(
+    1L,
+    as.integer(batch_size)
+  )
+
+  batch_ids <- split(
+    seq_len(n_resamples),
+    ceiling(
+      seq_len(n_resamples) /
+        batch_size
+    )
+  )
+
+  message(
+    "Running ",
+    n_resamples,
+    " resamples using ",
+    n_workers,
+    " workers in ",
+    length(batch_ids),
+    " batches."
+  )
+
+  if (
+    .Platform$OS.type == "unix" &&
+    n_workers > 1
+  ) {
+    bp <- BiocParallel::MulticoreParam(
+      workers = n_workers,
+      RNGseed = as.integer(random_seed),
+      progressbar = TRUE
+    )
+  } else {
+    bp <- BiocParallel::SerialParam(
+      RNGseed = as.integer(random_seed),
+      progressbar = TRUE
+    )
+  }
+
+  parts <- BiocParallel::bplapply(
+    batch_ids,
+    function(ids) {
+      run_resampling_analysis(
+        index_list = index_list[ids],
+        resample_names = resample_names[ids],
+        counts_mat = counts_mat,
+        metadata = metadata,
+        genes_to_keep = genes_to_keep,
+        target_genes = target_genes,
+        contrasts_to_test = contrasts_to_test,
+        fdr_cutoff = fdr_cutoff
+      )
+    },
+    BPPARAM = bp
+  )
+
+  logFC_combined <- setNames(
+    lapply(
+      contrasts_to_test,
+      function(contrast_name) {
+        matrices <- lapply(
+          parts,
+          function(x) {
+            x$logFC[[contrast_name]]
+          }
+        )
+
+        combined <- do.call(
+          cbind,
+          matrices
+        )
+
+        colnames(combined) <- resample_names
+        combined
+      }
+    ),
+    contrasts_to_test
+  )
+
+  FDR_combined <- setNames(
+    lapply(
+      contrasts_to_test,
+      function(contrast_name) {
+        matrices <- lapply(
+          parts,
+          function(x) {
+            x$FDR[[contrast_name]]
+          }
+        )
+
+        combined <- do.call(
+          cbind,
+          matrices
+        )
+
+        colnames(combined) <- resample_names
+        combined
+      }
+    ),
+    contrasts_to_test
+  )
+
+  total_DE_combined <- do.call(
+    rbind,
+    lapply(
+      parts,
+      function(x) {
+        x$total_DE
+      }
+    )
+  )
+
+  rownames(total_DE_combined) <-
+    resample_names
+
+  failure_messages <- unlist(
+    lapply(
+      parts,
+      function(x) {
+        x$failures
+      }
+    ),
+    use.names = FALSE
+  )
+
+  names(failure_messages) <-
+    resample_names
+
+  list(
+    logFC = logFC_combined,
+    FDR = FDR_combined,
+    total_DE = total_DE_combined,
+    failures = failure_messages
+  )
+}
+```
+
+```{r}
+safe_quantile <- function(x, probability) {
+  if (length(x) == 0 || all(is.na(x))) {
+    return(NA_real_)
+  }
+
+  unname(
+    stats::quantile(
+      x,
+      probs = probability,
+      na.rm = TRUE,
+      type = 6
+    )
+  )
+}
+
+
+safe_median <- function(x) {
+  if (length(x) == 0 || all(is.na(x))) {
+    return(NA_real_)
+  }
+
+  stats::median(
+    x,
+    na.rm = TRUE
+  )
+}
+
+
+summarize_resampling <- function(
+    resampling_results,
+    full_results,
+    target_genes,
+    method_name,
+    fdr_cutoff,
+    sign_consistency_cutoff,
+    repeated_significance_cutoff
+) {
+  contrast_names <- names(target_genes)
+
+  if (is.null(contrast_names)) {
+    stop("target_genes must be a named list.")
+  }
+
+  missing_logfc <- setdiff(
+    contrast_names,
+    names(resampling_results$logFC)
+  )
+
+  missing_fdr <- setdiff(
+    contrast_names,
+    names(resampling_results$FDR)
+  )
+
+  missing_full <- setdiff(
+    contrast_names,
+    names(full_results)
+  )
+
+  if (length(missing_logfc) > 0) {
+    stop(
+      "Missing logFC matrices for contrasts: ",
+      paste(missing_logfc, collapse = ", ")
+    )
+  }
+
+  if (length(missing_fdr) > 0) {
+    stop(
+      "Missing FDR matrices for contrasts: ",
+      paste(missing_fdr, collapse = ", ")
+    )
+  }
+
+  if (length(missing_full) > 0) {
+    stop(
+      "Missing primary results for contrasts: ",
+      paste(missing_full, collapse = ", ")
+    )
+  }
+
+  summaries <- lapply(
+    contrast_names,
+    function(contrast_name) {
+      genes <- target_genes[[contrast_name]]
+
+      if (length(genes) == 0) {
+        return(tibble::tibble())
+      }
+
+      logFC_matrix <-
+        resampling_results$logFC[[contrast_name]]
+
+      FDR_matrix <-
+        resampling_results$FDR[[contrast_name]]
+
+      if (!is.matrix(logFC_matrix)) {
+        logFC_matrix <- as.matrix(logFC_matrix)
+      }
+
+      if (!is.matrix(FDR_matrix)) {
+        FDR_matrix <- as.matrix(FDR_matrix)
+      }
+
+      if (!identical(dim(logFC_matrix), dim(FDR_matrix))) {
+        stop(
+          "logFC and FDR matrices have different dimensions for contrast: ",
+          contrast_name
+        )
+      }
+
+      if (ncol(logFC_matrix) == 0) {
+        stop(
+          "No resampling columns were found for contrast: ",
+          contrast_name
+        )
+      }
+
+      full_result_table <-
+        full_results[[contrast_name]]
+
+      gene_positions <- match(
+        genes,
+        rownames(full_result_table)
+      )
+
+      if (anyNA(gene_positions)) {
+        missing_genes <- genes[
+          is.na(gene_positions)
+        ]
+
+        stop(
+          "Some target pre-miRNAs are missing from the primary result for ",
+          contrast_name,
+          ": ",
+          paste(
+            head(missing_genes, 20),
+            collapse = ", "
+          )
+        )
+      }
+
+      full_table <- full_result_table[
+        gene_positions,
+        ,
+        drop = FALSE
+      ]
+
+      rownames(full_table) <- genes
+
+      full_logFC <- as.numeric(
+        full_table$logFC
+      )
+
+      full_FDR <- as.numeric(
+        full_table$FDR
+      )
+
+      
+      logFC_positions <- match(
+        genes,
+        rownames(logFC_matrix)
+      )
+
+      FDR_positions <- match(
+        genes,
+        rownames(FDR_matrix)
+      )
+
+      if (
+        anyNA(logFC_positions) ||
+        anyNA(FDR_positions)
+      ) {
+        stop(
+          "Some target pre-miRNAs are missing from the resampling matrices for ",
+          contrast_name
+        )
+      }
+
+      logFC_matrix <- logFC_matrix[
+        logFC_positions,
+        ,
+        drop = FALSE
+      ]
+
+      FDR_matrix <- FDR_matrix[
+        FDR_positions,
+        ,
+        drop = FALSE
+      ]
+
+      valid_result <-
+        !is.na(logFC_matrix) &
+        !is.na(FDR_matrix)
+
+      same_direction <- sweep(
+        sign(logFC_matrix),
+        MARGIN = 1,
+        STATS = sign(full_logFC),
+        FUN = "=="
+      )
+
+      significant <-
+        !is.na(FDR_matrix) &
+        FDR_matrix <= fdr_cutoff
+
+      n_tested <- rowSums(
+        valid_result,
+        na.rm = TRUE
+      )
+
+      sign_consistency <- ifelse(
+        n_tested > 0,
+        rowSums(
+          same_direction & valid_result,
+          na.rm = TRUE
+        ) / n_tested,
+        NA_real_
+      )
+
+      FDR_rate <- ifelse(
+        n_tested > 0,
+        rowSums(
+          significant & valid_result,
+          na.rm = TRUE
+        ) / n_tested,
+        NA_real_
+      )
+
+      FDR_same_direction_rate <- ifelse(
+        n_tested > 0,
+        rowSums(
+          significant &
+            same_direction &
+            valid_result,
+          na.rm = TRUE
+        ) / n_tested,
+        NA_real_
+      )
+
+      median_logFC <- apply(
+        logFC_matrix,
+        MARGIN = 1,
+        FUN = safe_median
+      )
+
+      logFC_q025 <- apply(
+        logFC_matrix,
+        MARGIN = 1,
+        FUN = safe_quantile,
+        probability = 0.025
+      )
+
+      logFC_q975 <- apply(
+        logFC_matrix,
+        MARGIN = 1,
+        FUN = safe_quantile,
+        probability = 0.975
+      )
+
+      direction_stable <- (
+        !is.na(logFC_q025) &
+        !is.na(logFC_q975) &
+        logFC_q025 > 0 &
+        logFC_q975 > 0
+      ) | (
+        !is.na(logFC_q025) &
+        !is.na(logFC_q975) &
+        logFC_q025 < 0 &
+        logFC_q975 < 0
+      )
+
+      tested_rate <-
+        n_tested / ncol(logFC_matrix)
+
+      robust_effect <- (
+        !is.na(tested_rate) &
+        tested_rate >= 0.95 &
+        !is.na(sign_consistency) &
+        sign_consistency >= sign_consistency_cutoff &
+        direction_stable
+      )
+
+      repeatedly_significant <- (
+        !is.na(FDR_same_direction_rate) &
+        FDR_same_direction_rate >=
+          repeated_significance_cutoff
+      )
+
+      tibble::tibble(
+        Contrast = contrast_name,
+        pre_miRNA = genes,
+        Method = method_name,
+        n_resamples = ncol(logFC_matrix),
+        n_tested = n_tested,
+        tested_rate = tested_rate,
+        full_logFC = full_logFC,
+        full_FDR = full_FDR,
+        resampled_median_logFC = median_logFC,
+        resampled_logFC_q025 = logFC_q025,
+        resampled_logFC_q975 = logFC_q975,
+        sign_consistency = sign_consistency,
+        FDR_rate = FDR_rate,
+        FDR_same_direction_rate =
+          FDR_same_direction_rate,
+        direction_stable = direction_stable,
+        robust_effect = robust_effect,
+        repeatedly_significant =
+          repeatedly_significant
+      )
+    }
+  )
+
+  dplyr::bind_rows(summaries)
+}
+```
+
+```{r}
+run_mirna_stability_analysis <- function(
+    dataset_name,
+    clinical_file,
+    counts_file
+) {
+  message(
+    "\n========================================\n",
+    "Starting ", dataset_name,
+    " pre-miRNA stability analysis\n",
+    "========================================"
+  )
+
+  dataset_dir <- file.path(
+    params$output_root,
+    dataset_name
+  )
+
+  primary_dir <- file.path(
+    dataset_dir,
+    "primary_DE"
+  )
+
+  stability_dir <- file.path(
+    dataset_dir,
+    "stability_analysis"
+  )
+
+  figure_dir <- file.path(
+    dataset_dir,
+    "figures"
+  )
+
+  fs::dir_create(
+    c(
+      dataset_dir,
+      primary_dir,
+      stability_dir,
+      figure_dir
+    )
+  )
+
+  
+  
+  
+
+  clinical <- read_clinical_data(
+    file = clinical_file,
+    dataset_name = dataset_name,
+    output_dir = stability_dir
+  )
+
+  counts <- read_mirna_counts(
+    file = counts_file,
+    dataset_name = dataset_name,
+    output_dir = stability_dir
+  )
+
+  common_samples <- intersect(
+    colnames(counts),
+    rownames(clinical)
+  )
+
+  if (length(common_samples) == 0) {
+    stop(
+      dataset_name,
+      ": no sample names are shared by the count matrix and clinical data."
+    )
+  }
+
+  counts <- counts[
+    ,
+    common_samples,
+    drop = FALSE
+  ]
+
+  clinical <- clinical[
+    common_samples,
+    ,
+    drop = FALSE
+  ]
+
+  if (!identical(colnames(counts), rownames(clinical))) {
+    stop(
+      dataset_name,
+      ": counts and clinical sample orders do not match."
+    )
+  }
+
+  group_sizes <- table(
+    clinical$MSI_TMB,
+    useNA = "ifany"
+  )
+
+  required_groups <- c(
+    "MSI_H",
+    "MSS_TMB_H",
+    "MSS_TMB_L"
+  )
+
+  missing_groups <- setdiff(
+    required_groups,
+    names(group_sizes)
+  )
+
+  if (length(missing_groups) > 0) {
+    stop(
+      dataset_name,
+      ": missing MSI/TMB groups: ",
+      paste(missing_groups, collapse = ", ")
+    )
+  }
+
+  if (any(group_sizes[required_groups] == 0)) {
+    stop(
+      dataset_name,
+      ": at least one required MSI/TMB group has no matched samples."
+    )
+  }
+
+  group_size_table <- tibble::tibble(
+    Dataset = dataset_name,
+    Group = names(group_sizes),
+    Number_of_samples = as.integer(group_sizes)
+  )
+
+  write.csv(
+    group_size_table,
+    file.path(
+      stability_dir,
+      "group_sizes.csv"
+    ),
+    row.names = FALSE
+  )
+
+  write.csv(
+    clinical,
+    file.path(
+      stability_dir,
+      "clinical_data_used.csv"
+    ),
+    row.names = TRUE
+  )
+
+  write.csv(
+    tibble::tibble(
+      pre_miRNA = rownames(counts)
+    ),
+    file.path(
+      stability_dir,
+      "pre_miRNAs_before_expression_filtering.csv"
+    ),
+    row.names = FALSE
+  )
+
+  
+  
+  
+
+  primary_model <- fit_edger_model(
+    counts_mat = counts,
+    metadata = clinical,
+    min_count = params$min_count
+  )
+
+  primary_results <- extract_contrast_results(
+    primary_model
+  )
+
+  saveRDS(
+    primary_model,
+    file.path(
+      stability_dir,
+      "primary_edgeR_model.rds"
+    )
+  )
+
+  writeLines(
+    primary_model$kept_genes,
+    file.path(
+      stability_dir,
+      "pre_miRNAs_tested_primary_analysis.txt"
+    )
+  )
+
+  for (contrast_name in names(primary_results)) {
+    write.csv(
+      primary_results[[contrast_name]],
+      file.path(
+        primary_dir,
+        paste0(
+          contrast_name,
+          ".csv"
+        )
+      )
+    )
+  }
+
+  primary_significant <- dplyr::bind_rows(
+    lapply(
+      names(primary_results),
+      function(contrast_name) {
+        primary_results[[contrast_name]] %>%
+          tibble::rownames_to_column(
+            "pre_miRNA"
+          ) %>%
+          tibble::as_tibble() %>%
+          dplyr::filter(
+            !is.na(FDR),
+            FDR <= params$fdr_threshold
+          ) %>%
+          dplyr::mutate(
+            Dataset = dataset_name,
+            Contrast = contrast_name,
+            Direction = dplyr::case_when(
+              logFC > 0 ~ "Up_in_first_group",
+              logFC < 0 ~ "Down_in_first_group",
+              TRUE ~ "No_change"
+            ),
+            Passes_logFC_cutoff =
+              abs(logFC) >= params$logfc_threshold,
+            .before = 1
+          )
+      }
+    )
+  )
+
+  write.csv(
+    primary_significant,
+    file.path(
+      primary_dir,
+      "all_primary_significant_pre_miRNAs.csv"
+    ),
+    row.names = FALSE
+  )
+
+  
+  
+  
+
+  missing_stability_contrasts <- setdiff(
+    stability_contrasts,
+    names(primary_results)
+  )
+
+  if (length(missing_stability_contrasts) > 0) {
+    stop(
+      "Missing primary results for contrasts: ",
+      paste(
+        missing_stability_contrasts,
+        collapse = ", "
+      )
+    )
+  }
+
+  target_genes <- lapply(
+    primary_results[stability_contrasts],
+    function(result_table) {
+      rownames(result_table)[
+        !is.na(result_table$FDR) &
+          result_table$FDR <= params$fdr_threshold
+      ]
+    }
+  )
+
+  target_counts <- tibble::tibble(
+    Dataset = dataset_name,
+    Contrast = names(target_genes),
+    Number_of_primary_significant = vapply(
+      target_genes,
+      length,
+      integer(1)
+    )
+  )
+
+  write.csv(
+    target_counts,
+    file.path(
+      stability_dir,
+      "target_pre_miRNA_counts.csv"
+    ),
+    row.names = FALSE
+  )
+
+  
+  
+  
+
+  dataset_seed_offset <- match(
+    dataset_name,
+    c("CRC", "UCEC")
+  )
+
+  if (is.na(dataset_seed_offset)) {
+    dataset_seed_offset <- 0L
+  }
+
+  dataset_seed <- as.integer(
+    params$random_seed
+  ) + as.integer(dataset_seed_offset)
+
+  set.seed(dataset_seed)
+
+  B <- as.integer(
+    params$bootstrap_iterations
+  )
+
+  if (is.na(B) || B < 1L) {
+    stop(
+      "bootstrap_iterations must be at least 1."
+    )
+  }
+
+  bootstrap_index_list <- replicate(
+    B,
+    stratified_bootstrap_indices(
+      clinical$MSI_TMB
+    ),
+    simplify = FALSE
+  )
+
+  bootstrap_names <- sprintf(
+    "bootstrap_%04d",
+    seq_len(B)
+  )
+
+  bootstrap_results <- run_resampling_parallel(
+    index_list = bootstrap_index_list,
+    resample_names = bootstrap_names,
+    counts_mat = counts,
+    metadata = clinical,
+    genes_to_keep = primary_model$kept_genes,
+    target_genes = target_genes,
+    contrasts_to_test = stability_contrasts,
+    fdr_cutoff = params$fdr_threshold,
+    n_workers = params$parallel_workers,
+    batch_size = params$bootstrap_batch_size,
+    random_seed = dataset_seed
+  )
+
+  saveRDS(
+    bootstrap_results,
+    file.path(
+      stability_dir,
+      "bootstrap_results.rds"
+    )
+  )
+
+  bootstrap_failures <- as.character(
+    bootstrap_results$failures
+  )
+
+  if (length(bootstrap_failures) != length(bootstrap_names)) {
+    stop(
+      "The number of bootstrap failure records does not match ",
+      "the number of bootstrap resamples."
+    )
+  }
+
+  bootstrap_failure_table <- tibble::tibble(
+    Resample = bootstrap_names,
+    Failure = bootstrap_failures
+  )
+
+  write.csv(
+    bootstrap_failure_table,
+    file.path(
+      stability_dir,
+      "bootstrap_failures.csv"
+    ),
+    row.names = FALSE
+  )
+
+  bootstrap_summary <- summarize_resampling(
+    resampling_results = bootstrap_results,
+    full_results = primary_results,
+    target_genes = target_genes,
+    method_name = "Stratified bootstrap",
+    fdr_cutoff = params$fdr_threshold,
+    sign_consistency_cutoff =
+      params$sign_consistency_threshold,
+    repeated_significance_cutoff =
+      params$repeated_significance_threshold
+  )
+
+  write.csv(
+    bootstrap_summary,
+    file.path(
+      stability_dir,
+      "bootstrap_pre_miRNA_stability_summary.csv"
+    ),
+    row.names = FALSE
+  )
+
+  
+  
+  
+
+  mssh_group_size <- as.integer(
+    group_sizes[["MSS_TMB_H"]]
+  )
+
+  run_loo <- isTRUE(
+    as_flag(params$run_leave_one_out)
+  ) && mssh_group_size >= 2L
+
+  if (run_loo) {
+    mssh_indices <- which(
+      clinical$MSI_TMB == "MSS_TMB_H"
+    )
+
+    loo_index_list <- lapply(
+      mssh_indices,
+      function(omit_index) {
+        setdiff(
+          seq_len(ncol(counts)),
+          omit_index
+        )
+      }
+    )
+
+    loo_names <- paste0(
+      "leave_out_",
+      colnames(counts)[mssh_indices]
+    )
+
+    loo_results <- run_resampling_parallel(
+      index_list = loo_index_list,
+      resample_names = loo_names,
+      counts_mat = counts,
+      metadata = clinical,
+      genes_to_keep = primary_model$kept_genes,
+      target_genes = target_genes,
+      contrasts_to_test = stability_contrasts,
+      fdr_cutoff = params$fdr_threshold,
+      n_workers = params$parallel_workers,
+      batch_size = params$bootstrap_batch_size,
+      random_seed = dataset_seed + 1000L
+    )
+
+    saveRDS(
+      loo_results,
+      file.path(
+        stability_dir,
+        "leave_one_MSS_TMB_H_out_results.rds"
+      )
+    )
+
+    loo_failures <- as.character(
+      loo_results$failures
+    )
+
+    write.csv(
+      tibble::tibble(
+        Resample = loo_names,
+        Failure = loo_failures
+      ),
+      file.path(
+        stability_dir,
+        "leave_one_out_failures.csv"
+      ),
+      row.names = FALSE
+    )
+
+    loo_summary <- summarize_resampling(
+      resampling_results = loo_results,
+      full_results = primary_results,
+      target_genes = target_genes,
+      method_name = "Leave-one-MSS/TMB-H-out",
+      fdr_cutoff = params$fdr_threshold,
+      sign_consistency_cutoff =
+        params$sign_consistency_threshold,
+      repeated_significance_cutoff =
+        params$repeated_significance_threshold
+    )
+  } else {
+    loo_results <- NULL
+    loo_summary <- tibble::tibble()
+
+    write_empty_csv(
+      file.path(
+        stability_dir,
+        "leave_one_out_failures.csv"
+      ),
+      c(
+        "Resample",
+        "Failure"
+      )
+    )
+  }
+
+  write.csv(
+    loo_summary,
+    file.path(
+      stability_dir,
+      "leave_one_out_pre_miRNA_stability_summary.csv"
+    ),
+    row.names = FALSE
+  )
+
+  
+  
+  
+
+  if (nrow(bootstrap_summary) > 0) {
+    bootstrap_wide <- bootstrap_summary %>%
+      dplyr::select(
+        Contrast,
+        pre_miRNA,
+        bootstrap_tested_rate = tested_rate,
+        bootstrap_median_logFC =
+          resampled_median_logFC,
+        bootstrap_logFC_q025 =
+          resampled_logFC_q025,
+        bootstrap_logFC_q975 =
+          resampled_logFC_q975,
+        bootstrap_sign_consistency =
+          sign_consistency,
+        bootstrap_FDR_rate = FDR_rate,
+        bootstrap_FDR_same_direction_rate =
+          FDR_same_direction_rate,
+        bootstrap_direction_stable =
+          direction_stable,
+        bootstrap_robust_effect =
+          robust_effect,
+        bootstrap_repeatedly_significant =
+          repeatedly_significant
+      )
+  } else {
+    bootstrap_wide <- tibble::tibble(
+      Contrast = character(),
+      pre_miRNA = character(),
+      bootstrap_tested_rate = numeric(),
+      bootstrap_median_logFC = numeric(),
+      bootstrap_logFC_q025 = numeric(),
+      bootstrap_logFC_q975 = numeric(),
+      bootstrap_sign_consistency = numeric(),
+      bootstrap_FDR_rate = numeric(),
+      bootstrap_FDR_same_direction_rate =
+        numeric(),
+      bootstrap_direction_stable = logical(),
+      bootstrap_robust_effect = logical(),
+      bootstrap_repeatedly_significant =
+        logical()
+    )
+  }
+
+  if (nrow(loo_summary) > 0) {
+    loo_wide <- loo_summary %>%
+      dplyr::select(
+        Contrast,
+        pre_miRNA,
+        loo_tested_rate = tested_rate,
+        loo_median_logFC =
+          resampled_median_logFC,
+        loo_logFC_q025 =
+          resampled_logFC_q025,
+        loo_logFC_q975 =
+          resampled_logFC_q975,
+        loo_sign_consistency =
+          sign_consistency,
+        loo_FDR_rate = FDR_rate,
+        loo_FDR_same_direction_rate =
+          FDR_same_direction_rate,
+        loo_direction_stable =
+          direction_stable,
+        loo_robust_effect = robust_effect,
+        loo_repeatedly_significant =
+          repeatedly_significant
+      )
+  } else {
+    loo_wide <- tibble::tibble(
+      Contrast = character(),
+      pre_miRNA = character()
+    )
+  }
+
+  
+  
+  
+
+  full_target_information <- dplyr::bind_rows(
+    lapply(
+      stability_contrasts,
+      function(contrast_name) {
+        genes <- target_genes[[contrast_name]]
+
+        if (length(genes) == 0) {
+          return(tibble::tibble())
+        }
+
+        result_table <- primary_results[[contrast_name]]
+
+        gene_positions <- match(
+          genes,
+          rownames(result_table)
+        )
+
+        if (anyNA(gene_positions)) {
+          missing_genes <- genes[
+            is.na(gene_positions)
+          ]
+
+          stop(
+            "Target pre-miRNAs are missing from the primary table for ",
+            contrast_name,
+            ": ",
+            paste(
+              head(missing_genes, 20),
+              collapse = ", "
+            )
+          )
+        }
+
+        result_table[
+          gene_positions,
+          ,
+          drop = FALSE
+        ] %>%
+          tibble::rownames_to_column(
+            "pre_miRNA"
+          ) %>%
+          tibble::as_tibble() %>%
+          dplyr::mutate(
+            Dataset = dataset_name,
+            Contrast = contrast_name,
+            .before = 1
+          )
+      }
+    )
+  )
+
+  
+  
+  
+
+  combined_stability <- full_target_information %>%
+    dplyr::left_join(
+      bootstrap_wide,
+      by = c(
+        "Contrast",
+        "pre_miRNA"
+      )
+    )
+
+  if (nrow(loo_wide) > 0) {
+    combined_stability <- combined_stability %>%
+      dplyr::left_join(
+        loo_wide,
+        by = c(
+          "Contrast",
+          "pre_miRNA"
+        )
+      )
+  } else {
+    combined_stability <- combined_stability %>%
+      dplyr::mutate(
+        loo_tested_rate = NA_real_,
+        loo_median_logFC = NA_real_,
+        loo_logFC_q025 = NA_real_,
+        loo_logFC_q975 = NA_real_,
+        loo_sign_consistency = NA_real_,
+        loo_FDR_rate = NA_real_,
+        loo_FDR_same_direction_rate =
+          NA_real_,
+        loo_direction_stable = NA,
+        loo_robust_effect = NA,
+        loo_repeatedly_significant = NA
+      )
+  }
+
+  if (nrow(combined_stability) > 0) {
+    combined_stability <- combined_stability %>%
+      dplyr::mutate(
+        bootstrap_stable = dplyr::coalesce(
+          bootstrap_robust_effect,
+          FALSE
+        ),
+
+        bootstrap_stable_strict =
+          dplyr::coalesce(
+            bootstrap_robust_effect,
+            FALSE
+          ) &
+          dplyr::coalesce(
+            bootstrap_repeatedly_significant,
+            FALSE
+          ),
+
+        stable_in_both_analyses =
+          dplyr::case_when(
+            is.na(loo_robust_effect) ~
+              NA,
+
+            TRUE ~
+              bootstrap_stable &
+              loo_robust_effect
+          ),
+
+        repeatedly_significant_in_both =
+          dplyr::case_when(
+            is.na(
+              loo_repeatedly_significant
+            ) ~ NA,
+
+            TRUE ~
+              dplyr::coalesce(
+                bootstrap_repeatedly_significant,
+                FALSE
+              ) &
+              loo_repeatedly_significant
+          ),
+
+        Primary_passes_logFC_cutoff =
+          abs(logFC) >=
+          params$logfc_threshold,
+
+        Bootstrap_failure_reason =
+          dplyr::case_when(
+            bootstrap_stable ~
+              "Passed bootstrap robust-effect criterion",
+
+            is.na(bootstrap_tested_rate) ~
+              "Missing bootstrap result",
+
+            bootstrap_tested_rate < 0.95 ~
+              "Tested in fewer than 95% of bootstrap samples",
+
+            bootstrap_sign_consistency <
+              params$sign_consistency_threshold &
+              !bootstrap_direction_stable ~
+              "Low sign consistency and interval crosses zero",
+
+            bootstrap_sign_consistency <
+              params$sign_consistency_threshold ~
+              "Low sign consistency",
+
+            !bootstrap_direction_stable ~
+              "Bootstrap logFC interval crosses zero",
+
+            TRUE ~
+              "Did not pass bootstrap"
+          )
+      ) %>%
+      dplyr::arrange(
+        Contrast,
+        FDR,
+        dplyr::desc(abs(logFC))
+      )
+  } else {
+    combined_stability$bootstrap_stable <-
+      logical(0)
+
+    combined_stability$bootstrap_stable_strict <-
+      logical(0)
+
+    combined_stability$stable_in_both_analyses <-
+      logical(0)
+
+    combined_stability$repeatedly_significant_in_both <-
+      logical(0)
+
+    combined_stability$Primary_passes_logFC_cutoff <-
+      logical(0)
+
+    combined_stability$Bootstrap_failure_reason <-
+      character(0)
+  }
+
+  write.csv(
+    combined_stability,
+    file.path(
+      stability_dir,
+      "combined_primary_bootstrap_LOO_pre_miRNA_stability.csv"
+    ),
+    row.names = FALSE
+  )
+
+  
+  
+  
+
+  stable_pre_mirnas <- combined_stability %>%
+    dplyr::filter(
+      bootstrap_stable
+    )
+
+  strict_stable_pre_mirnas <- combined_stability %>%
+    dplyr::filter(
+      bootstrap_stable_strict
+    )
+
+  failed_pre_mirnas <- combined_stability %>%
+    dplyr::filter(
+      !bootstrap_stable
+    )
+
+  write.csv(
+    stable_pre_mirnas,
+    file.path(
+      stability_dir,
+      "bootstrap_stable_pre_miRNAs.csv"
+    ),
+    row.names = FALSE
+  )
+
+  write.csv(
+    strict_stable_pre_mirnas,
+    file.path(
+      stability_dir,
+      "bootstrap_strict_stable_pre_miRNAs.csv"
+    ),
+    row.names = FALSE
+  )
+
+  write.csv(
+    failed_pre_mirnas,
+    file.path(
+      stability_dir,
+      "primary_significant_pre_miRNAs_not_passing_bootstrap.csv"
+    ),
+    row.names = FALSE
+  )
+
+  
+  
+  
+
+  stable_counts <- stable_pre_mirnas %>%
+    dplyr::count(
+      Contrast,
+      name = "Bootstrap_robust_effect"
+    )
+
+  strict_counts <- strict_stable_pre_mirnas %>%
+    dplyr::count(
+      Contrast,
+      name = "Bootstrap_strict_stable"
+    )
+
+  comparison_summary <- target_counts %>%
+    dplyr::left_join(
+      stable_counts,
+      by = "Contrast"
+    ) %>%
+    dplyr::left_join(
+      strict_counts,
+      by = "Contrast"
+    ) %>%
+    dplyr::mutate(
+      Bootstrap_robust_effect =
+        dplyr::coalesce(
+          Bootstrap_robust_effect,
+          0L
+        ),
+
+      Bootstrap_strict_stable =
+        dplyr::coalesce(
+          Bootstrap_strict_stable,
+          0L
+        ),
+
+      Not_passing_bootstrap =
+        Number_of_primary_significant -
+        Bootstrap_robust_effect,
+
+      Retained_percent = round(
+        100 * safe_divide(
+          Bootstrap_robust_effect,
+          Number_of_primary_significant
+        ),
+        2
+      )
+    )
+
+  write.csv(
+    comparison_summary,
+    file.path(
+      stability_dir,
+      "primary_vs_bootstrap_stable_counts.csv"
+    ),
+    row.names = FALSE
+  )
+
+  bootstrap_DE_counts <- as.data.frame(
+    bootstrap_results$total_DE
+  ) %>%
+    tibble::rownames_to_column(
+      "Resample"
+    )
+
+  write.csv(
+    bootstrap_DE_counts,
+    file.path(
+      stability_dir,
+      "bootstrap_number_of_significant_pre_miRNAs.csv"
+    ),
+    row.names = FALSE
+  )
+
+  
+  
+  
+
+  count_plot_data <- comparison_summary %>%
+    dplyr::select(
+      Dataset,
+      Contrast,
+      Primary =
+        Number_of_primary_significant,
+      Bootstrap_robust =
+        Bootstrap_robust_effect,
+      Bootstrap_strict =
+        Bootstrap_strict_stable
+    ) %>%
+    tidyr::pivot_longer(
+      cols = c(
+        Primary,
+        Bootstrap_robust,
+        Bootstrap_strict
+      ),
+      names_to = "Analysis",
+      values_to = "Number_of_pre_miRNAs"
+    )
+
+  p_counts <- ggplot2::ggplot(
+    count_plot_data,
+    ggplot2::aes(
+      Contrast,
+      Number_of_pre_miRNAs,
+      fill = Analysis
+    )
+  ) +
+    ggplot2::geom_col(
+      position =
+        ggplot2::position_dodge(
+          width = 0.8
+        ),
+      width = 0.72
+    ) +
+    ggplot2::geom_text(
+      ggplot2::aes(
+        label =
+          Number_of_pre_miRNAs
+      ),
+      position =
+        ggplot2::position_dodge(
+          width = 0.8
+        ),
+      vjust = -0.3,
+      size = 3.5
+    ) +
+    ggplot2::labs(
+      title = paste0(
+        dataset_name,
+        ": primary versus bootstrap-stable pre-miRNAs"
+      ),
+      x = NULL,
+      y = "Number of significant pre-miRNAs",
+      fill = NULL
+    ) +
+    ggplot2::theme_classic(
+      base_size = 12
+    ) +
+    ggplot2::theme(
+      axis.text.x =
+        ggplot2::element_text(
+          angle = 25,
+          hjust = 1
+        ),
+      legend.position = "top"
+    )
+
+  ggplot2::ggsave(
+    file.path(
+      figure_dir,
+      "primary_vs_bootstrap_stable_counts.svg"
+    ),
+    p_counts,
+    width = 9,
+    height = 5.5,
+    device = "svg"
+  )
+
+  
+  
+  
+
+  if (nrow(bootstrap_summary) > 0) {
+    p_logfc <- ggplot2::ggplot(
+      bootstrap_summary,
+      ggplot2::aes(
+        full_logFC,
+        resampled_median_logFC
+      )
+    ) +
+      ggplot2::geom_hline(
+        yintercept = 0,
+        linetype = "dashed"
+      ) +
+      ggplot2::geom_vline(
+        xintercept = 0,
+        linetype = "dashed"
+      ) +
+      ggplot2::geom_abline(
+        slope = 1,
+        intercept = 0,
+        linetype = "dotted"
+      ) +
+      ggplot2::geom_errorbar(
+        ggplot2::aes(
+          ymin =
+            resampled_logFC_q025,
+          ymax =
+            resampled_logFC_q975
+        ),
+        width = 0,
+        alpha = 0.45
+      ) +
+      ggplot2::geom_point(
+        ggplot2::aes(
+          shape =
+            direction_stable,
+          size =
+            FDR_same_direction_rate
+        ),
+        alpha = 0.8
+      ) +
+      ggplot2::facet_wrap(
+        ~ Contrast,
+        scales = "free"
+      ) +
+      ggplot2::labs(
+        title = paste0(
+          dataset_name,
+          ": bootstrap stability of pre-miRNA effect sizes"
+        ),
+        x = "Primary logFC",
+        y = "Median bootstrap logFC",
+        shape =
+          "95% interval excludes zero",
+        size =
+          "Significant in same direction"
+      ) +
+      ggplot2::theme_classic(
+        base_size = 12
+      )
+
+    ggplot2::ggsave(
+      file.path(
+        figure_dir,
+        "bootstrap_logFC_stability.svg"
+      ),
+      p_logfc,
+      width = 10,
+      height = 6,
+      device = "svg"
+    )
+
+    stability_long <- bootstrap_summary %>%
+      dplyr::select(
+        Contrast,
+        pre_miRNA,
+        Sign_consistency =
+          sign_consistency,
+        Repeated_significance =
+          FDR_same_direction_rate
+      ) %>%
+      tidyr::pivot_longer(
+        cols = c(
+          Sign_consistency,
+          Repeated_significance
+        ),
+        names_to = "Measure",
+        values_to = "Rate"
+      )
+
+    p_rates <- ggplot2::ggplot(
+      stability_long,
+      ggplot2::aes(
+        Rate,
+        fill = Measure
+      )
+    ) +
+      ggplot2::geom_histogram(
+        bins = 20,
+        alpha = 0.65,
+        position = "identity"
+      ) +
+      ggplot2::facet_wrap(
+        ~ Contrast
+      ) +
+      ggplot2::geom_vline(
+        xintercept = c(
+          params$sign_consistency_threshold,
+          params$repeated_significance_threshold
+        ),
+        linetype = "dashed"
+      ) +
+      ggplot2::labs(
+        title = paste0(
+          dataset_name,
+          ": bootstrap stability-rate distributions"
+        ),
+        x = "Rate",
+        y = "Number of pre-miRNAs",
+        fill = NULL
+      ) +
+      ggplot2::theme_classic(
+        base_size = 12
+      )
+
+    ggplot2::ggsave(
+      file.path(
+        figure_dir,
+        "bootstrap_stability_rate_distributions.svg"
+      ),
+      p_rates,
+      width = 10,
+      height = 6,
+      device = "svg"
+    )
+  }
+
+  
+  
+  
+
+  excel_file <- file.path(
+    dataset_dir,
+    paste0(
+      dataset_name,
+      "_pre_miRNA_bootstrap_stability.xlsx"
+    )
+  )
+
+  openxlsx::write.xlsx(
+    list(
+      Group_sizes =
+        group_size_table,
+      Primary_counts =
+        target_counts,
+      Primary_significant =
+        primary_significant,
+      Bootstrap_count_comparison =
+        comparison_summary,
+      Bootstrap_stability =
+        bootstrap_summary,
+      Combined_stability =
+        combined_stability,
+      Bootstrap_stable =
+        stable_pre_mirnas,
+      Strict_stable =
+        strict_stable_pre_mirnas,
+      Not_passing_bootstrap =
+        failed_pre_mirnas,
+      Bootstrap_failures =
+        bootstrap_failure_table,
+      LOO_stability =
+        loo_summary
+    ),
+    file = excel_file,
+    overwrite = TRUE
+  )
+
+  message(
+    dataset_name,
+    " analysis completed. Results saved to: ",
+    dataset_dir
+  )
+
+  
+  
+  
+
+  list(
+    dataset = dataset_name,
+    dataset_dir = dataset_dir,
+    group_sizes = group_size_table,
+    primary_results = primary_results,
+    primary_significant =
+      primary_significant,
+    target_genes = target_genes,
+    bootstrap_results =
+      bootstrap_results,
+    bootstrap_summary =
+      bootstrap_summary,
+    loo_results = loo_results,
+    loo_summary = loo_summary,
+    combined_stability =
+      combined_stability,
+    comparison_summary =
+      comparison_summary,
+    stable_pre_mirnas =
+      stable_pre_mirnas,
+    strict_stable_pre_mirnas =
+      strict_stable_pre_mirnas,
+    failed_pre_mirnas =
+      failed_pre_mirnas
+  )
+}
+```
+
+```{r}
+crc_analysis <- run_mirna_stability_analysis(
+  dataset_name = "CRC",
+  clinical_file =
+    params$crc_clinical_file,
+  counts_file =
+    crc_counts_file
+)
+
+knitr::kable(
+  crc_analysis$group_sizes,
+  caption = "CRC sample counts."
+)
+
+knitr::kable(
+  crc_analysis$comparison_summary,
+  caption = "CRC primary versus bootstrap-stable pre-miRNAs."
+)
+```
+
+```{r}
+ucec_analysis <- run_mirna_stability_analysis(
+  dataset_name = "UCEC",
+  clinical_file =
+    params$ucec_clinical_file,
+  counts_file =
+    ucec_counts_file
+)
+
+knitr::kable(
+  ucec_analysis$group_sizes,
+  caption = "UCEC sample counts."
+)
+
+knitr::kable(
+  ucec_analysis$comparison_summary,
+  caption = "UCEC primary versus bootstrap-stable pre-miRNAs."
+)
+```
+
+```{r}
+combined_count_summary <- bind_rows(
+  crc_analysis$comparison_summary,
+  ucec_analysis$comparison_summary
+)
+
+write.csv(
+  combined_count_summary,
+  file.path(
+    params$output_root,
+    "CRC_UCEC_primary_vs_bootstrap_stable_counts.csv"
+  ),
+  row.names = FALSE
+)
+
+knitr::kable(
+  combined_count_summary,
+  caption = "Primary versus bootstrap-stable pre-miRNA counts in CRC and UCEC."
+)
+```
+
+```{r}
+combined_count_plot_data <-
+  combined_count_summary %>%
+  select(
+    Dataset,
+    Contrast,
+    Primary =
+      Number_of_primary_significant,
+    Bootstrap_robust =
+      Bootstrap_robust_effect,
+    Bootstrap_strict =
+      Bootstrap_strict_stable
+  ) %>%
+  pivot_longer(
+    cols = c(
+      Primary,
+      Bootstrap_robust,
+      Bootstrap_strict
+    ),
+    names_to = "Analysis",
+    values_to = "Number_of_pre_miRNAs"
+  )
+
+p_combined_counts <- ggplot(
+  combined_count_plot_data,
+  aes(
+    Contrast,
+    Number_of_pre_miRNAs,
+    fill = Analysis
+  )
+) +
+  geom_col(
+    position =
+      position_dodge(
+        width = 0.8
+      ),
+    width = 0.72
+  ) +
+  geom_text(
+    aes(
+      label =
+        Number_of_pre_miRNAs
+    ),
+    position =
+      position_dodge(
+        width = 0.8
+      ),
+    vjust = -0.3,
+    size = 3.1
+  ) +
+  facet_wrap(
+    ~ Dataset,
+    scales = "free_y"
+  ) +
+  labs(
+    title =
+      "Primary versus bootstrap-stable pre-miRNAs",
+    x = NULL,
+    y =
+      "Number of significant pre-miRNAs",
+    fill = NULL
+  ) +
+  theme_classic(
+    base_size = 12
+  ) +
+  theme(
+    axis.text.x =
+      element_text(
+        angle = 25,
+        hjust = 1
+      ),
+    legend.position =
+      "top"
+  )
+
+ggsave(
+  file.path(
+    params$output_root,
+    "CRC_UCEC_primary_vs_bootstrap_stable_counts.svg"
+  ),
+  p_combined_counts,
+  width = 11,
+  height = 6,
+  device = "svg"
+)
+```
+
+```{r}
+crc_stable <- crc_analysis$stable_pre_mirnas %>%
+  select(
+    Contrast,
+    pre_miRNA,
+    CRC_logFC = logFC,
+    CRC_FDR = FDR,
+    CRC_bootstrap_sign_consistency =
+      bootstrap_sign_consistency,
+    CRC_bootstrap_FDR_same_direction_rate =
+      bootstrap_FDR_same_direction_rate,
+    CRC_bootstrap_direction_stable =
+      bootstrap_direction_stable
+  )
+
+ucec_stable <- ucec_analysis$stable_pre_mirnas %>%
+  select(
+    Contrast,
+    pre_miRNA,
+    UCEC_logFC = logFC,
+    UCEC_FDR = FDR,
+    UCEC_bootstrap_sign_consistency =
+      bootstrap_sign_consistency,
+    UCEC_bootstrap_FDR_same_direction_rate =
+      bootstrap_FDR_same_direction_rate,
+    UCEC_bootstrap_direction_stable =
+      bootstrap_direction_stable
+  )
+
+shared_bootstrap_stable <- inner_join(
+  crc_stable,
+  ucec_stable,
+  by = c(
+    "Contrast",
+    "pre_miRNA"
+  )
+) %>%
+  mutate(
+    Direction_consistent =
+      sign(CRC_logFC) ==
+      sign(UCEC_logFC),
+
+    Direction = case_when(
+      Direction_consistent &
+        CRC_logFC > 0 ~
+        "Higher in first contrast group in both cancers",
+
+      Direction_consistent &
+        CRC_logFC < 0 ~
+        "Lower in first contrast group in both cancers",
+
+      TRUE ~
+        "Opposite directions"
+    )
+  ) %>%
+  arrange(
+    Contrast,
+    desc(Direction_consistent),
+    pmax(
+      CRC_FDR,
+      UCEC_FDR
+    )
+  )
+
+write.csv(
+  shared_bootstrap_stable,
+  file.path(
+    params$output_root,
+    "shared_bootstrap_stable_pre_miRNAs_CRC_UCEC.csv"
+  ),
+  row.names = FALSE
+)
+
+shared_consistent <- shared_bootstrap_stable %>%
+  filter(
+    Direction_consistent
+  )
+
+write.csv(
+  shared_consistent,
+  file.path(
+    params$output_root,
+    "shared_direction_consistent_bootstrap_stable_pre_miRNAs_CRC_UCEC.csv"
+  ),
+  row.names = FALSE
+)
+
+shared_summary <- shared_bootstrap_stable %>%
+  group_by(
+    Contrast
+  ) %>%
+  summarise(
+    Shared_bootstrap_stable =
+      n(),
+    Shared_direction_consistent =
+      sum(
+        Direction_consistent
+      ),
+    .groups = "drop"
+  )
+
+write.csv(
+  shared_summary,
+  file.path(
+    params$output_root,
+    "shared_bootstrap_stable_pre_miRNA_counts_CRC_UCEC.csv"
+  ),
+  row.names = FALSE
+)
+
+knitr::kable(
+  shared_summary,
+  caption = "Shared bootstrap-stable pre-miRNAs in CRC and UCEC."
+)
+```
+
+```{r}
+combined_excel_file <- file.path(
+  params$output_root,
+  "CRC_UCEC_pre_miRNA_bootstrap_stability.xlsx"
+)
+
+openxlsx::write.xlsx(
+  list(
+    Count_summary =
+      combined_count_summary,
+
+    CRC_combined_stability =
+      crc_analysis$combined_stability,
+
+    UCEC_combined_stability =
+      ucec_analysis$combined_stability,
+
+    CRC_not_passing =
+      crc_analysis$failed_pre_mirnas,
+
+    UCEC_not_passing =
+      ucec_analysis$failed_pre_mirnas,
+
+    CRC_bootstrap_stable =
+      crc_analysis$stable_pre_mirnas,
+
+    UCEC_bootstrap_stable =
+      ucec_analysis$stable_pre_mirnas,
+
+    Shared_stable =
+      shared_bootstrap_stable,
+
+    Shared_consistent =
+      shared_consistent,
+
+    Shared_counts =
+      shared_summary
+  ),
+  file =
+    combined_excel_file,
+  overwrite = TRUE
+)
+
+cat(
+  "Combined Excel workbook:\n",
+  combined_excel_file,
+  "\n"
+)
+```
+
+```{r}
+output_manifest <- list.files(
+  params$output_root,
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+writeLines(
+  output_manifest,
+  file.path(
+    params$output_root,
+    "output_manifest.txt"
+  )
+)
+
+cat(
+  paste(
+    output_manifest,
+    collapse = "\n"
+  )
+)
+```
+
+```{r}
+sessionInfo()
+```

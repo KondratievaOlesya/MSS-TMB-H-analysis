@@ -1,0 +1,520 @@
+```{r}
+library(GSVA)
+library(msigdbr)
+library(edgeR)
+```
+
+```{r}
+clinical_data <- read.csv("data/ucec_clinical.csv", header = TRUE, stringsAsFactors = FALSE, fileEncoding = "UTF-8", na.strings = c("NA", ""))
+
+
+rownames(clinical_data) <- clinical_data$sample_submitter_id
+clinical_data <- clinical_data[!is.na(clinical_data$MSI_TMB),]
+```
+
+```{r}
+counts <- as.matrix(read.csv("data/UCEC/count_gene_name.csv",
+                             row.names = 1, check.names = FALSE))
+```
+
+```{r}
+clinical_data$MSI_TMB <- factor(clinical_data$MSI_TMB,
+                                levels = c("MSI-H", "MSS/TMB-H", "MSS/TMB-L"),
+                                labels = c("MSI_H", "MSS_TMB_H", "MSS_TMB_L"))
+
+
+common_samples <- intersect(colnames(counts), rownames(clinical_data))
+counts <- counts[, common_samples, drop = FALSE]
+clinical_data <- clinical_data[common_samples, , drop = FALSE]
+```
+
+```{r}
+y <- edgeR::DGEList(counts = counts, group = clinical_data$MSI_TMB)
+
+
+keep <- edgeR::filterByExpr(y, group = clinical_data$MSI_TMB, min.count = 10)
+y <- y[keep, , keep.lib.sizes = FALSE]
+
+
+y <- edgeR::calcNormFactors(y, method = "TMM")
+
+
+expr_matrix <- edgeR::cpm(y, log = TRUE, prior.count = 1)
+
+
+expr_matrix <- as.matrix(expr_matrix)
+storage.mode(expr_matrix) <- "double"
+expr_matrix <- expr_matrix[!duplicated(rownames(expr_matrix)), , drop = FALSE]
+
+
+out_expr <- "data/prepared/ucec_expr_logCPM_TMM.csv"
+
+if (!dir.exists(dirname(out_expr))) dir.create(dirname(out_expr), recursive = TRUE)
+utils::write.csv(expr_matrix, out_expr, row.names = TRUE)
+```
+
+```{r}
+expr_matrix <- read.csv(out_expr, 
+                        row.names = 1, 
+                        check.names = FALSE,    
+                        stringsAsFactors = FALSE)
+
+
+expr_matrix <- as.matrix(expr_matrix)
+
+
+colnames(expr_matrix) <- gsub("\\.", "-", colnames(expr_matrix), fixed = FALSE)
+```
+
+```{r}
+msig_h <- msigdbr::msigdbr(species = "Homo sapiens", collection = "H")
+pathways_list <- split(msig_h$gene_symbol, msig_h$gs_name)
+
+
+pathways_list <- lapply(pathways_list, function(gs) intersect(gs, rownames(expr_matrix)))
+pathways_list <- pathways_list[vapply(pathways_list, length, 1L) >= 10]
+```
+
+```{r}
+genes_in_pathways <- unique(unlist(pathways_list))
+expr_matrix <- expr_matrix[rownames(expr_matrix) %in% genes_in_pathways, , drop = FALSE]
+
+
+gsva_params <- GSVA::ssgseaParam(
+  expr = expr_matrix,
+  geneSets = pathways_list
+)
+
+
+gsva_scores <- GSVA::gsva(gsva_params)
+
+
+out_gsva <- "data/prepared/ucec_gsva_ssgsea_hallmark.csv"
+utils::write.csv(gsva_scores, out_gsva, row.names = TRUE)
+```
+
+```{r}
+gsva_scores <- read.csv(out_gsva, 
+                        row.names = 1, 
+                        check.names = FALSE,    
+                        stringsAsFactors = FALSE)
+
+
+gsva_scores <- as.matrix(gsva_scores)
+
+
+colnames(gsva_scores) <- gsub("\\.", "-", colnames(expr_matrix), fixed = FALSE)
+as.data.frame(gsva_scores)
+```
+
+```{r}
+clinical_data <- clinical_data[colnames(gsva_scores),]
+```
+
+```{r}
+library(limma)
+
+
+samples <- intersect(colnames(gsva_scores), rownames(clinical_data))
+gsva_scores <- gsva_scores[, samples, drop = FALSE]
+clinical_data <- clinical_data[samples, , drop = FALSE]
+
+
+design <- stats::model.matrix(~ 0 + clinical_data$MSI_TMB)
+colnames(design) <- levels(clinical_data$MSI_TMB)
+rownames(design) <- rownames(clinical_data)  
+
+
+
+merged <- dplyr::left_join(clinical_data, as.data.frame(design), )
+
+
+print(merged[, c("Sample_ID", "MSI_TMB", "MSI_H", "MSS_TMB_H", "MSS_TMB_L")])
+
+
+fit <- limma::lmFit((gsva_scores), design)
+
+contrast <- limma::makeContrasts(
+  MSI_H_vs_MSS_TMB_L = MSI_H - MSS_TMB_L,
+  MSI_H_vs_MSS_TMB_H = MSI_H - MSS_TMB_H,
+  MSS_TMB_H_vs_MSS_TMB_L = MSS_TMB_H - MSS_TMB_L,
+  levels = design
+)
+fit2 <- limma::contrasts.fit(fit, contrast)
+fit2 <- limma::eBayes(fit2)
+top_pathways <- limma::topTable(fit2, number = Inf, adjust = "BH")
+```
+
+```{r}
+logfc_threshold <- 0.03
+pval_column <- "adj.P.Val"
+output_dir <- "data/DE_results/ucec"
+
+comparison_cols <- c("MSI_H_vs_MSS_TMB_L", "MSI_H_vs_MSS_TMB_H", "MSS_TMB_H_vs_MSS_TMB_L")
+
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+
+write_directional_files <- function(df, groupA, groupB, output_dir) {
+  
+  up_in_A   <- df[df$logFC >  logfc_threshold & df$pval < 0.05, ]
+  down_in_A <- df[df$logFC < -logfc_threshold & df$pval < 0.05, ]
+
+  
+  dir.create(file.path(output_dir, groupA, "upregulated"), recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(output_dir, groupA, "downregulated"), recursive = TRUE, showWarnings = FALSE)
+
+  
+  utils::write.csv(up_in_A, file.path(output_dir, groupA, "upregulated", paste0("pathways_compared_to_", groupB, ".csv")), row.names = FALSE)
+  utils::write.csv(down_in_A, file.path(output_dir, groupA, "downregulated", paste0("pathways_compared_to_", groupB, ".csv")), row.names = FALSE)
+}
+
+
+for (comp in comparison_cols) {
+  comp_split <- strsplit(comp, "_vs_")[[1]]
+  groupA <- comp_split[1]  
+  groupB <- comp_split[2]  
+
+  df <- data.frame(
+    pathway = rownames(top_pathways),
+    logFC = top_pathways[[comp]],
+    pval = top_pathways[[pval_column]],
+    stringsAsFactors = FALSE
+  )
+
+  
+  write_directional_files(df, groupA, groupB, output_dir)
+
+  
+  df$logFC <- -df$logFC
+  write_directional_files(df, groupB, groupA, output_dir)
+}
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+
+pdf_out <- "data/DE_results/ucec_top_pathways_groupwise.pdf"
+
+
+plot_df <- top_pathways %>%
+  tibble::rownames_to_column("pathway") %>%
+  select(pathway, MSI_H_vs_MSS_TMB_H, MSI_H_vs_MSS_TMB_L, MSS_TMB_H_vs_MSS_TMB_L, adj.P.Val) %>%
+  tidyr::pivot_longer(
+    cols = c(MSI_H_vs_MSS_TMB_H, MSI_H_vs_MSS_TMB_L, MSS_TMB_H_vs_MSS_TMB_L),
+    names_to = "comparison", values_to = "logFC"
+  ) %>%
+  mutate(
+    group = dplyr::case_when(
+      grepl("^MSI_H", comparison) ~ "MSI_H",
+      grepl("^MSS_TMB_H", comparison) ~ "MSS_TMB_H"
+    )
+  ) %>%
+  dplyr::filter(adj.P.Val <= 0.05)
+
+
+plot_df$comparison <- dplyr::recode(
+  plot_df$comparison,
+  "MSI_H_vs_MSS_TMB_H" = "MSS/TMB-H",
+  "MSI_H_vs_MSS_TMB_L" = "MSS/TMB-L",
+  "MSS_TMB_H_vs_MSS_TMB_L" = "MSS/TMB-L"
+)
+
+
+plot_df$comparison <- factor(plot_df$comparison, levels = c("MSS/TMB-L", "MSS/TMB-H"))
+
+
+x_range <- range(plot_df$logFC, na.rm = TRUE)
+
+
+sort_order <- plot_df %>%
+  filter(group == "MSI_H", comparison == "MSS/TMB-L") %>%
+  arrange(logFC) %>%
+  pull(pathway)
+sort_order_mss <- plot_df %>%
+  filter(group == "MSS_TMB_H", comparison == "MSS/TMB-L") %>%
+  arrange(logFC) %>%
+  pull(pathway)
+
+grDevices::pdf(pdf_out, width = 10, height = 10)
+
+for (g in unique(plot_df$group)) {
+  subdf <- plot_df %>% filter(group == g)
+
+  
+  if (g == "MSI_H") {
+    subdf$pathway <- factor(subdf$pathway, levels = sort_order)
+  }
+  
+  if (g == "MSS_TMB_H") {
+    subdf$pathway <- factor(subdf$pathway, levels = sort_order_mss)
+  }
+
+  p <- ggplot(subdf, aes(x = pathway, y = logFC, fill = comparison)) +
+    geom_col(position = position_dodge(width = 0.86), width = 0.85) +
+    coord_flip() +
+    scale_fill_manual(values = c("MSS/TMB-L" = "steelblue", "MSS/TMB-H" = "firebrick")) +
+    ylim(x_range[1], x_range[2]) +
+    labs(
+      title = paste0("Pathway expression (GSVA) in ", g),
+      x = "Pathway",
+      y = "logFC vs other subtype",
+      fill = "Comparison"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+
+  print(p)
+}
+
+grDevices::dev.off()
+```
+
+```{r}
+top_pathways
+```
+
+```{r}
+library(edgeR)
+library(dplyr)
+```
+
+```{r}
+clinical_data <- read.csv("data/ucec_clinical.csv", header = TRUE, stringsAsFactors = FALSE, fileEncoding = "UTF-8", na.strings = c("NA", ""))
+
+
+rownames(clinical_data) <- clinical_data$sample_submitter_id
+clinical_data <- clinical_data[!is.na(clinical_data$MSI_TMB),]
+```
+
+```{r}
+counts <- as.matrix(read.csv("data/UCEC/count_gene_name.csv",
+                             row.names = 1, check.names = FALSE))
+```
+
+```{r}
+clinical_data$MSI_TMB <- factor(clinical_data$MSI_TMB,
+                                levels = c("MSI-H", "MSS/TMB-H", "MSS/TMB-L"),
+                                labels = c("MSI_H", "MSS_TMB_H", "MSS_TMB_L"))
+
+
+common_samples <- intersect(colnames(counts), rownames(clinical_data))
+counts <- counts[, common_samples, drop = FALSE]
+clinical_data <- clinical_data[common_samples, , drop = FALSE]
+```
+
+```{r}
+y <- edgeR::DGEList(counts = counts, group = clinical_data$MSI_TMB)
+
+
+
+keep <- edgeR::filterByExpr(y, group = clinical_data$MSI_TMB, min.count = 10)
+y <- y[keep, , keep.lib.sizes = FALSE]
+```
+
+```{r}
+y <- edgeR::calcNormFactors(y, method = "TMM")
+
+
+design <- stats::model.matrix(~0 + clinical_data$MSI_TMB)
+colnames(design) <- levels(clinical_data$MSI_TMB)
+
+
+y <- edgeR::estimateDisp(y, design, robust = TRUE)
+
+
+fit <- edgeR::glmQLFit(y, design, robust = TRUE)
+
+
+contrasts <- list(
+  MSI_H_vs_MSS_TMB_H  = makeContrasts(MSI_H - MSS_TMB_H, levels = design),
+  MSI_H_vs_MSS_TMB_L  = makeContrasts(MSI_H - MSS_TMB_L, levels = design),
+  MSS_TMB_H_vs_MSS_TMB_L = makeContrasts(MSS_TMB_H - MSS_TMB_L, levels = design)
+)
+
+
+results <- lapply(contrasts, function(ct) {
+  qlf <- edgeR::glmQLFTest(fit, contrast = ct)
+  top <- edgeR::topTags(qlf, n = Inf)
+  return(top$table)
+})
+```
+
+```{r}
+for (name in names(results)) {
+  safe_name <- gsub("[^A-Za-z0-9_-]", "_", name)
+  write.csv(results[[name]],
+            file = paste0("data/DE_results/ucec/", safe_name, ".csv"))
+}
+```
+
+```{r}
+res_dir <- "data/DE_results/ucec"
+res_files <- list.files(res_dir, pattern = "\\.csv$", full.names = TRUE)
+
+for (file in res_files) {
+  df <- read.csv(file, row.names = 1, check.names = FALSE)
+  
+  
+  df <- tibble::rownames_to_column(df, var = "Gene")
+  
+  
+  df_filtered <- df %>%
+    filter(FDR <= 0.05) %>%
+    arrange(desc(abs(logFC))) %>%
+    select(Gene, logFC)
+  
+  
+  base <- gsub("\\.csv$", "", basename(file))
+  out_file <- file.path(res_dir, paste0(base, "_sig_genes.csv"))
+  write.csv(df_filtered, out_file, row.names = FALSE)
+}
+```
+
+```{r}
+library(tibble)
+library(fs) 
+
+res_dir <- "data/DE_results/ucec/"
+res_files <- list.files(res_dir, pattern = "_sig_genes\\.csv$", full.names = TRUE)
+
+for (file in res_files) {
+  df <- read.csv(file, row.names = 1, check.names = FALSE)
+  df <- tibble::rownames_to_column(df, var = "Gene")
+  
+  
+  base <- gsub("_sig_genes\\.csv$", "", basename(file))
+  
+  
+  parts <- unlist(strsplit(base, "_vs_"))
+  if (length(parts) != 2) next
+  
+  group1 <- parts[1]
+  group2 <- parts[2]
+  
+  
+  df_up <- df %>% filter(logFC > 0) %>% arrange(desc(logFC)) %>% select(Gene, logFC)
+  df_down <- df %>% filter(logFC < 0) %>% arrange(logFC) %>% select(Gene, logFC)
+  
+  
+  up_dir_g1 <- file.path(res_dir, group1, "upregulated")
+  down_dir_g1 <- file.path(res_dir, group1, "downregulated")
+  up_dir_g2 <- file.path(res_dir, group2, "upregulated")
+  down_dir_g2 <- file.path(res_dir, group2, "downregulated")
+  fs::dir_create(c(up_dir_g1, down_dir_g1, up_dir_g2, down_dir_g2))
+  
+  
+  write.csv(df_up,   file.path(up_dir_g1,   paste0("compared_to_", group2, ".csv")), row.names = FALSE)
+  write.csv(df_down, file.path(down_dir_g1, paste0("compared_to_", group2, ".csv")), row.names = FALSE)
+  
+  
+  df_up_g2   <- df %>% filter(logFC < 0) %>% arrange(desc(abs(logFC))) %>% select(Gene, logFC = -logFC)
+  df_down_g2 <- df %>% filter(logFC > 0) %>% arrange(abs(logFC)) %>% select(Gene, logFC = -logFC)
+  
+  write.csv(df_up_g2,   file.path(up_dir_g2,   paste0("compared_to_", group1, ".csv")), row.names = FALSE)
+  write.csv(df_down_g2, file.path(down_dir_g2, paste0("compared_to_", group1, ".csv")), row.names = FALSE)
+}
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+sel_pw <- c("HALLMARK_MTORC1_SIGNALING","HALLMARK_E2F_TARGETS","HALLMARK_G2M_CHECKPOINT")
+
+
+samples <- intersect(colnames(gsva_scores), rownames(clinical_data))
+stopifnot(length(samples) > 0)
+gsva_sel <- gsva_scores[sel_pw, samples, drop = FALSE]
+
+plot_df <- as.data.frame(t(gsva_sel)) %>%
+  tibble::rownames_to_column("sample") %>%
+  dplyr::left_join(
+    tibble::tibble(sample = rownames(clinical_data), MSI_TMB = clinical_data$MSI_TMB),
+    by = "sample"
+  ) %>%
+  tidyr::pivot_longer(cols = all_of(sel_pw), names_to = "pathway", values_to = "score") %>%
+  dplyr::mutate(
+    MSI_TMB = factor(MSI_TMB, levels = c("MSI_H","MSS_TMB_H","MSS_TMB_L")),
+    pathway = factor(pathway, levels = sel_pw)
+  )
+
+pdf_violin <- "data/DE_results/gsva_violin_selected_pathways.pdf"
+grDevices::pdf(pdf_violin, width = 10, height = 7)
+
+ggplot(plot_df, aes(x = MSI_TMB, y = score, fill = MSI_TMB)) +
+  geom_violin(trim = TRUE, alpha = 0.6, color = NA) +
+  geom_jitter(width = 0.15, size = 0.9, alpha = 0.6) +
+  
+  stat_summary(fun = median, geom = "crossbar", width = 0.5, fatten = 0, color = "black") +
+  
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2, color = "black") +
+  facet_wrap(~ pathway, ncol = 1, scales = "free_y") +
+  scale_fill_manual(values = c("MSI_H" = "#1f77b4", "MSS_TMB_H" = "#d62728", "MSS_TMB_L" = "#2ca02c")) +
+  labs(title = "Per-sample GSVA scores by MSI group",
+       x = "MSI/TMB group", y = "GSVA (ssGSEA) score", fill = "Group") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold"))
+print(1)  
+
+grDevices::dev.off()
+```
+
+```{r}
+library(pheatmap)
+
+sel_pw <- c("HALLMARK_MTORC1_SIGNALING","HALLMARK_E2F_TARGETS","HALLMARK_G2M_CHECKPOINT")
+
+
+samples <- intersect(colnames(gsva_scores), rownames(clinical_data))
+anno <- data.frame(MSI_TMB = clinical_data[samples, "MSI_TMB", drop = TRUE])
+rownames(anno) <- samples
+
+mat <- gsva_scores[sel_pw, samples, drop = FALSE]
+
+
+mat_z <- t(scale(t(mat)))
+
+
+ord <- order(
+  anno$MSI_TMB,
+  colMeans(mat_z, na.rm = TRUE)  
+)
+
+mat_z <- mat_z[, ord, drop = FALSE]
+anno_ord <- anno[ord, , drop = FALSE]
+
+
+ann_colors <- list(
+  MSI_TMB = c(MSI_H = "#1f77b4", MSS_TMB_H = "#d62728", MSS_TMB_L = "#2ca02c")
+)
+
+
+pdf_hm <- "data/DE_results/gsva_heatmap_selected_pathways_sorted.pdf"
+grDevices::pdf(pdf_hm, width = 10, height = 2)
+
+pheatmap::pheatmap(
+  mat_z,
+  color = colorRampPalette(c(
+    "#313695","#4575b4","#74add1","#abd9e9","#e0f3f8",
+    "#ffffbf","#fee090","#fdae61","#f46d43","#d73027","#a50026"
+  ))(100),
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  fontsize_row = 10,
+  border_color = NA,
+  annotation_col = anno_ord,
+  annotation_colors = ann_colors,
+  main = "Selected pathways (row z-score), ordered within MSI groups"
+)
+
+grDevices::dev.off()
+```

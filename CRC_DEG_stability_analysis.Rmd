@@ -1,0 +1,1957 @@
+```{r}
+required_packages <- c(
+  "edgeR",
+  "limma",
+  "dplyr",
+  "tibble",
+  "tidyr",
+  "ggplot2",
+  "fs",
+  "knitr"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "The following required packages are not installed: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+library(edgeR)
+library(limma)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(ggplot2)
+library(fs)
+library(knitr)
+
+params <- list(
+  clinical_file = "data/clinical_data.csv",
+  counts_file = "data/prepared/counts_coad_read_HUGO_shortbarcodes.csv",
+  output_dir = "data/DE_results",
+  bootstrap_iterations = 500L,
+  random_seed = 20260804L,
+  fdr_threshold = 0.05,
+  sign_consistency_threshold = 0.90,
+  repeated_significance_threshold = 0.70
+)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 10,
+  fig.height = 6
+)
+
+set.seed(params$random_seed)
+
+clinical_file <- params$clinical_file
+counts_file <- params$counts_file
+res_dir <- params$output_dir
+stability_dir <- file.path(res_dir, "stability_analysis")
+
+fs::dir_create(res_dir)
+fs::dir_create(stability_dir)
+
+fdr_threshold <- params$fdr_threshold
+```
+
+```{r}
+if (!file.exists(clinical_file)) {
+  stop("Clinical-data file does not exist: ", clinical_file)
+}
+
+clinical_data <- read.csv(
+  clinical_file,
+  header = TRUE,
+  stringsAsFactors = FALSE,
+  fileEncoding = "UTF-8",
+  na.strings = c("NA", "")
+)
+
+required_clinical_columns <- c(
+  "sample_submitter_id",
+  "MSI_TMB"
+)
+
+missing_clinical_columns <- setdiff(
+  required_clinical_columns,
+  colnames(clinical_data)
+)
+
+if (length(missing_clinical_columns) > 0) {
+  stop(
+    "Missing required clinical-data columns: ",
+    paste(missing_clinical_columns, collapse = ", ")
+  )
+}
+
+if (anyDuplicated(clinical_data$sample_submitter_id)) {
+  duplicated_ids <- unique(
+    clinical_data$sample_submitter_id[
+      duplicated(clinical_data$sample_submitter_id)
+    ]
+  )
+
+  stop(
+    "Duplicated sample_submitter_id values were found: ",
+    paste(head(duplicated_ids, 20), collapse = ", ")
+  )
+}
+
+rownames(clinical_data) <- clinical_data$sample_submitter_id
+```
+
+```{r}
+if (!file.exists(counts_file)) {
+  stop("Count-matrix file does not exist: ", counts_file)
+}
+
+counts <- as.matrix(
+  read.csv(
+    counts_file,
+    row.names = 1,
+    check.names = FALSE
+  )
+)
+
+storage.mode(counts) <- "numeric"
+
+if (anyNA(counts)) {
+  stop("The count matrix contains missing or non-numeric values.")
+}
+
+if (any(counts < 0)) {
+  stop("The count matrix contains negative values.")
+}
+
+if (anyDuplicated(rownames(counts))) {
+  stop("The count matrix contains duplicated gene names.")
+}
+
+if (anyDuplicated(colnames(counts))) {
+  stop("The count matrix contains duplicated sample names.")
+}
+```
+
+```{r}
+group_mapping <- c(
+  "MSI-H" = "MSI_H",
+  "MSI_H" = "MSI_H",
+  "MSS/TMB-H" = "MSS_TMB_H",
+  "MSS_TMB_H" = "MSS_TMB_H",
+  "MSS/TMB-L" = "MSS_TMB_L",
+  "MSS_TMB_L" = "MSS_TMB_L"
+)
+
+clinical_data$MSI_TMB_original <- clinical_data$MSI_TMB
+clinical_data$MSI_TMB <- unname(
+  group_mapping[as.character(clinical_data$MSI_TMB)]
+)
+
+clinical_data$MSI_TMB <- factor(
+  clinical_data$MSI_TMB,
+  levels = c(
+    "MSI_H",
+    "MSS_TMB_H",
+    "MSS_TMB_L"
+  )
+)
+
+invalid_group_samples <- rownames(clinical_data)[
+  is.na(clinical_data$MSI_TMB)
+]
+
+if (length(invalid_group_samples) > 0) {
+  message(
+    "Removing ",
+    length(invalid_group_samples),
+    " samples with missing or unsupported MSI_TMB labels."
+  )
+
+  clinical_data <- clinical_data[
+    !is.na(clinical_data$MSI_TMB),
+    ,
+    drop = FALSE
+  ]
+}
+```
+
+```{r}
+common_samples <- intersect(
+  colnames(counts),
+  rownames(clinical_data)
+)
+
+if (length(common_samples) == 0) {
+  stop("No sample names are shared by the count matrix and clinical data.")
+}
+
+counts <- counts[
+  ,
+  common_samples,
+  drop = FALSE
+]
+
+clinical_data <- clinical_data[
+  common_samples,
+  ,
+  drop = FALSE
+]
+
+stopifnot(
+  identical(
+    colnames(counts),
+    rownames(clinical_data)
+  )
+)
+
+group_sizes <- table(
+  clinical_data$MSI_TMB,
+  useNA = "ifany"
+)
+
+print(group_sizes)
+
+if (any(group_sizes == 0)) {
+  stop(
+    "At least one required MSI/TMB group has no samples after matching."
+  )
+}
+
+if (group_sizes[["MSS_TMB_H"]] < 2) {
+  stop(
+    "At least two MSS/TMB-H samples are required for leave-one-out analysis."
+  )
+}
+
+write.csv(
+  data.frame(
+    Group = names(group_sizes),
+    Number_of_samples = as.integer(group_sizes)
+  ),
+  file.path(
+    stability_dir,
+    "group_sizes.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  clinical_data,
+  file.path(
+    stability_dir,
+    "clinical_data_used.csv"
+  ),
+  row.names = TRUE
+)
+```
+
+```{r}
+knitr::kable(
+  data.frame(
+    Group = names(group_sizes),
+    Number_of_samples = as.integer(group_sizes)
+  ),
+  caption = "Sample numbers used in the analysis."
+)
+```
+
+```{r}
+fit_edger_model <- function(
+    counts_mat,
+    metadata,
+    genes_to_keep = NULL
+) {
+  stopifnot(
+    identical(
+      colnames(counts_mat),
+      rownames(metadata)
+    )
+  )
+
+  expected_levels <- c(
+    "MSI_H",
+    "MSS_TMB_H",
+    "MSS_TMB_L"
+  )
+
+  group <- factor(
+    as.character(metadata$MSI_TMB),
+    levels = expected_levels
+  )
+
+  if (anyNA(group)) {
+    stop(
+      "Some samples have a missing or unsupported MSI_TMB group."
+    )
+  }
+
+  current_group_sizes <- table(group)
+
+  if (any(current_group_sizes == 0)) {
+    stop(
+      "At least one MSI/TMB group is absent from this dataset."
+    )
+  }
+
+  y <- edgeR::DGEList(
+    counts = counts_mat,
+    group = group
+  )
+
+  if (is.null(genes_to_keep)) {
+    keep <- edgeR::filterByExpr(
+      y,
+      group = group,
+      min.count = 10
+    )
+  } else {
+    keep <- rownames(y) %in% genes_to_keep &
+      rowSums(y$counts) > 0
+  }
+
+  y <- y[
+    keep,
+    ,
+    keep.lib.sizes = FALSE
+  ]
+
+  if (nrow(y) == 0) {
+    stop(
+      "No expressed genes remain after filtering."
+    )
+  }
+
+  y <- edgeR::calcNormFactors(
+    y,
+    method = "TMM"
+  )
+
+  design <- stats::model.matrix(
+    ~ 0 + group
+  )
+
+  colnames(design) <- levels(group)
+
+  y <- edgeR::estimateDisp(
+    y,
+    design,
+    robust = TRUE
+  )
+
+  fit <- edgeR::glmQLFit(
+    y,
+    design,
+    robust = TRUE
+  )
+
+  contrasts <- list(
+    MSI_H_vs_MSS_TMB_H = limma::makeContrasts(
+      MSI_H - MSS_TMB_H,
+      levels = design
+    ),
+    MSI_H_vs_MSS_TMB_L = limma::makeContrasts(
+      MSI_H - MSS_TMB_L,
+      levels = design
+    ),
+    MSS_TMB_H_vs_MSS_TMB_L = limma::makeContrasts(
+      MSS_TMB_H - MSS_TMB_L,
+      levels = design
+    )
+  )
+
+  list(
+    y = y,
+    fit = fit,
+    design = design,
+    contrasts = contrasts,
+    kept_genes = rownames(y)
+  )
+}
+```
+
+```{r}
+extract_contrast_results <- function(model_object) {
+  lapply(
+    model_object$contrasts,
+    function(contrast_vector) {
+      qlf <- edgeR::glmQLFTest(
+        model_object$fit,
+        contrast = contrast_vector
+      )
+
+      edgeR::topTags(
+        qlf,
+        n = Inf,
+        sort.by = "PValue"
+      )$table
+    }
+  )
+}
+```
+
+```{r}
+stratified_bootstrap_indices <- function(group) {
+  group <- droplevels(group)
+
+  unlist(
+    lapply(
+      levels(group),
+      function(group_name) {
+        available_indices <- which(
+          group == group_name
+        )
+
+        sample(
+          available_indices,
+          size = length(available_indices),
+          replace = TRUE
+        )
+      }
+    ),
+    use.names = FALSE
+  )
+}
+```
+
+```{r}
+run_resampling_analysis <- function(
+    index_list,
+    resample_names,
+    counts_mat,
+    metadata,
+    genes_to_keep,
+    target_genes,
+    contrasts_to_test,
+    fdr_cutoff = 0.05
+) {
+  n_resamples <- length(index_list)
+
+  stopifnot(
+    length(resample_names) == n_resamples
+  )
+
+  logFC_matrices <- setNames(
+    lapply(
+      contrasts_to_test,
+      function(contrast_name) {
+        genes <- target_genes[[contrast_name]]
+
+        matrix(
+          NA_real_,
+          nrow = length(genes),
+          ncol = n_resamples,
+          dimnames = list(
+            genes,
+            resample_names
+          )
+        )
+      }
+    ),
+    contrasts_to_test
+  )
+
+  FDR_matrices <- setNames(
+    lapply(
+      contrasts_to_test,
+      function(contrast_name) {
+        genes <- target_genes[[contrast_name]]
+
+        matrix(
+          NA_real_,
+          nrow = length(genes),
+          ncol = n_resamples,
+          dimnames = list(
+            genes,
+            resample_names
+          )
+        )
+      }
+    ),
+    contrasts_to_test
+  )
+
+  total_DE <- matrix(
+    NA_integer_,
+    nrow = n_resamples,
+    ncol = length(contrasts_to_test),
+    dimnames = list(
+      resample_names,
+      contrasts_to_test
+    )
+  )
+
+  failure_messages <- rep(
+    NA_character_,
+    n_resamples
+  )
+
+  for (i in seq_len(n_resamples)) {
+    if (
+      i == 1L ||
+      i %% 25L == 0L ||
+      i == n_resamples
+    ) {
+      message(
+        "Processing resample ",
+        i,
+        " of ",
+        n_resamples
+      )
+    }
+
+    sample_indices <- index_list[[i]]
+
+    counts_i <- counts_mat[
+      genes_to_keep,
+      sample_indices,
+      drop = FALSE
+    ]
+
+    metadata_i <- metadata[
+      sample_indices,
+      ,
+      drop = FALSE
+    ]
+
+    unique_names <- paste0(
+      "resample_",
+      i,
+      "_sample_",
+      seq_len(ncol(counts_i))
+    )
+
+    colnames(counts_i) <- unique_names
+    rownames(metadata_i) <- unique_names
+
+    model_i <- try(
+      fit_edger_model(
+        counts_mat = counts_i,
+        metadata = metadata_i,
+        genes_to_keep = genes_to_keep
+      ),
+      silent = TRUE
+    )
+
+    if (inherits(model_i, "try-error")) {
+      failure_messages[i] <- as.character(model_i)
+      next
+    }
+
+    for (contrast_name in contrasts_to_test) {
+      qlf_i <- edgeR::glmQLFTest(
+        model_i$fit,
+        contrast = model_i$contrasts[[contrast_name]]
+      )
+
+      tab_i <- qlf_i$table
+
+      tab_i$FDR <- p.adjust(
+        tab_i$PValue,
+        method = "BH"
+      )
+
+      total_DE[i, contrast_name] <- sum(
+        tab_i$FDR <= fdr_cutoff,
+        na.rm = TRUE
+      )
+
+      genes <- target_genes[[contrast_name]]
+
+      if (length(genes) == 0) {
+        next
+      }
+
+      gene_positions <- match(
+        genes,
+        rownames(tab_i)
+      )
+
+      logFC_matrices[[contrast_name]][, i] <-
+        tab_i$logFC[gene_positions]
+
+      FDR_matrices[[contrast_name]][, i] <-
+        tab_i$FDR[gene_positions]
+    }
+  }
+
+  list(
+    logFC = logFC_matrices,
+    FDR = FDR_matrices,
+    total_DE = total_DE,
+    failures = failure_messages
+  )
+}
+run_resampling_parallel <- function(
+    index_list,
+    resample_names,
+    counts_mat,
+    metadata,
+    genes_to_keep,
+    target_genes,
+    contrasts_to_test,
+    fdr_cutoff = 0.05,
+    n_cores = 4,
+    random_seed = 20260804
+) {
+  if (!requireNamespace("BiocParallel", quietly = TRUE)) {
+    stop(
+      "Install BiocParallel using: ",
+      "BiocManager::install('BiocParallel')"
+    )
+  }
+
+  n_resamples <- length(index_list)
+  n_cores <- min(n_cores, n_resamples)
+  
+  batch_size <- 5L
+
+  batch_ids <- split(
+    seq_len(n_resamples),
+    ceiling(seq_len(n_resamples) / batch_size)
+  )
+  
+  
+  
+  
+  
+  
+  
+  
+  
+
+  bp <- BiocParallel::MulticoreParam(
+    workers = n_cores,
+    RNGseed = random_seed,
+    progressbar = TRUE
+  )
+
+  parts <- BiocParallel::bplapply(
+    batch_ids,
+    function(ids) {
+      suppressMessages(
+        run_resampling_analysis(
+          index_list = index_list[ids],
+          resample_names = resample_names[ids],
+          counts_mat = counts_mat,
+          metadata = metadata,
+          genes_to_keep = genes_to_keep,
+          target_genes = target_genes,
+          contrasts_to_test = contrasts_to_test,
+          fdr_cutoff = fdr_cutoff
+        )
+      )
+    },
+    BPPARAM = bp
+  )
+
+  logFC_combined <- setNames(
+    lapply(
+      contrasts_to_test,
+      function(contrast_name) {
+        do.call(
+          cbind,
+          lapply(
+            parts,
+            function(x) {
+              x$logFC[[contrast_name]]
+            }
+          )
+        )
+      }
+    ),
+    contrasts_to_test
+  )
+
+  FDR_combined <- setNames(
+    lapply(
+      contrasts_to_test,
+      function(contrast_name) {
+        do.call(
+          cbind,
+          lapply(
+            parts,
+            function(x) {
+              x$FDR[[contrast_name]]
+            }
+          )
+        )
+      }
+    ),
+    contrasts_to_test
+  )
+
+  list(
+    logFC = logFC_combined,
+    FDR = FDR_combined,
+    total_DE = do.call(
+      rbind,
+      lapply(parts, function(x) x$total_DE)
+    ),
+    failures = unlist(
+      lapply(parts, function(x) x$failures),
+      use.names = FALSE
+    )
+  )
+}
+```
+
+```{r}
+safe_quantile <- function(
+    x,
+    probability
+) {
+  if (all(is.na(x))) {
+    return(NA_real_)
+  }
+
+  unname(
+    stats::quantile(
+      x,
+      probs = probability,
+      na.rm = TRUE,
+      type = 6
+    )
+  )
+}
+
+
+safe_median <- function(x) {
+  if (all(is.na(x))) {
+    return(NA_real_)
+  }
+
+  stats::median(
+    x,
+    na.rm = TRUE
+  )
+}
+
+
+summarize_resampling <- function(
+    resampling_results,
+    full_results,
+    target_genes,
+    method_name,
+    fdr_cutoff = 0.05,
+    sign_consistency_cutoff = 0.90,
+    repeated_significance_cutoff = 0.70
+) {
+  summaries <- lapply(
+    names(target_genes),
+    function(contrast_name) {
+      genes <- target_genes[[contrast_name]]
+
+      if (length(genes) == 0) {
+        return(tibble())
+      }
+
+      logFC_matrix <-
+        resampling_results$logFC[[contrast_name]]
+
+      FDR_matrix <-
+        resampling_results$FDR[[contrast_name]]
+
+      full_table <- full_results[[contrast_name]][
+        genes,
+        ,
+        drop = FALSE
+      ]
+
+      full_logFC <- full_table$logFC
+      full_FDR <- full_table$FDR
+
+      valid_result <-
+        !is.na(logFC_matrix) &
+        !is.na(FDR_matrix)
+
+      same_direction <- sweep(
+        sign(logFC_matrix),
+        MARGIN = 1,
+        STATS = sign(full_logFC),
+        FUN = "=="
+      )
+
+      significant <- FDR_matrix <= fdr_cutoff
+
+      n_tested <- rowSums(valid_result)
+
+      sign_consistency <- ifelse(
+        n_tested > 0,
+        rowSums(
+          same_direction & valid_result,
+          na.rm = TRUE
+        ) / n_tested,
+        NA_real_
+      )
+
+      FDR_rate <- ifelse(
+        n_tested > 0,
+        rowSums(
+          significant & valid_result,
+          na.rm = TRUE
+        ) / n_tested,
+        NA_real_
+      )
+
+      FDR_same_direction_rate <- ifelse(
+        n_tested > 0,
+        rowSums(
+          significant &
+            same_direction &
+            valid_result,
+          na.rm = TRUE
+        ) / n_tested,
+        NA_real_
+      )
+
+      median_logFC <- apply(
+        logFC_matrix,
+        1,
+        safe_median
+      )
+
+      logFC_q025 <- apply(
+        logFC_matrix,
+        1,
+        safe_quantile,
+        probability = 0.025
+      )
+
+      logFC_q975 <- apply(
+        logFC_matrix,
+        1,
+        safe_quantile,
+        probability = 0.975
+      )
+
+      direction_stable <-
+        (
+          logFC_q025 > 0 &
+            logFC_q975 > 0
+        ) |
+        (
+          logFC_q025 < 0 &
+            logFC_q975 < 0
+        )
+
+      tibble(
+        Contrast = contrast_name,
+        Gene = genes,
+        Method = method_name,
+        n_resamples = ncol(logFC_matrix),
+        n_tested = n_tested,
+        tested_rate = n_tested / ncol(logFC_matrix),
+        full_logFC = full_logFC,
+        full_FDR = full_FDR,
+        resampled_median_logFC = median_logFC,
+        resampled_logFC_q025 = logFC_q025,
+        resampled_logFC_q975 = logFC_q975,
+        sign_consistency = sign_consistency,
+        FDR_rate = FDR_rate,
+        FDR_same_direction_rate =
+          FDR_same_direction_rate,
+        direction_stable = direction_stable,
+        robust_effect =
+          tested_rate >= 0.95 &
+          sign_consistency >=
+            sign_consistency_cutoff &
+          direction_stable,
+        repeatedly_significant =
+          FDR_same_direction_rate >=
+            repeated_significance_cutoff
+      )
+    }
+  )
+
+  bind_rows(summaries)
+}
+```
+
+```{r}
+primary_model <- fit_edger_model(
+  counts_mat = counts,
+  metadata = clinical_data
+)
+
+results <- extract_contrast_results(
+  primary_model
+)
+
+writeLines(
+  primary_model$kept_genes,
+  file.path(
+    stability_dir,
+    "genes_tested_primary_analysis.txt"
+  )
+)
+
+saveRDS(
+  primary_model,
+  file.path(
+    stability_dir,
+    "primary_edgeR_model.rds"
+  )
+)
+```
+
+```{r}
+for (contrast_name in names(results)) {
+  write.csv(
+    results[[contrast_name]],
+    file.path(
+      res_dir,
+      paste0(
+        contrast_name,
+        ".csv"
+      )
+    )
+  )
+}
+```
+
+```{r}
+significant_results <- lapply(
+  names(results),
+  function(contrast_name) {
+    results[[contrast_name]] %>%
+      tibble::rownames_to_column(
+        var = "Gene"
+      ) %>%
+      filter(
+        !is.na(FDR),
+        FDR <= fdr_threshold
+      ) %>%
+      arrange(
+        desc(abs(logFC))
+      ) %>%
+      mutate(
+        Contrast = contrast_name,
+        Regulation_in_first_group = case_when(
+          logFC > 0 ~ "Upregulated",
+          logFC < 0 ~ "Downregulated",
+          TRUE ~ "No_change"
+        ),
+        .before = 1
+      )
+  }
+)
+
+names(significant_results) <- names(results)
+
+for (contrast_name in names(significant_results)) {
+  write.csv(
+    significant_results[[contrast_name]],
+    file.path(
+      res_dir,
+      paste0(
+        contrast_name,
+        "_sig_genes.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+}
+
+all_significant_results <- bind_rows(
+  significant_results
+)
+
+write.csv(
+  all_significant_results,
+  file.path(
+    res_dir,
+    "all_contrasts_significant_genes.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+```{r}
+primary_DE_counts <- tibble(
+  Contrast = names(significant_results),
+  Number_of_DEGs = vapply(
+    significant_results,
+    nrow,
+    integer(1)
+  )
+)
+
+knitr::kable(
+  primary_DE_counts,
+  caption = paste0(
+    "Significant genes in the primary analysis at FDR <= ",
+    fdr_threshold,
+    "."
+  )
+)
+```
+
+```{r}
+for (contrast_name in names(significant_results)) {
+  df <- significant_results[[contrast_name]]
+
+  parts <- unlist(
+    strsplit(
+      contrast_name,
+      "_vs_",
+      fixed = TRUE
+    )
+  )
+
+  if (length(parts) != 2) {
+    warning(
+      "Could not parse contrast name: ",
+      contrast_name
+    )
+    next
+  }
+
+  group1 <- parts[1]
+  group2 <- parts[2]
+
+  df_up_group1 <- df %>%
+    filter(logFC > 0) %>%
+    transmute(
+      Gene,
+      logFC
+    ) %>%
+    arrange(
+      desc(logFC)
+    )
+
+  df_down_group1 <- df %>%
+    filter(logFC < 0) %>%
+    transmute(
+      Gene,
+      logFC
+    ) %>%
+    arrange(
+      logFC
+    )
+
+  df_up_group2 <- df %>%
+    filter(logFC < 0) %>%
+    transmute(
+      Gene,
+      logFC = -logFC
+    ) %>%
+    arrange(
+      desc(logFC)
+    )
+
+  df_down_group2 <- df %>%
+    filter(logFC > 0) %>%
+    transmute(
+      Gene,
+      logFC = -logFC
+    ) %>%
+    arrange(
+      logFC
+    )
+
+  output_directories <- c(
+    file.path(
+      res_dir,
+      group1,
+      "upregulated"
+    ),
+    file.path(
+      res_dir,
+      group1,
+      "downregulated"
+    ),
+    file.path(
+      res_dir,
+      group2,
+      "upregulated"
+    ),
+    file.path(
+      res_dir,
+      group2,
+      "downregulated"
+    )
+  )
+
+  fs::dir_create(
+    output_directories
+  )
+
+  write.csv(
+    df_up_group1,
+    file.path(
+      res_dir,
+      group1,
+      "upregulated",
+      paste0(
+        "compared_to_",
+        group2,
+        ".csv"
+      )
+    ),
+    row.names = FALSE
+  )
+
+  write.csv(
+    df_down_group1,
+    file.path(
+      res_dir,
+      group1,
+      "downregulated",
+      paste0(
+        "compared_to_",
+        group2,
+        ".csv"
+      )
+    ),
+    row.names = FALSE
+  )
+
+  write.csv(
+    df_up_group2,
+    file.path(
+      res_dir,
+      group2,
+      "upregulated",
+      paste0(
+        "compared_to_",
+        group1,
+        ".csv"
+      )
+    ),
+    row.names = FALSE
+  )
+
+  write.csv(
+    df_down_group2,
+    file.path(
+      res_dir,
+      group2,
+      "downregulated",
+      paste0(
+        "compared_to_",
+        group1,
+        ".csv"
+      )
+    ),
+    row.names = FALSE
+  )
+}
+```
+
+```{r}
+stability_contrasts <- c(
+  "MSI_H_vs_MSS_TMB_H",
+  "MSS_TMB_H_vs_MSS_TMB_L"
+)
+
+target_genes <- lapply(
+  results[stability_contrasts],
+  function(result_table) {
+    rownames(result_table)[
+      !is.na(result_table$FDR) &
+        result_table$FDR <= fdr_threshold
+    ]
+  }
+)
+
+target_gene_counts <- tibble(
+  Contrast = names(target_genes),
+  Number_of_primary_DEGs = vapply(
+    target_genes,
+    length,
+    integer(1)
+  )
+)
+
+write.csv(
+  target_gene_counts,
+  file.path(
+    stability_dir,
+    "target_gene_counts.csv"
+  ),
+  row.names = FALSE
+)
+
+knitr::kable(
+  target_gene_counts,
+  caption = "Primary significant genes evaluated in the stability analyses."
+)
+```
+
+```{r}
+set.seed(params$random_seed)
+
+B <- as.integer(
+  params$bootstrap_iterations
+)
+
+if (B < 1L) {
+  stop(
+    "bootstrap_iterations must be at least 1."
+  )
+}
+
+bootstrap_index_list <- replicate(
+  B,
+  stratified_bootstrap_indices(
+    clinical_data$MSI_TMB
+  ),
+  simplify = FALSE
+)
+
+bootstrap_names <- sprintf(
+  "bootstrap_%04d",
+  seq_len(B)
+)
+
+counts_bootstrap <- counts[
+  primary_model$kept_genes,
+  ,
+  drop = FALSE
+]
+params$bootstrap_iterations <- 500L
+bootstrap_results <- run_resampling_parallel(
+  index_list = bootstrap_index_list,
+  resample_names = bootstrap_names,
+  counts_mat = counts,
+  metadata = clinical_data,
+  genes_to_keep = primary_model$kept_genes,
+  target_genes = target_genes,
+  contrasts_to_test = stability_contrasts,
+  fdr_cutoff = fdr_threshold,
+  n_cores = 23,
+  random_seed = params$random_seed
+)
+
+saveRDS(
+  bootstrap_results,
+  file.path(
+    stability_dir,
+    "bootstrap_results.rds"
+  )
+)
+```
+
+```{r}
+bootstrap_failure_table <- tibble(
+  Resample = bootstrap_names,
+  Failure = bootstrap_results$failures
+)
+
+write.csv(
+  bootstrap_failure_table,
+  file.path(
+    stability_dir,
+    "bootstrap_failures.csv"
+  ),
+  row.names = FALSE
+)
+
+number_bootstrap_failures <- sum(
+  !is.na(bootstrap_results$failures)
+)
+
+message(
+  "Bootstrap fits that failed: ",
+  number_bootstrap_failures,
+  " of ",
+  B
+)
+```
+
+```{r}
+mss_tmb_h_indices <- which(
+  clinical_data$MSI_TMB ==
+    "MSS_TMB_H"
+)
+
+all_sample_indices <- seq_len(
+  ncol(counts)
+)
+
+loo_index_list <- lapply(
+  mss_tmb_h_indices,
+  function(index_to_remove) {
+    all_sample_indices[
+      all_sample_indices !=
+        index_to_remove
+    ]
+  }
+)
+
+loo_names <- paste0(
+  "left_out_",
+  rownames(clinical_data)[
+    mss_tmb_h_indices
+  ]
+)
+
+loo_results <- run_resampling_analysis(
+  index_list = loo_index_list,
+  resample_names = loo_names,
+  counts_mat = counts,
+  metadata = clinical_data,
+  genes_to_keep = primary_model$kept_genes,
+  target_genes = target_genes,
+  contrasts_to_test = stability_contrasts,
+  fdr_cutoff = fdr_threshold
+)
+
+saveRDS(
+  loo_results,
+  file.path(
+    stability_dir,
+    "leave_one_MSS_TMB_H_out_results.rds"
+  )
+)
+```
+
+```{r}
+loo_failure_table <- tibble(
+  Resample = loo_names,
+  Failure = loo_results$failures
+)
+
+write.csv(
+  loo_failure_table,
+  file.path(
+    stability_dir,
+    "leave_one_out_failures.csv"
+  ),
+  row.names = FALSE
+)
+
+number_loo_failures <- sum(
+  !is.na(loo_results$failures)
+)
+
+message(
+  "Leave-one-out fits that failed: ",
+  number_loo_failures,
+  " of ",
+  length(loo_names)
+)
+```
+
+```{r}
+bootstrap_summary <- summarize_resampling(
+  resampling_results = bootstrap_results,
+  full_results = results,
+  target_genes = target_genes,
+  method_name = "Stratified bootstrap",
+  fdr_cutoff = fdr_threshold,
+  sign_consistency_cutoff =
+    params$sign_consistency_threshold,
+  repeated_significance_cutoff =
+    params$repeated_significance_threshold
+)
+
+loo_summary <- summarize_resampling(
+  resampling_results = loo_results,
+  full_results = results,
+  target_genes = target_genes,
+  method_name = "Leave-one-MSS/TMB-H-out",
+  fdr_cutoff = fdr_threshold,
+  sign_consistency_cutoff =
+    params$sign_consistency_threshold,
+  repeated_significance_cutoff =
+    params$repeated_significance_threshold
+)
+
+stability_summary <- bind_rows(
+  bootstrap_summary,
+  loo_summary
+) %>%
+  arrange(
+    Contrast,
+    Gene,
+    Method
+  )
+
+write.csv(
+  bootstrap_summary,
+  file.path(
+    stability_dir,
+    "bootstrap_gene_stability_summary.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  loo_summary,
+  file.path(
+    stability_dir,
+    "leave_one_out_gene_stability_summary.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  stability_summary,
+  file.path(
+    stability_dir,
+    "DEG_resampling_stability_summary.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+```{r}
+bootstrap_wide <- bootstrap_summary %>%
+  select(
+    Contrast,
+    Gene,
+    bootstrap_tested_rate = tested_rate,
+    bootstrap_median_logFC =
+      resampled_median_logFC,
+    bootstrap_logFC_q025 =
+      resampled_logFC_q025,
+    bootstrap_logFC_q975 =
+      resampled_logFC_q975,
+    bootstrap_sign_consistency =
+      sign_consistency,
+    bootstrap_FDR_rate =
+      FDR_rate,
+    bootstrap_FDR_same_direction_rate =
+      FDR_same_direction_rate,
+    bootstrap_direction_stable =
+      direction_stable,
+    bootstrap_robust_effect =
+      robust_effect,
+    bootstrap_repeatedly_significant =
+      repeatedly_significant
+  )
+
+loo_wide <- loo_summary %>%
+  select(
+    Contrast,
+    Gene,
+    loo_tested_rate = tested_rate,
+    loo_median_logFC =
+      resampled_median_logFC,
+    loo_logFC_q025 =
+      resampled_logFC_q025,
+    loo_logFC_q975 =
+      resampled_logFC_q975,
+    loo_sign_consistency =
+      sign_consistency,
+    loo_FDR_rate =
+      FDR_rate,
+    loo_FDR_same_direction_rate =
+      FDR_same_direction_rate,
+    loo_direction_stable =
+      direction_stable,
+    loo_robust_effect =
+      robust_effect,
+    loo_repeatedly_significant =
+      repeatedly_significant
+  )
+
+full_gene_information <- bind_rows(
+  lapply(
+    stability_contrasts,
+    function(contrast_name) {
+      genes <- target_genes[[contrast_name]]
+
+      if (length(genes) == 0) {
+        return(tibble())
+      }
+
+      results[[contrast_name]][
+        genes,
+        ,
+        drop = FALSE
+      ] %>%
+        rownames_to_column(
+          var = "Gene"
+        ) %>%
+        mutate(
+          Contrast = contrast_name,
+          .before = 1
+        )
+    }
+  )
+)
+
+combined_stability_table <- full_gene_information %>%
+  left_join(
+    bootstrap_wide,
+    by = c(
+      "Contrast",
+      "Gene"
+    )
+  ) %>%
+  left_join(
+    loo_wide,
+    by = c(
+      "Contrast",
+      "Gene"
+    )
+  ) %>%
+  mutate(
+    stable_in_both_analyses =
+      bootstrap_robust_effect &
+        loo_robust_effect,
+    repeatedly_significant_in_both =
+      bootstrap_repeatedly_significant &
+        loo_repeatedly_significant
+  ) %>%
+  arrange(
+    Contrast,
+    FDR,
+    desc(abs(logFC))
+  )
+
+write.csv(
+  combined_stability_table,
+  file.path(
+    stability_dir,
+    "combined_primary_bootstrap_LOO_stability.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+```{r}
+bootstrap_DE_counts <- data.frame(
+  Resample = rownames(
+    bootstrap_results$total_DE
+  ),
+  bootstrap_results$total_DE,
+  check.names = FALSE
+)
+
+loo_DE_counts <- data.frame(
+  Resample = rownames(
+    loo_results$total_DE
+  ),
+  loo_results$total_DE,
+  check.names = FALSE
+)
+
+write.csv(
+  bootstrap_DE_counts,
+  file.path(
+    stability_dir,
+    "bootstrap_number_of_DEGs.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  loo_DE_counts,
+  file.path(
+    stability_dir,
+    "leave_one_out_number_of_DEGs.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+```{r}
+robust_gene_summary <- stability_summary %>%
+  group_by(
+    Method,
+    Contrast
+  ) %>%
+  summarise(
+    Primary_DEGs_evaluated = n(),
+    Direction_stable = sum(
+      direction_stable,
+      na.rm = TRUE
+    ),
+    Robust_effect = sum(
+      robust_effect,
+      na.rm = TRUE
+    ),
+    Repeatedly_significant = sum(
+      repeatedly_significant,
+      na.rm = TRUE
+    ),
+    Median_sign_consistency = median(
+      sign_consistency,
+      na.rm = TRUE
+    ),
+    Median_FDR_same_direction_rate = median(
+      FDR_same_direction_rate,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  )
+
+write.csv(
+  robust_gene_summary,
+  file.path(
+    stability_dir,
+    "robust_gene_summary_by_contrast.csv"
+  ),
+  row.names = FALSE
+)
+
+knitr::kable(
+  robust_gene_summary,
+  digits = 3,
+  caption = "Summary of gene-level robustness across resampling analyses."
+)
+```
+
+```{r}
+bootstrap_plot_data <- bootstrap_summary %>%
+  filter(
+    !is.na(resampled_median_logFC)
+  )
+
+bootstrap_logFC_plot <- ggplot(
+  bootstrap_plot_data,
+  aes(
+    x = full_logFC,
+    y = resampled_median_logFC
+  )
+) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed"
+  ) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed"
+  ) +
+  geom_abline(
+    intercept = 0,
+    slope = 1
+  ) +
+  geom_point(
+    aes(
+      size = FDR_same_direction_rate,
+      shape = direction_stable
+    ),
+    alpha = 0.7
+  ) +
+  facet_wrap(
+    ~ Contrast,
+    scales = "free"
+  ) +
+  theme_bw() +
+  labs(
+    title = "Bootstrap stability of differential-expression effect sizes",
+    x = "Primary-analysis logFC",
+    y = "Median bootstrap logFC",
+    size = paste0(
+      "Same-direction\nFDR <= ",
+      fdr_threshold,
+      " rate"
+    ),
+    shape = "95% bootstrap interval\nexcludes zero"
+  )
+
+print(
+  bootstrap_logFC_plot
+)
+
+ggsave(
+  filename = file.path(
+    stability_dir,
+    "bootstrap_logFC_stability.svg"
+  ),
+  plot = bootstrap_logFC_plot,
+  width = 10,
+  height = 6
+)
+
+ggsave(
+  filename = file.path(
+    stability_dir,
+    "bootstrap_logFC_stability.png"
+  ),
+  plot = bootstrap_logFC_plot,
+  width = 10,
+  height = 6,
+  dpi = 300
+)
+```
+
+```{r}
+loo_plot_data <- loo_summary %>%
+  filter(
+    !is.na(resampled_median_logFC)
+  )
+
+loo_logFC_plot <- ggplot(
+  loo_plot_data,
+  aes(
+    x = full_logFC,
+    y = resampled_median_logFC
+  )
+) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed"
+  ) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed"
+  ) +
+  geom_abline(
+    intercept = 0,
+    slope = 1
+  ) +
+  geom_point(
+    aes(
+      size = FDR_same_direction_rate,
+      shape = direction_stable
+    ),
+    alpha = 0.7
+  ) +
+  facet_wrap(
+    ~ Contrast,
+    scales = "free"
+  ) +
+  theme_bw() +
+  labs(
+    title = "Leave-one-MSS/TMB-H-out stability of effect sizes",
+    x = "Primary-analysis logFC",
+    y = "Median leave-one-out logFC",
+    size = paste0(
+      "Same-direction\nFDR <= ",
+      fdr_threshold,
+      " rate"
+    ),
+    shape = "95% leave-one-out\ninterval excludes zero"
+  )
+
+print(
+  loo_logFC_plot
+)
+
+ggsave(
+  filename = file.path(
+    stability_dir,
+    "leave_one_out_logFC_stability.svg"
+  ),
+  plot = loo_logFC_plot,
+  width = 10,
+  height = 6
+)
+
+ggsave(
+  filename = file.path(
+    stability_dir,
+    "leave_one_out_logFC_stability.png"
+  ),
+  plot = loo_logFC_plot,
+  width = 10,
+  height = 6,
+  dpi = 300
+)
+```
+
+```{r}
+bootstrap_DE_counts_long <- bootstrap_DE_counts %>%
+  pivot_longer(
+    cols = all_of(
+      stability_contrasts
+    ),
+    names_to = "Contrast",
+    values_to = "Number_of_DEGs"
+  )
+
+bootstrap_DE_count_plot <- ggplot(
+  bootstrap_DE_counts_long,
+  aes(
+    x = Number_of_DEGs
+  )
+) +
+  geom_histogram(
+    bins = 30
+  ) +
+  facet_wrap(
+    ~ Contrast,
+    scales = "free"
+  ) +
+  theme_bw() +
+  labs(
+    title = "Number of significant genes across bootstrap iterations",
+    x = paste0(
+      "Number of genes with FDR <= ",
+      fdr_threshold
+    ),
+    y = "Bootstrap iterations"
+  )
+
+print(
+  bootstrap_DE_count_plot
+)
+
+ggsave(
+  filename = file.path(
+    stability_dir,
+    "bootstrap_DEG_count_distribution.svg"
+  ),
+  plot = bootstrap_DE_count_plot,
+  width = 10,
+  height = 5
+)
+
+ggsave(
+  filename = file.path(
+    stability_dir,
+    "bootstrap_DEG_count_distribution.png"
+  ),
+  plot = bootstrap_DE_count_plot,
+  width = 10,
+  height = 5,
+  dpi = 300
+)
+```
+
+```{r}
+stability_rate_plot_data <- stability_summary %>%
+  select(
+    Contrast,
+    Gene,
+    Method,
+    sign_consistency,
+    FDR_same_direction_rate
+  ) %>%
+  pivot_longer(
+    cols = c(
+      sign_consistency,
+      FDR_same_direction_rate
+    ),
+    names_to = "Metric",
+    values_to = "Rate"
+  ) %>%
+  mutate(
+    Metric = recode(
+      Metric,
+      sign_consistency =
+        "Direction consistency",
+      FDR_same_direction_rate =
+        paste0(
+          "Same-direction FDR <= ",
+          fdr_threshold
+        )
+    )
+  )
+
+stability_rate_plot <- ggplot(
+  stability_rate_plot_data,
+  aes(
+    x = Rate
+  )
+) +
+  geom_histogram(
+    bins = 20
+  ) +
+  facet_grid(
+    Metric ~ Method + Contrast,
+    scales = "free_y"
+  ) +
+  theme_bw() +
+  labs(
+    title = "Distribution of gene-level stability rates",
+    x = "Fraction of successful resamples",
+    y = "Genes"
+  )
+
+print(
+  stability_rate_plot
+)
+
+ggsave(
+  filename = file.path(
+    stability_dir,
+    "gene_stability_rate_distributions.svg"
+  ),
+  plot = stability_rate_plot,
+  width = 14,
+  height = 7
+)
+
+ggsave(
+  filename = file.path(
+    stability_dir,
+    "gene_stability_rate_distributions.png"
+  ),
+  plot = stability_rate_plot,
+  width = 14,
+  height = 7,
+  dpi = 300
+)
+```
+
+```{r}
+top_stable_genes <- combined_stability_table %>%
+  arrange(
+    Contrast,
+    desc(
+      bootstrap_sign_consistency
+    ),
+    desc(
+      loo_sign_consistency
+    ),
+    FDR
+  ) %>%
+  group_by(
+    Contrast
+  ) %>%
+  slice_head(
+    n = 20
+  ) %>%
+  ungroup() %>%
+  select(
+    Contrast,
+    Gene,
+    logFC,
+    FDR,
+    bootstrap_sign_consistency,
+    bootstrap_FDR_same_direction_rate,
+    bootstrap_direction_stable,
+    loo_sign_consistency,
+    loo_FDR_same_direction_rate,
+    loo_direction_stable,
+    stable_in_both_analyses
+  )
+
+write.csv(
+  top_stable_genes,
+  file.path(
+    stability_dir,
+    "top_stable_genes.csv"
+  ),
+  row.names = FALSE
+)
+
+knitr::kable(
+  top_stable_genes,
+  digits = 3,
+  caption = "Top genes ranked by bootstrap and leave-one-out stability."
+)
+```
+
+```{r}
+generated_files <- list.files(
+  res_dir,
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+cat(
+  paste(
+    generated_files,
+    collapse = "\n"
+  )
+)
+```
+
+```{r}
+sessionInfo()
+```

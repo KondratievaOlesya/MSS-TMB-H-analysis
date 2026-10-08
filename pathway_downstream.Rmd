@@ -1,0 +1,214 @@
+```{r}
+library(msigdbr)
+library(dplyr)
+library(STRINGdb)S
+library(ggplot2)
+```
+
+```{r}
+outdir <- "data/DE_results/ucec/STRING/"
+input_dir <- "data/DE_results/ucec/"
+if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
+```
+
+```{r}
+contrast <- "MSS_TMB_H_vs_MSS_TMB_L"
+
+selected_pathways <- c(
+  "HALLMARK_KRAS_SIGNALING_DN", 
+  "HALLMARK_MTORC1_SIGNALING", 
+  "HALLMARK_G2M_CHECKPOINT", 
+  "HALLMARK_E2F_TARGETS"
+)
+```
+
+```{r}
+msig_h <- msigdbr::msigdbr(species = "Homo sapiens", collection = "H")
+genes_in_selected <- msig_h[msig_h$gs_name %in% selected_pathways, c("gs_name", "gene_symbol")]
+```
+
+```{r}
+dge_results <- utils::read.csv(file.path(input_dir, paste0(contrast,".csv")), row.names = 1)
+dge_results$gene <- rownames(dge_results)
+
+
+de_selected_genes <- dplyr::filter(
+  dge_results,
+  gene %in% genes_in_selected$gene_symbol,
+  FDR < 0.05
+)
+
+
+de_selected_genes <- dplyr::inner_join(
+  de_selected_genes,
+  genes_in_selected,
+  by = c("gene" = "gene_symbol")
+)
+
+
+
+
+
+
+
+
+de_selected_genes <- de_selected_genes |>
+  dplyr::mutate(
+    node_color = ifelse(logFC >= 0, "#C0392B", "#2166AC"),
+    node_size = case_when(
+      abs(logFC) < 0.5 ~ 10,
+      abs(logFC) < 1   ~ 14,
+      abs(logFC) < 2   ~ 18,
+      abs(logFC) < 3   ~ 22,
+      TRUE             ~ 26
+    ),
+    logFC_bin = case_when(  
+      abs(logFC) < 0.5 ~ "< 0.5",
+      abs(logFC) < 1   ~ "0.5 – 1",
+      abs(logFC) < 2   ~ "1 – 2",
+      abs(logFC) < 3   ~ "2 – 3",
+      TRUE             ~ "≥ 3"
+    )
+  )
+```
+
+```{r}
+string_db <- STRINGdb::STRINGdb$new(version = "11.5", species = 9606, score_threshold = 400)
+
+mapped_all <- string_db$map(
+  de_selected_genes,
+  "gene",
+  removeUnmappedRows = TRUE
+)
+
+
+mapped_all <- dplyr::mutate(
+  mapped_all,
+  logFC     = de_selected_genes$logFC[match(mapped_all$gene, de_selected_genes$gene)],
+  FDR       = de_selected_genes$FDR[match(mapped_all$gene, de_selected_genes$gene)],
+  gs_name   = de_selected_genes$gs_name[match(mapped_all$gene, de_selected_genes$gene)],
+  node_color= de_selected_genes$node_color[match(mapped_all$gene, de_selected_genes$gene)],
+  node_size = de_selected_genes$node_size[match(mapped_all$gene, de_selected_genes$gene)]
+)
+```
+
+```{r}
+plot_string_ggraph <- function(string_db, mapped_df, main_title, score_min = 400) {
+  if (nrow(mapped_df) < 2L) {
+    plot.new(); title(paste0(main_title, " — not enough mapped proteins"))
+    return(invisible(NULL))
+  }
+  
+  edges <- string_db$get_interactions(mapped_df$STRING_id)
+  if (is.null(edges) || nrow(edges) == 0) {
+    plot.new(); title(paste0(main_title, " — no interactions at current score threshold"))
+    return(invisible(NULL))
+  }
+  edges <- edges[edges$combined_score >= score_min, , drop = FALSE]
+  if (nrow(edges) == 0) {
+    plot.new(); title(paste0(main_title, " — no edges after score filter"))
+    return(invisible(NULL))
+  }
+
+  
+  vtx <- mapped_df |>
+    dplyr::select(STRING_id, gene, logFC, FDR) |>
+    dplyr::distinct() |>
+    dplyr::mutate(
+      dir = ifelse(logFC >= 0, "Up (logFC ≥ 0)", "Down (logFC < 0)"),
+      logFC_bin = dplyr::case_when(
+        abs(logFC) < 0.5 ~ "< 0.5",
+        abs(logFC) < 1   ~ "0.5 – 1",
+        abs(logFC) < 2   ~ "1 – 2",
+        abs(logFC) < 3   ~ "2 – 3",
+        TRUE             ~ "≥ 3"
+      ),
+      logFC_bin = factor(logFC_bin, levels = c("< 0.5","0.5 – 1","1 – 2","2 – 3","≥ 3")),
+      dir = factor(dir, levels = c("Down (logFC < 0)","Up (logFC ≥ 0)"))
+    )
+
+  
+  keep_ids <- unique(c(edges$from, edges$to))
+  vtx <- vtx[vtx$STRING_id %in% keep_ids, , drop = FALSE]
+  edges <- edges[edges$from %in% vtx$STRING_id & edges$to %in% vtx$STRING_id, , drop = FALSE]
+  if (nrow(vtx) < 2L || nrow(edges) == 0) {
+    plot.new(); title(paste0(main_title, " — network collapsed after filtering"))
+    return(invisible(NULL))
+  }
+
+  
+  g <- igraph::graph_from_data_frame(
+    d = data.frame(from = edges$from, to = edges$to),
+    directed = FALSE,
+    vertices = data.frame(
+      name  = vtx$STRING_id,
+      gene  = vtx$gene,
+      dir   = vtx$dir,
+      bin   = vtx$logFC_bin,
+      stringsAsFactors = FALSE
+    )
+  )
+
+  
+  size_vals <- c("< 0.5" = 3.5, "0.5 – 1" = 6, "1 – 2" = 12, "2 – 3" = 8.0*2, "≥ 3" = 10.0*2)
+  col_vals  <- c("Down (logFC < 0)" = "#74aeff", "Up (logFC ≥ 0)" = "#ff8f8f")
+
+  set.seed(1)
+  p <- ggraph::ggraph(g, layout = "fr") +
+    ggraph::geom_edge_link(alpha = 0.25, colour = "grey70", width = 0.5) +
+    ggraph::geom_node_point(
+      ggplot2::aes(size = bin, fill = dir),
+      shape = 21, stroke = 0.3, colour = "black"
+    ) +
+    ggraph::geom_node_text(
+      ggplot2::aes(label = gene),
+      repel = TRUE, size = 3.4, fontface = "bold"
+    ) +
+    ggplot2::scale_fill_manual(
+      values = col_vals,
+      name = "Direction",
+      guide = ggplot2::guide_legend(
+        override.aes = list(shape = 21, size = 8, colour = "black")
+      )
+    )+
+    ggplot2::scale_size_manual(values = size_vals, name = "|logFC| bins") +
+    ggplot2::guides(
+      size = ggplot2::guide_legend(override.aes = list(shape = 21, fill = "grey80", colour = "black"))
+    ) +
+    ggplot2::labs(title = main_title) +
+    ggplot2::theme_void() +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(hjust = 0.5, face = "bold"),
+      legend.position = "bottom",
+      legend.box = "vertical"
+    )
+
+  print(p)
+}
+```
+
+```{r}
+pdf_all <- file.path(outdir, paste0("all_", contrast, ".pdf"))
+grDevices::pdf(pdf_all, width = 16, height = 12)
+plot_string_ggraph(
+  string_db,
+  mapped_all,
+  sprintf("STRING network: %s (n=%d proteins)", contrast, nrow(mapped_all)),
+  score_min = 400
+)
+grDevices::dev.off()
+
+
+pdf_by_path <- file.path(outdir, paste0("by_pathway_", contrast, ".pdf"))
+grDevices::pdf(pdf_by_path, width = 8, height = 6)
+for (pw in selected_pathways) {
+  sub <- mapped_all[mapped_all$gs_name == pw, , drop = FALSE]
+  plot_string_ggraph(
+    string_db,
+    sub,
+    sprintf("%s (n=%d proteins)", pw, nrow(sub)),
+    score_min = 400
+  )
+}
+grDevices::dev.off()
+```

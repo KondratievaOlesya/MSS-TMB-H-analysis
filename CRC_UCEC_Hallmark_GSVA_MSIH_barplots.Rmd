@@ -1,0 +1,1518 @@
+```{r}
+required_packages <- c(
+  "edgeR",
+  "GSVA",
+  "limma",
+  "msigdbr",
+  "dplyr",
+  "tidyr",
+  "tibble",
+  "stringr",
+  "ggplot2",
+  "patchwork",
+  "svglite",
+  "openxlsx",
+  "knitr"
+)
+
+missing_packages <- required_packages[
+  !vapply(
+    required_packages,
+    requireNamespace,
+    logical(1),
+    quietly = TRUE
+  )
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing packages: ",
+    paste(
+      missing_packages,
+      collapse = ", "
+    )
+  )
+}
+
+library(edgeR)
+library(GSVA)
+library(limma)
+library(msigdbr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(ggplot2)
+library(patchwork)
+library(svglite)
+library(openxlsx)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 9,
+  fig.height = 8
+)
+
+set.seed(20260811)
+```
+
+```{r}
+params <- list(
+  
+  
+  
+  crc_counts_file =
+    "data/prepared/counts_coad_read_HUGO_shortbarcodes.csv",
+
+  crc_clinical_file =
+    "data/clinical_data.csv",
+
+  
+  
+  
+  ucec_counts_file =
+    "data/UCEC/count_gene_name.csv",
+
+  ucec_clinical_file =
+    "data/ucec_clinical.csv",
+
+  
+  
+  
+  min_count =
+    10L,
+
+  logcpm_prior_count =
+    1,
+
+  
+  
+  
+  min_genes_per_set =
+    10L,
+
+  max_genes_per_set =
+    500L,
+
+  
+  
+  
+  fdr_cutoff =
+    0.05,
+
+  
+  
+  significant_only =
+    TRUE,
+
+  
+  
+  
+  comparison_colors =
+    c(
+      "MSS/TMB-L" = "#4C8FC0",
+      "MSS/TMB-H" = "#C62828"
+    ),
+
+  
+  
+  
+  output_root =
+    "bootstrap_validated_downstream_analysis/Hallmark_GSVA_MSIH_comparison"
+)
+
+plot_dir <- file.path(
+  params$output_root,
+  "plots"
+)
+
+table_dir <- file.path(
+  params$output_root,
+  "tables"
+)
+
+score_dir <- file.path(
+  params$output_root,
+  "GSVA_scores"
+)
+
+for (
+  directory in c(
+    params$output_root,
+    plot_dir,
+    table_dir,
+    score_dir
+  )
+) {
+  dir.create(
+    directory,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+}
+```
+
+```{r}
+normalize_tcga_id <- function(x) {
+  substr(
+    trimws(
+      as.character(x)
+    ),
+    1,
+    16
+  )
+}
+
+
+check_file <- function(
+    file,
+    description
+) {
+  if (
+    !file.exists(
+      file
+    )
+  ) {
+    stop(
+      description,
+      " not found:\n",
+      file
+    )
+  }
+}
+
+
+read_counts <- function(
+    file,
+    dataset
+) {
+  check_file(
+    file,
+    paste0(
+      dataset,
+      " count matrix"
+    )
+  )
+
+  counts <- as.matrix(
+    read.csv(
+      file,
+      row.names = 1,
+      check.names = FALSE
+    )
+  )
+
+  suppressWarnings(
+    storage.mode(
+      counts
+    ) <-
+      "numeric"
+  )
+
+  if (
+    anyNA(
+      counts
+    )
+  ) {
+    stop(
+      dataset,
+      ": count matrix contains NA/non-numeric values."
+    )
+  }
+
+  if (
+    any(
+      counts < 0
+    )
+  ) {
+    stop(
+      dataset,
+      ": count matrix contains negative values."
+    )
+  }
+
+  
+  if (
+    anyDuplicated(
+      rownames(
+        counts
+      )
+    )
+  ) {
+    message(
+      dataset,
+      ": collapsing duplicated gene symbols by summing counts."
+    )
+
+    counts <- rowsum(
+      counts,
+      group =
+        rownames(
+          counts
+        ),
+      reorder =
+        FALSE
+    )
+  }
+
+  colnames(
+    counts
+  ) <-
+    normalize_tcga_id(
+      colnames(
+        counts
+      )
+    )
+
+  if (
+    anyDuplicated(
+      colnames(
+        counts
+      )
+    )
+  ) {
+    warning(
+      dataset,
+      ": duplicated sample IDs after TCGA barcode shortening; ",
+      "keeping the first occurrence."
+    )
+
+    counts <- counts[
+      ,
+      !duplicated(
+        colnames(
+          counts
+        )
+      ),
+      drop =
+        FALSE
+    ]
+  }
+
+  counts
+}
+
+
+read_clinical <- function(
+    file,
+    dataset
+) {
+  check_file(
+    file,
+    paste0(
+      dataset,
+      " clinical file"
+    )
+  )
+
+  clinical <- read.csv(
+    file,
+    stringsAsFactors =
+      FALSE,
+    fileEncoding =
+      "UTF-8",
+    na.strings = c(
+      "NA",
+      ""
+    ),
+    check.names =
+      FALSE
+  )
+
+  required <- c(
+    "sample_submitter_id",
+    "MSI_TMB"
+  )
+
+  missing <- setdiff(
+    required,
+    names(
+      clinical
+    )
+  )
+
+  if (
+    length(
+      missing
+    ) >
+      0
+  ) {
+    stop(
+      dataset,
+      " clinical file is missing: ",
+      paste(
+        missing,
+        collapse = ", "
+      )
+    )
+  }
+
+  clinical <- clinical %>%
+    dplyr::mutate(
+      sample_submitter_id =
+        normalize_tcga_id(
+          sample_submitter_id
+        ),
+
+      MSI_TMB =
+        factor(
+          MSI_TMB,
+          levels = c(
+            "MSI-H",
+            "MSS/TMB-H",
+            "MSS/TMB-L"
+          )
+        )
+    ) %>%
+    dplyr::filter(
+      !is.na(
+        MSI_TMB
+      )
+    )
+
+  clinical <- clinical[
+    !duplicated(
+      clinical$
+        sample_submitter_id
+    ),
+    ,
+    drop =
+      FALSE
+  ]
+
+  rownames(
+    clinical
+  ) <-
+    clinical$
+      sample_submitter_id
+
+  clinical
+}
+
+
+clean_pathway_name <- function(x) {
+  x %>%
+    stringr::str_remove(
+      "^HALLMARK_"
+    ) %>%
+    stringr::str_replace_all(
+      "_",
+      " "
+    )
+}
+```
+
+```{r}
+hallmark_df <- msigdbr::msigdbr(
+  species =
+    "Homo sapiens",
+  collection =
+    "H"
+) %>%
+  dplyr::select(
+    gs_name,
+    gene_symbol
+  ) %>%
+  dplyr::distinct()
+
+
+hallmark_sets <- split(
+  hallmark_df$
+    gene_symbol,
+  hallmark_df$
+    gs_name
+)
+
+hallmark_sets <- lapply(
+  hallmark_sets,
+  unique
+)
+
+cat(
+  "Hallmark gene sets: ",
+  length(
+    hallmark_sets
+  ),
+  "\n"
+)
+```
+
+```{r}
+prepare_expression <- function(
+    dataset,
+    counts_file,
+    clinical_file
+) {
+  counts <- read_counts(
+    file =
+      counts_file,
+    dataset =
+      dataset
+  )
+
+  clinical <- read_clinical(
+    file =
+      clinical_file,
+    dataset =
+      dataset
+  )
+
+  common_samples <- intersect(
+    colnames(
+      counts
+    ),
+    rownames(
+      clinical
+    )
+  )
+
+  if (
+    length(
+      common_samples
+    ) ==
+      0
+  ) {
+    stop(
+      dataset,
+      ": no matching samples between counts and clinical data."
+    )
+  }
+
+  counts <- counts[
+    ,
+    common_samples,
+    drop =
+      FALSE
+  ]
+
+  clinical <- clinical[
+    common_samples,
+    ,
+    drop =
+      FALSE
+  ]
+
+  stopifnot(
+    identical(
+      colnames(
+        counts
+      ),
+      rownames(
+        clinical
+      )
+    )
+  )
+
+  group <- droplevels(
+    clinical$
+      MSI_TMB
+  )
+
+  message(
+    "\n",
+    dataset,
+    " group sizes:"
+  )
+
+  print(
+    table(
+      group
+    )
+  )
+
+  y <- edgeR::DGEList(
+    counts =
+      counts,
+    group =
+      group
+  )
+
+  keep <- edgeR::filterByExpr(
+    y,
+    group =
+      group,
+    min.count =
+      params$
+        min_count
+  )
+
+  y <- y[
+    keep,
+    ,
+    keep.lib.sizes =
+      FALSE
+  ]
+
+  y <- edgeR::calcNormFactors(
+    y,
+    method =
+      "TMM"
+  )
+
+  logcpm <- edgeR::cpm(
+    y,
+    log =
+      TRUE,
+    prior.count =
+      params$
+        logcpm_prior_count
+  )
+
+  message(
+    dataset,
+    ": ",
+    nrow(
+      logcpm
+    ),
+    " genes retained for pathway scoring."
+  )
+
+  list(
+    dataset =
+      dataset,
+
+    clinical =
+      clinical,
+
+    expression =
+      logcpm
+  )
+}
+```
+
+```{r}
+run_ssgsea <- function(
+    expression,
+    gene_sets
+) {
+  gene_sets_present <- lapply(
+    gene_sets,
+    function(genes) {
+      intersect(
+        genes,
+        rownames(
+          expression
+        )
+      )
+    }
+  )
+
+  gene_sets_present <- gene_sets_present[
+    vapply(
+      gene_sets_present,
+      length,
+      integer(1)
+    ) >=
+      params$
+        min_genes_per_set
+  ]
+
+  message(
+    "Gene sets retained after expression overlap: ",
+    length(
+      gene_sets_present
+    )
+  )
+
+  
+  
+  
+  scores <- tryCatch(
+    {
+      ssgsea_par <- GSVA::ssgseaParam(
+        exprData =
+          expression,
+
+        geneSets =
+          gene_sets_present,
+
+        minSize =
+          params$
+            min_genes_per_set,
+
+        maxSize =
+          params$
+            max_genes_per_set,
+
+        normalize =
+          TRUE
+      )
+
+      GSVA::gsva(
+        ssgsea_par,
+        verbose =
+          FALSE
+      )
+    },
+
+    error =
+      function(e) {
+        message(
+          "Current GSVA API failed; trying legacy API.\n",
+          conditionMessage(
+            e
+          )
+        )
+
+        NULL
+      }
+  )
+
+  
+  
+  
+  if (
+    is.null(
+      scores
+    )
+  ) {
+    scores <- GSVA::gsva(
+      expr =
+        expression,
+
+      gset.idx.list =
+        gene_sets_present,
+
+      method =
+        "ssgsea",
+
+      kcdf =
+        "Gaussian",
+
+      min.sz =
+        params$
+          min_genes_per_set,
+
+      max.sz =
+        params$
+          max_genes_per_set,
+
+      ssgsea.norm =
+        TRUE,
+
+      verbose =
+        FALSE
+    )
+  }
+
+  as.matrix(
+    scores
+  )
+}
+```
+
+```{r}
+fit_pathway_models <- function(
+    scores,
+    clinical,
+    dataset
+) {
+  sample_order <- colnames(
+    scores
+  )
+
+  clinical <- clinical[
+    sample_order,
+    ,
+    drop =
+      FALSE
+  ]
+
+  stopifnot(
+    identical(
+      sample_order,
+      rownames(
+        clinical
+      )
+    )
+  )
+
+  group <- factor(
+    clinical$
+      MSI_TMB,
+    levels = c(
+      "MSI-H",
+      "MSS/TMB-H",
+      "MSS/TMB-L"
+    )
+  )
+
+  design <- stats::model.matrix(
+    ~ 0 +
+      group
+  )
+
+  colnames(
+    design
+  ) <- c(
+    "MSI_H",
+    "MSS_TMB_H",
+    "MSS_TMB_L"
+  )
+
+  contrast_matrix <- limma::makeContrasts(
+    MSI_H_vs_MSS_TMB_L =
+      MSI_H -
+      MSS_TMB_L,
+
+    MSI_H_vs_MSS_TMB_H =
+      MSI_H -
+      MSS_TMB_H,
+
+    MSS_TMB_H_vs_MSS_TMB_L =
+      MSS_TMB_H -
+      MSS_TMB_L,
+
+    levels =
+      design
+  )
+
+  fit <- limma::lmFit(
+    scores,
+    design
+  )
+
+  fit <- limma::contrasts.fit(
+    fit,
+    contrast_matrix
+  )
+
+  fit <- limma::eBayes(
+    fit
+  )
+
+  extract_contrast <- function(
+      contrast_name
+  ) {
+    limma::topTable(
+      fit,
+      coef =
+        contrast_name,
+      number =
+        Inf,
+      sort.by =
+        "none",
+      adjust.method =
+        "BH"
+    ) %>%
+      tibble::rownames_to_column(
+        "Pathway"
+      ) %>%
+      tibble::as_tibble() %>%
+      dplyr::mutate(
+        Dataset =
+          dataset,
+        Contrast =
+          contrast_name,
+        .before =
+          1
+      )
+  }
+
+  results <- dplyr::bind_rows(
+    extract_contrast(
+      "MSI_H_vs_MSS_TMB_L"
+    ),
+
+    extract_contrast(
+      "MSI_H_vs_MSS_TMB_H"
+    ),
+
+    extract_contrast(
+      "MSS_TMB_H_vs_MSS_TMB_L"
+    )
+  )
+
+  list(
+    fit =
+      fit,
+
+    results =
+      results
+  )
+}
+```
+
+```{r}
+make_plot_table <- function(
+    model_results
+) {
+  comparison_lookup <- c(
+    "MSI_H_vs_MSS_TMB_L" =
+      "MSS/TMB-L",
+
+    "MSI_H_vs_MSS_TMB_H" =
+      "MSS/TMB-H"
+  )
+
+  x <- model_results %>%
+    dplyr::filter(
+      Contrast %in%
+        names(
+          comparison_lookup
+        )
+    ) %>%
+    dplyr::mutate(
+      Comparison =
+        unname(
+          comparison_lookup[
+            Contrast
+          ]
+        ),
+
+      significant =
+        adj.P.Val <=
+        params$
+          fdr_cutoff
+    )
+
+  pathway_keep <- x %>%
+    dplyr::group_by(
+      Pathway
+    ) %>%
+    dplyr::summarise(
+      significant_any =
+        any(
+          significant,
+          na.rm =
+            TRUE
+        ),
+
+      .groups =
+        "drop"
+    )
+
+  if (
+    isTRUE(
+      params$
+        significant_only
+    )
+  ) {
+    pathway_keep <- pathway_keep %>%
+      dplyr::filter(
+        significant_any
+      )
+  }
+
+  x <- x %>%
+    dplyr::semi_join(
+      pathway_keep,
+      by =
+        "Pathway"
+    )
+
+  
+  pathway_order <- x %>%
+    dplyr::filter(
+      Comparison ==
+        "MSS/TMB-L"
+    ) %>%
+    dplyr::arrange(
+      dplyr::desc(
+        logFC
+      )
+    ) %>%
+    dplyr::pull(
+      Pathway
+    )
+
+  x %>%
+    dplyr::mutate(
+      Pathway_label =
+        clean_pathway_name(
+          Pathway
+        ),
+
+      Pathway_label =
+        factor(
+          Pathway_label,
+          levels =
+            rev(
+              clean_pathway_name(
+                pathway_order
+              )
+            )
+        ),
+
+      Comparison =
+        factor(
+          Comparison,
+          levels = c(
+            "MSS/TMB-L",
+            "MSS/TMB-H"
+          )
+        )
+    )
+}
+```
+
+```{r}
+plot_pathway_expression <- function(
+    plot_df,
+    dataset,
+    output_stub
+) {
+  if (
+    nrow(
+      plot_df
+    ) ==
+      0
+  ) {
+    stop(
+      dataset,
+      ": no pathways passed the plotting criteria."
+    )
+  }
+
+  p <- ggplot2::ggplot(
+    plot_df,
+    ggplot2::aes(
+      x =
+        logFC,
+
+      y =
+        Pathway_label,
+
+      fill =
+        Comparison
+    )
+  ) +
+
+    ggplot2::geom_col(
+      position =
+        ggplot2::position_dodge(
+          width =
+            0.72
+        ),
+
+      width =
+        0.64
+    ) +
+
+    ggplot2::geom_vline(
+      xintercept =
+        0,
+      linewidth =
+        0.45,
+      color =
+        "grey55"
+    ) +
+
+    ggplot2::scale_fill_manual(
+      values =
+        params$
+          comparison_colors,
+
+      breaks = c(
+        "MSS/TMB-L",
+        "MSS/TMB-H"
+      ),
+
+      drop =
+        FALSE,
+
+      name =
+        "Comparison"
+    ) +
+
+    ggplot2::labs(
+      title =
+        "Pathway expression (GSVA) in MSI-H",
+
+      subtitle =
+        NULL,
+
+      x =
+        "logFC vs other subtype",
+
+      y =
+        "Pathway"
+    ) +
+
+    ggplot2::theme_minimal(
+      base_size =
+        11
+    ) +
+
+    ggplot2::theme(
+      plot.title =
+        ggplot2::element_text(
+          face =
+            "plain",
+          hjust =
+            0.5,
+          size =
+            12
+        ),
+
+      axis.title.x =
+        ggplot2::element_text(
+          size =
+            14
+        ),
+
+      axis.title.y =
+        ggplot2::element_text(
+          size =
+            18
+        ),
+
+      axis.text.y =
+        ggplot2::element_text(
+          size =
+            8.5,
+          color =
+            "grey35"
+        ),
+
+      axis.text.x =
+        ggplot2::element_text(
+          size =
+            9,
+          color =
+            "grey35"
+        ),
+
+      panel.grid.major.y =
+        ggplot2::element_line(
+          color =
+            "grey90",
+          linewidth =
+            0.35
+        ),
+
+      panel.grid.major.x =
+        ggplot2::element_line(
+          color =
+            "grey90",
+          linewidth =
+            0.35
+        ),
+
+      panel.grid.minor =
+        ggplot2::element_blank(),
+
+      legend.position =
+        "bottom",
+
+      legend.title =
+        ggplot2::element_text(
+          size =
+            9
+        ),
+
+      legend.text =
+        ggplot2::element_text(
+          size =
+            9
+        ),
+
+      plot.margin =
+        ggplot2::margin(
+          8,
+          8,
+          8,
+          8
+        )
+    )
+
+  n_pathways <- dplyr::n_distinct(
+    plot_df$
+      Pathway
+  )
+
+  plot_height <- max(
+    6,
+    0.25 *
+      n_pathways +
+      2
+  )
+
+  ggplot2::ggsave(
+    filename =
+      file.path(
+        plot_dir,
+        paste0(
+          output_stub,
+          ".svg"
+        )
+      ),
+
+    plot =
+      p,
+
+    width =
+      8.5,
+
+    height =
+      plot_height,
+
+    device =
+      "svg"
+  )
+
+  ggplot2::ggsave(
+    filename =
+      file.path(
+        plot_dir,
+        paste0(
+          output_stub,
+          ".pdf"
+        )
+      ),
+
+    plot =
+      p,
+
+    width =
+      8.5,
+
+    height =
+      plot_height,
+
+    device =
+      grDevices::
+        cairo_pdf
+  )
+
+  p
+}
+```
+
+```{r}
+crc_expression <- prepare_expression(
+  dataset =
+    "CRC",
+
+  counts_file =
+    params$
+      crc_counts_file,
+
+  clinical_file =
+    params$
+      crc_clinical_file
+)
+
+
+crc_scores <- run_ssgsea(
+  expression =
+    crc_expression$
+      expression,
+
+  gene_sets =
+    hallmark_sets
+)
+
+
+crc_models <- fit_pathway_models(
+  scores =
+    crc_scores,
+
+  clinical =
+    crc_expression$
+      clinical,
+
+  dataset =
+    "CRC"
+)
+
+
+crc_plot_df <- make_plot_table(
+  crc_models$
+    results
+)
+
+
+p_crc <- plot_pathway_expression(
+  plot_df =
+    crc_plot_df,
+
+  dataset =
+    "CRC",
+
+  output_stub =
+    "CRC_Hallmark_GSVA_MSI_H_vs_other_subtypes"
+)
+
+p_crc
+```
+
+```{r}
+ucec_expression <- prepare_expression(
+  dataset =
+    "UCEC",
+
+  counts_file =
+    params$
+      ucec_counts_file,
+
+  clinical_file =
+    params$
+      ucec_clinical_file
+)
+
+
+ucec_scores <- run_ssgsea(
+  expression =
+    ucec_expression$
+      expression,
+
+  gene_sets =
+    hallmark_sets
+)
+
+
+ucec_models <- fit_pathway_models(
+  scores =
+    ucec_scores,
+
+  clinical =
+    ucec_expression$
+      clinical,
+
+  dataset =
+    "UCEC"
+)
+
+
+ucec_plot_df <- make_plot_table(
+  ucec_models$
+    results
+)
+
+
+p_ucec <- plot_pathway_expression(
+  plot_df =
+    ucec_plot_df,
+
+  dataset =
+    "UCEC",
+
+  output_stub =
+    "UCEC_Hallmark_GSVA_MSI_H_vs_other_subtypes"
+)
+
+p_ucec
+```
+
+```{r}
+combined_plot <- (
+  p_crc +
+    p_ucec
+) +
+
+  patchwork::plot_layout(
+    widths =
+      c(
+        1,
+        1
+      ),
+
+    guides =
+      "collect"
+  ) +
+
+  patchwork::plot_annotation(
+    tag_levels =
+      "A"
+  ) &
+
+  ggplot2::theme(
+    legend.position =
+      "bottom",
+
+    plot.tag =
+      ggplot2::element_text(
+        face =
+          "plain",
+        size =
+          26
+      )
+  )
+
+combined_plot
+
+
+ggplot2::ggsave(
+  filename =
+    file.path(
+      plot_dir,
+      "CRC_UCEC_Hallmark_GSVA_MSI_H_vs_other_subtypes_AB.svg"
+    ),
+
+  plot =
+    combined_plot,
+
+  width =
+    16,
+
+  height =
+    10,
+
+  device =
+    "svg"
+)
+
+
+ggplot2::ggsave(
+  filename =
+    file.path(
+      plot_dir,
+      "CRC_UCEC_Hallmark_GSVA_MSI_H_vs_other_subtypes_AB.pdf"
+    ),
+
+  plot =
+    combined_plot,
+
+  width =
+    16,
+
+  height =
+    10,
+
+  device =
+    grDevices::
+      cairo_pdf
+)
+```
+
+```{r}
+write.csv(
+  crc_scores,
+  file.path(
+    score_dir,
+    "CRC_Hallmark_ssGSEA_scores.csv"
+  )
+)
+
+
+write.csv(
+  ucec_scores,
+  file.path(
+    score_dir,
+    "UCEC_Hallmark_ssGSEA_scores.csv"
+  )
+)
+```
+
+```{r}
+write.csv(
+  crc_models$
+    results,
+  file.path(
+    table_dir,
+    "CRC_Hallmark_GSVA_limma_all_contrasts.csv"
+  ),
+  row.names =
+    FALSE
+)
+
+
+write.csv(
+  ucec_models$
+    results,
+  file.path(
+    table_dir,
+    "UCEC_Hallmark_GSVA_limma_all_contrasts.csv"
+  ),
+  row.names =
+    FALSE
+)
+
+
+write.csv(
+  crc_plot_df,
+  file.path(
+    table_dir,
+    "CRC_Hallmark_GSVA_plotted_pathways.csv"
+  ),
+  row.names =
+    FALSE
+)
+
+
+write.csv(
+  ucec_plot_df,
+  file.path(
+    table_dir,
+    "UCEC_Hallmark_GSVA_plotted_pathways.csv"
+  ),
+  row.names =
+    FALSE
+)
+```
+
+```{r}
+significant_summary <- dplyr::bind_rows(
+  crc_models$
+    results,
+
+  ucec_models$
+    results
+) %>%
+  dplyr::mutate(
+    Significant =
+      adj.P.Val <=
+      params$
+        fdr_cutoff
+  ) %>%
+  dplyr::count(
+    Dataset,
+    Contrast,
+    Significant,
+    name =
+      "n_pathways"
+  )
+
+
+significant_summary
+
+
+write.csv(
+  significant_summary,
+  file.path(
+    table_dir,
+    "Hallmark_GSVA_significance_summary.csv"
+  ),
+  row.names =
+    FALSE
+)
+```
+
+```{r}
+openxlsx::write.xlsx(
+  list(
+    CRC_all_contrasts =
+      crc_models$
+        results,
+
+    UCEC_all_contrasts =
+      ucec_models$
+        results,
+
+    CRC_plotted =
+      crc_plot_df,
+
+    UCEC_plotted =
+      ucec_plot_df,
+
+    Summary =
+      significant_summary
+  ),
+
+  file =
+    file.path(
+      params$output_root,
+      "CRC_UCEC_Hallmark_GSVA_results.xlsx"
+    ),
+
+  overwrite =
+    TRUE
+)
+```
+
+```{r}
+sessionInfo()
+```

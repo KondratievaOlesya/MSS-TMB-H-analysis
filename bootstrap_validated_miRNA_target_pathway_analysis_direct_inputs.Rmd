@@ -1,0 +1,2825 @@
+```{r}
+required_packages <- c(
+  "dplyr",
+  "tidyr",
+  "tibble",
+  "stringr",
+  "ggplot2",
+  "gprofiler2",
+  "multiMiR",
+  "openxlsx",
+  "svglite",
+  "knitr"
+)
+
+missing_packages <- required_packages[
+  !vapply(
+    required_packages,
+    requireNamespace,
+    logical(1),
+    quietly = TRUE
+  )
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing required packages: ",
+    paste(missing_packages, collapse = ", "),
+    "\nInstall Bioconductor packages with BiocManager::install() where required."
+  )
+}
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(ggplot2)
+library(gprofiler2)
+library(multiMiR)
+library(openxlsx)
+library(svglite)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 10,
+  fig.height = 7
+)
+```
+
+```{r}
+params <- list(
+  
+  original_crc_de_dir =
+    "data/DE_results",
+
+  original_ucec_de_dir =
+    "data/DE_results/ucec_gene_DE",
+
+  
+  crc_mrna_stability_file =
+    "data/DE_results/stability_analysis/combined_primary_bootstrap_LOO_stability.csv",
+
+  ucec_mrna_stability_file =
+    "data/DE_results/ucec_gene_DE/stability_analysis/combined_primary_bootstrap_LOO_stability.csv",
+
+  mrna_stability_flag_column =
+    "bootstrap_robust_effect",
+
+  
+  crc_mirna_primary_dir =
+    "data/DE_results/pre_miRNA/bootstrap_stability/CRC/primary_DE",
+
+  ucec_mirna_primary_dir =
+    "data/DE_results/pre_miRNA/bootstrap_stability/UCEC/primary_DE",
+
+  
+  crc_mirna_stability_file =
+    "data/DE_results/pre_miRNA/bootstrap_stability/CRC/stability_analysis/combined_primary_bootstrap_LOO_pre_miRNA_stability.csv",
+
+  ucec_mirna_stability_file =
+    "data/DE_results/pre_miRNA/bootstrap_stability/UCEC/stability_analysis/combined_primary_bootstrap_LOO_pre_miRNA_stability.csv",
+
+  mirna_stability_flag_column =
+    "bootstrap_stable",
+
+  
+  output_root =
+    "bootstrap_validated_downstream_analysis",
+
+  contrast =
+    "MSS_TMB_H_vs_MSS_TMB_L",
+
+  fdr_cutoff = 0.05,
+  logfc_cutoff = 1,
+
+  run_multimir = TRUE,
+  force_multimir_query = FALSE,
+
+  run_gprofiler = TRUE,
+  organism = "hsapiens",
+  minimum_query_size = 3L,
+
+  enrichment_sources = c(
+    "GO:BP",
+    "REAC",
+    "WP",
+    "CORUM"
+  ),
+
+  domain_scope =
+    "custom_annotated",
+
+  top_terms_per_source = 8L
+)
+
+analysis_root <- file.path(
+  params$output_root,
+  "miRNA_target_pathway_analysis"
+)
+
+table_dir <- file.path(
+  analysis_root,
+  "tables"
+)
+
+multimir_dir <- file.path(
+  analysis_root,
+  "multiMiR"
+)
+
+enrichment_dir <- file.path(
+  analysis_root,
+  "enrichment"
+)
+
+plot_dir <- file.path(
+  analysis_root,
+  "figures"
+)
+
+for (
+  directory in c(
+    analysis_root,
+    table_dir,
+    multimir_dir,
+    enrichment_dir,
+    plot_dir
+  )
+) {
+  dir.create(
+    directory,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+}
+
+direction_colors <- c(
+  "Up in MSS/TMB-H" = "#D55E00",
+  "Down in MSS/TMB-H" = "#0072B2"
+)
+```
+
+```{r}
+input_files <- list(
+  CRC = list(
+    mRNA_primary = file.path(
+      params$original_crc_de_dir,
+      paste0(
+        params$contrast,
+        ".csv"
+      )
+    ),
+
+    mRNA_stability =
+      params$crc_mrna_stability_file,
+
+    pre_miRNA_primary = file.path(
+      params$crc_mirna_primary_dir,
+      paste0(
+        params$contrast,
+        ".csv"
+      )
+    ),
+
+    pre_miRNA_stability =
+      params$crc_mirna_stability_file
+  ),
+
+  UCEC = list(
+    mRNA_primary = file.path(
+      params$original_ucec_de_dir,
+      paste0(
+        params$contrast,
+        ".csv"
+      )
+    ),
+
+    mRNA_stability =
+      params$ucec_mrna_stability_file,
+
+    pre_miRNA_primary = file.path(
+      params$ucec_mirna_primary_dir,
+      paste0(
+        params$contrast,
+        ".csv"
+      )
+    ),
+
+    pre_miRNA_stability =
+      params$ucec_mirna_stability_file
+  )
+)
+
+all_input_files <- unlist(
+  input_files,
+  use.names = TRUE
+)
+
+missing_files <- all_input_files[
+  !file.exists(
+    all_input_files
+  )
+]
+
+if (length(missing_files) > 0) {
+  stop(
+    "The following required input files were not found:\n",
+    paste(
+      missing_files,
+      collapse = "\n"
+    )
+  )
+}
+
+knitr::kable(
+  data.frame(
+    Input = names(all_input_files),
+    File = unname(all_input_files),
+    stringsAsFactors = FALSE
+  ),
+  caption = "Primary and bootstrap-stability input files."
+)
+```
+
+```{r}
+as_flag <- function(x) {
+  if (is.logical(x)) {
+    return(
+      replace(
+        x,
+        is.na(x),
+        FALSE
+      )
+    )
+  }
+
+  if (is.numeric(x)) {
+    return(
+      !is.na(x) &
+        x != 0
+    )
+  }
+
+  tolower(
+    trimws(
+      as.character(x)
+    )
+  ) %in% c(
+    "true",
+    "t",
+    "1",
+    "yes",
+    "y"
+  )
+}
+
+
+canonical_contrast <- function(x) {
+  x <- as.character(x)
+
+  x <- str_replace_all(
+    x,
+    "[^A-Za-z0-9]+",
+    "_"
+  )
+
+  x <- str_replace_all(
+    x,
+    "_+",
+    "_"
+  )
+
+  str_remove_all(
+    x,
+    "^_|_$"
+  )
+}
+
+
+find_column <- function(
+    data,
+    candidates,
+    description,
+    required = TRUE
+) {
+  found <- candidates[
+    candidates %in%
+      names(data)
+  ]
+
+  if (
+    length(found) == 0 &&
+    required
+  ) {
+    stop(
+      "Could not find ",
+      description,
+      ". Available columns: ",
+      paste(
+        names(data),
+        collapse = ", "
+      )
+    )
+  }
+
+  if (length(found) == 0) {
+    return(NULL)
+  }
+
+  found[1]
+}
+
+
+fdr_to_stars <- function(x) {
+  case_when(
+    is.na(x) ~ NA_character_,
+    x <= 0.001 ~ "***",
+    x <= 0.01 ~ "**",
+    x <= 0.05 ~ "*",
+    TRUE ~ "ns"
+  )
+}
+
+
+save_placeholder_svg <- function(
+    file,
+    title,
+    detail
+) {
+  p <- ggplot() +
+    annotate(
+      "text",
+      x = 0,
+      y = 0.12,
+      label = title,
+      fontface = "bold",
+      size = 5
+    ) +
+    annotate(
+      "text",
+      x = 0,
+      y = -0.12,
+      label = detail,
+      size = 4
+    ) +
+    xlim(-1, 1) +
+    ylim(-1, 1) +
+    theme_void()
+
+  ggsave(
+    file,
+    p,
+    width = 7,
+    height = 5,
+    device = "svg"
+  )
+
+  invisible(p)
+}
+```
+
+```{r}
+read_primary_de <- function(
+    file,
+    molecule,
+    dataset
+) {
+  data <- read.csv(
+    file,
+    row.names = 1,
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  ) %>%
+    rownames_to_column(
+      if (
+        molecule == "mRNA"
+      ) {
+        "Gene"
+      } else {
+        "pre_miRNA"
+      }
+    ) %>%
+    as_tibble()
+
+  required_statistics <- c(
+    "logFC",
+    "PValue",
+    "FDR"
+  )
+
+  missing_statistics <- setdiff(
+    required_statistics,
+    names(data)
+  )
+
+  if (length(missing_statistics) > 0) {
+    stop(
+      "Primary ",
+      molecule,
+      " result for ",
+      dataset,
+      " is missing columns: ",
+      paste(
+        missing_statistics,
+        collapse = ", "
+      ),
+      "\nFile: ",
+      file
+    )
+  }
+
+  identifier <- if (
+    molecule == "mRNA"
+  ) {
+    "Gene"
+  } else {
+    "pre_miRNA"
+  }
+
+  data[[identifier]] <- trimws(
+    as.character(
+      data[[identifier]]
+    )
+  )
+
+  data %>%
+    mutate(
+      Dataset = dataset,
+      Contrast = params$contrast,
+      logFC = as.numeric(logFC),
+      PValue = as.numeric(PValue),
+      FDR = as.numeric(FDR),
+      .before = 1
+    )
+}
+```
+
+```{r}
+read_stability_table <- function(
+    file,
+    molecule,
+    stability_flag_column
+) {
+  data <- read.csv(
+    file,
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  ) %>%
+    as_tibble()
+
+  identifier_candidates <- if (
+    molecule == "mRNA"
+  ) {
+    c(
+      "Gene",
+      "gene",
+      "gene_symbol",
+      "symbol",
+      "GeneSymbol",
+      "X",
+      "...1"
+    )
+  } else {
+    c(
+      "pre_miRNA",
+      "pre_mirna",
+      "miRNA",
+      "mirna",
+      "Gene",
+      "X",
+      "...1"
+    )
+  }
+
+  identifier_column <- find_column(
+    data,
+    identifier_candidates,
+    paste0(
+      molecule,
+      " identifier column"
+    )
+  )
+
+  canonical_identifier <- if (
+    molecule == "mRNA"
+  ) {
+    "Gene"
+  } else {
+    "pre_miRNA"
+  }
+
+  names(data)[
+    names(data) ==
+      identifier_column
+  ] <- canonical_identifier
+
+  contrast_column <- find_column(
+    data,
+    c(
+      "Contrast",
+      "contrast",
+      "Comparison",
+      "comparison"
+    ),
+    "contrast column"
+  )
+
+  names(data)[
+    names(data) ==
+      contrast_column
+  ] <- "Contrast"
+
+  if (
+    !stability_flag_column %in%
+      names(data)
+  ) {
+    stop(
+      "Stability flag '",
+      stability_flag_column,
+      "' was not found in ",
+      file,
+      ". Available columns: ",
+      paste(
+        names(data),
+        collapse = ", "
+      )
+    )
+  }
+
+  data[[canonical_identifier]] <- trimws(
+    as.character(
+      data[[canonical_identifier]]
+    )
+  )
+
+  data <- data %>%
+    mutate(
+      Contrast =
+        canonical_contrast(
+          Contrast
+        )
+    ) %>%
+    filter(
+      Contrast ==
+        canonical_contrast(
+          params$contrast
+        )
+    )
+
+  duplicates <- data %>%
+    count(
+      .data[[
+        canonical_identifier
+      ]],
+      name = "n"
+    ) %>%
+    filter(
+      n > 1
+    )
+
+  if (nrow(duplicates) > 0) {
+    stop(
+      "Duplicate feature rows were found in stability table: ",
+      file
+    )
+  }
+
+  data %>%
+    mutate(
+      selected_stability_flag =
+        as_flag(
+          .data[[
+            stability_flag_column
+          ]]
+        )
+    )
+}
+```
+
+```{r}
+build_validated_table <- function(
+    dataset,
+    molecule,
+    primary_file,
+    stability_file,
+    stability_flag_column
+) {
+  primary <- read_primary_de(
+    primary_file,
+    molecule,
+    dataset
+  )
+
+  stability <- read_stability_table(
+    stability_file,
+    molecule,
+    stability_flag_column
+  )
+
+  identifier <- if (
+    molecule == "mRNA"
+  ) {
+    "Gene"
+  } else {
+    "pre_miRNA"
+  }
+
+  stability_columns <- setdiff(
+    names(stability),
+    c(
+      identifier,
+      "Contrast"
+    )
+  )
+
+  stability <- stability %>%
+    rename_with(
+      ~ paste0(
+        "stability_",
+        .x
+      ),
+      all_of(
+        stability_columns
+      )
+    )
+
+  joined <- primary %>%
+    left_join(
+      stability,
+      by = c(
+        identifier,
+        "Contrast"
+      )
+    ) %>%
+    mutate(
+      bootstrap_assessed =
+        !is.na(
+          stability_selected_stability_flag
+        ),
+
+      bootstrap_stable =
+        if_else(
+          bootstrap_assessed,
+          stability_selected_stability_flag,
+          FALSE
+        ),
+
+      primary_significant =
+        !is.na(FDR) &
+        FDR <= params$fdr_cutoff &
+        !is.na(logFC) &
+        abs(logFC) >=
+          params$logfc_cutoff,
+
+      validated_significant =
+        primary_significant &
+        bootstrap_stable,
+
+      Direction = case_when(
+        logFC > 0 ~
+          "Up in MSS/TMB-H",
+
+        logFC < 0 ~
+          "Down in MSS/TMB-H",
+
+        TRUE ~
+          "No direction"
+      ),
+
+      Molecule = molecule
+    )
+
+  list(
+    all = joined,
+    validated = joined %>%
+      filter(
+        validated_significant
+      )
+  )
+}
+```
+
+```{r}
+analysis_data <- list()
+
+for (dataset_name in c("CRC", "UCEC")) {
+  files <- input_files[[
+    dataset_name
+  ]]
+
+  analysis_data[[
+    dataset_name
+  ]] <- list(
+    mRNA = build_validated_table(
+      dataset = dataset_name,
+      molecule = "mRNA",
+      primary_file =
+        files$mRNA_primary,
+      stability_file =
+        files$mRNA_stability,
+      stability_flag_column =
+        params$mrna_stability_flag_column
+    ),
+
+    pre_miRNA =
+      build_validated_table(
+        dataset = dataset_name,
+        molecule = "pre_miRNA",
+        primary_file =
+          files$pre_miRNA_primary,
+        stability_file =
+          files$pre_miRNA_stability,
+        stability_flag_column =
+          params$mirna_stability_flag_column
+      )
+  )
+}
+```
+
+```{r}
+for (dataset_name in c("CRC", "UCEC")) {
+  dataset_dir <- file.path(
+    table_dir,
+    dataset_name
+  )
+
+  dir.create(
+    dataset_dir,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+
+  write.csv(
+    analysis_data[[
+      dataset_name
+    ]]$
+      mRNA$
+      all,
+    file.path(
+      dataset_dir,
+      "mRNA_primary_with_bootstrap_stability.csv"
+    ),
+    row.names = FALSE
+  )
+
+  write.csv(
+    analysis_data[[
+      dataset_name
+    ]]$
+      mRNA$
+      validated,
+    file.path(
+      dataset_dir,
+      "mRNA_bootstrap_validated_DEGs.csv"
+    ),
+    row.names = FALSE
+  )
+
+  write.csv(
+    analysis_data[[
+      dataset_name
+    ]]$
+      pre_miRNA$
+      all,
+    file.path(
+      dataset_dir,
+      "pre_miRNA_primary_with_bootstrap_stability.csv"
+    ),
+    row.names = FALSE
+  )
+
+  write.csv(
+    analysis_data[[
+      dataset_name
+    ]]$
+      pre_miRNA$
+      validated,
+    file.path(
+      dataset_dir,
+      "pre_miRNA_bootstrap_validated_DE.csv"
+    ),
+    row.names = FALSE
+  )
+}
+```
+
+```{r}
+validation_summary <- bind_rows(
+  lapply(
+    c("CRC", "UCEC"),
+    function(dataset_name) {
+      bind_rows(
+        tibble(
+          Dataset = dataset_name,
+          Molecule = "mRNA",
+          Features_tested =
+            nrow(
+              analysis_data[[
+                dataset_name
+              ]]$
+                mRNA$
+                all
+            ),
+
+          Primary_significant =
+            sum(
+              analysis_data[[
+                dataset_name
+              ]]$
+                mRNA$
+                all$
+                primary_significant,
+              na.rm = TRUE
+            ),
+
+          Bootstrap_stable =
+            sum(
+              analysis_data[[
+                dataset_name
+              ]]$
+                mRNA$
+                all$
+                bootstrap_stable,
+              na.rm = TRUE
+            ),
+
+          Bootstrap_validated =
+            nrow(
+              analysis_data[[
+                dataset_name
+              ]]$
+                mRNA$
+                validated
+            )
+        ),
+
+        tibble(
+          Dataset = dataset_name,
+          Molecule = "pre_miRNA",
+          Features_tested =
+            nrow(
+              analysis_data[[
+                dataset_name
+              ]]$
+                pre_miRNA$
+                all
+            ),
+
+          Primary_significant =
+            sum(
+              analysis_data[[
+                dataset_name
+              ]]$
+                pre_miRNA$
+                all$
+                primary_significant,
+              na.rm = TRUE
+            ),
+
+          Bootstrap_stable =
+            sum(
+              analysis_data[[
+                dataset_name
+              ]]$
+                pre_miRNA$
+                all$
+                bootstrap_stable,
+              na.rm = TRUE
+            ),
+
+          Bootstrap_validated =
+            nrow(
+              analysis_data[[
+                dataset_name
+              ]]$
+                pre_miRNA$
+                validated
+            )
+        )
+      )
+    }
+  )
+)
+
+write.csv(
+  validation_summary,
+  file.path(
+    table_dir,
+    "bootstrap_validation_summary.csv"
+  ),
+  row.names = FALSE
+)
+
+knitr::kable(
+  validation_summary,
+  caption =
+    "Primary, bootstrap-stable, and bootstrap-validated feature counts."
+)
+```
+
+```{r}
+precursor_to_mature_base <- function(
+    precursor
+) {
+  trimws(
+    as.character(
+      precursor
+    )
+  ) %>%
+    str_replace(
+      "^hsa-mir",
+      "hsa-miR"
+    )
+}
+
+
+make_mature_candidates <- function(
+    precursors
+) {
+  precursors <- unique(
+    precursors[
+      !is.na(precursors) &
+      nzchar(precursors)
+    ]
+  )
+
+  bind_rows(
+    lapply(
+      precursors,
+      function(precursor) {
+        mature_base <-
+          precursor_to_mature_base(
+            precursor
+          )
+
+        mature_candidates <- if (
+          str_detect(
+            mature_base,
+            "-(3p|5p)$"
+          )
+        ) {
+          mature_base
+        } else {
+          c(
+            paste0(
+              mature_base,
+              "-5p"
+            ),
+            paste0(
+              mature_base,
+              "-3p"
+            )
+          )
+        }
+
+        tibble(
+          pre_miRNA = precursor,
+          mature_query =
+            mature_candidates
+        )
+      }
+    )
+  ) %>%
+    distinct()
+}
+```
+
+```{r}
+empty_multimir_table <- function() {
+  tibble(
+    pre_miRNA = character(),
+    mature_query = character(),
+    mature_mirna_id = character(),
+    target_symbol = character(),
+    database = character()
+  )
+}
+
+
+query_one_mature_mirna <- function(
+    pre_miRNA,
+    mature_query
+) {
+  message(
+    "Querying multiMiR: ",
+    mature_query
+  )
+
+  result <- tryCatch(
+    multiMiR::get_multimir(
+      mirna = mature_query,
+      table = "validated",
+      summary = TRUE
+    ),
+    error = function(error) {
+      message(
+        "multiMiR query failed for ",
+        mature_query,
+        ": ",
+        conditionMessage(error)
+      )
+
+      return(NULL)
+    }
+  )
+
+  if (
+    is.null(result) ||
+    is.null(result@data) ||
+    nrow(result@data) == 0
+  ) {
+    return(
+      empty_multimir_table()
+    )
+  }
+
+  result@data %>%
+    as_tibble() %>%
+    mutate(
+      pre_miRNA = pre_miRNA,
+      mature_query =
+        mature_query,
+      .before = 1
+    )
+}
+
+
+get_multimir_interactions <- function(
+    precursors,
+    cache_file
+) {
+  candidates <- make_mature_candidates(
+    precursors
+  )
+
+  write.csv(
+    candidates,
+    file.path(
+      multimir_dir,
+      "bootstrap_validated_pre_miRNA_mature_candidates.csv"
+    ),
+    row.names = FALSE
+  )
+
+  if (
+    file.exists(cache_file) &&
+    !params$force_multimir_query
+  ) {
+    message(
+      "Using cached multiMiR results: ",
+      cache_file
+    )
+
+    interactions <- read.csv(
+      cache_file,
+      check.names = FALSE,
+      stringsAsFactors = FALSE
+    ) %>%
+      as_tibble()
+  } else {
+    if (!params$run_multimir) {
+      stop(
+        "No cached multiMiR result exists and run_multimir is FALSE."
+      )
+    }
+
+    interactions <- bind_rows(
+      lapply(
+        seq_len(
+          nrow(candidates)
+        ),
+        function(index) {
+          query_one_mature_mirna(
+            candidates$pre_miRNA[
+              index
+            ],
+            candidates$mature_query[
+              index
+            ]
+          )
+        }
+      )
+    )
+
+    write.csv(
+      interactions,
+      cache_file,
+      row.names = FALSE
+    )
+  }
+
+  required_columns <- c(
+    "pre_miRNA",
+    "target_symbol"
+  )
+
+  missing_columns <- setdiff(
+    required_columns,
+    names(interactions)
+  )
+
+  if (length(missing_columns) > 0) {
+    stop(
+      "multiMiR result is missing columns: ",
+      paste(
+        missing_columns,
+        collapse = ", "
+      )
+    )
+  }
+
+  interactions %>%
+    mutate(
+      pre_miRNA = trimws(
+        as.character(
+          pre_miRNA
+        )
+      ),
+
+      target_symbol = trimws(
+        as.character(
+          target_symbol
+        )
+      ),
+
+      target_key = toupper(
+        target_symbol
+      )
+    ) %>%
+    filter(
+      !is.na(target_symbol),
+      nzchar(target_symbol)
+    )
+}
+```
+
+```{r}
+all_validated_precursors <- unique(
+  c(
+    analysis_data$CRC$
+      pre_miRNA$
+      validated$
+      pre_miRNA,
+
+    analysis_data$UCEC$
+      pre_miRNA$
+      validated$
+      pre_miRNA
+  )
+)
+
+if (length(all_validated_precursors) == 0) {
+  stop(
+    "No bootstrap-validated pre-miRNAs were available for multiMiR analysis."
+  )
+}
+
+multimir_cache_file <- file.path(
+  multimir_dir,
+  "validated_multiMiR_interactions_bootstrap_validated_pre_miRNAs.csv"
+)
+
+multimir_raw <- get_multimir_interactions(
+  all_validated_precursors,
+  multimir_cache_file
+)
+
+
+mature_column <- if (
+  "mature_mirna_id" %in%
+    names(multimir_raw)
+) {
+  "mature_mirna_id"
+} else {
+  "mature_query"
+}
+
+database_column <- if (
+  "database" %in%
+    names(multimir_raw)
+) {
+  "database"
+} else {
+  NULL
+}
+
+multimir_edges <- multimir_raw %>%
+  distinct(
+    pre_miRNA,
+    .data[[mature_column]],
+    target_symbol,
+    target_key,
+    across(
+      any_of(
+        database_column
+      )
+    ),
+    .keep_all = TRUE
+  )
+
+write.csv(
+  multimir_edges,
+  file.path(
+    table_dir,
+    "unique_validated_multiMiR_interactions.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+```{r}
+integrate_dataset <- function(
+    dataset_name,
+    mirna_table,
+    mrna_table,
+    multimir_table
+) {
+  mirna_direction <- mirna_table %>%
+    dplyr::select(
+      pre_miRNA,
+      miRNA_logFC = logFC,
+      miRNA_FDR = FDR,
+      miRNA_Direction =
+        Direction
+    ) %>%
+    distinct()
+
+  gene_direction <- mrna_table %>%
+    transmute(
+      target_key = toupper(
+        Gene
+      ),
+
+      target_symbol_DE =
+        Gene,
+
+      gene_logFC = logFC,
+      gene_FDR = FDR,
+      gene_Direction =
+        Direction
+    ) %>%
+    distinct()
+
+  multimir_table %>%
+    inner_join(
+      mirna_direction,
+      by = "pre_miRNA"
+    ) %>%
+    inner_join(
+      gene_direction,
+      by = "target_key"
+    ) %>%
+    mutate(
+      Dataset = dataset_name,
+
+      inverse_direction = case_when(
+        miRNA_logFC > 0 &
+          gene_logFC < 0 ~
+          TRUE,
+
+        miRNA_logFC < 0 &
+          gene_logFC > 0 ~
+          TRUE,
+
+        TRUE ~
+          FALSE
+      ),
+
+      .before = 1
+    ) %>%
+    arrange(
+      target_symbol_DE,
+      pre_miRNA
+    )
+}
+
+
+summarise_supported_genes <- function(
+    interactions
+) {
+  if (nrow(interactions) == 0) {
+    return(
+      tibble(
+        target_symbol = character(),
+        gene_logFC = numeric(),
+        gene_FDR = numeric(),
+        gene_Direction = character(),
+        n_pre_miRNAs = integer(),
+        pre_miRNAs = character(),
+        mature_miRNAs = character(),
+        databases = character(),
+        any_inverse_direction =
+          logical()
+      )
+    )
+  }
+
+  interactions %>%
+    group_by(
+      target_symbol =
+        target_symbol_DE,
+      gene_logFC,
+      gene_FDR,
+      gene_Direction
+    ) %>%
+    summarise(
+      n_pre_miRNAs =
+        n_distinct(
+          pre_miRNA
+        ),
+
+      pre_miRNAs = paste(
+        sort(
+          unique(
+            pre_miRNA
+          )
+        ),
+        collapse = "; "
+      ),
+
+      mature_miRNAs = paste(
+        sort(
+          unique(
+            .data[[
+              mature_column
+            ]]
+          )
+        ),
+        collapse = "; "
+      ),
+
+      databases = if (
+        is.null(
+          database_column
+        )
+      ) {
+        NA_character_
+      } else {
+        paste(
+          sort(
+            unique(
+              .data[[
+                database_column
+              ]]
+            )
+          ),
+          collapse = "; "
+        )
+      },
+
+      any_inverse_direction =
+        any(
+          inverse_direction
+        ),
+
+      .groups = "drop"
+    ) %>%
+    arrange(
+      gene_FDR,
+      desc(
+        n_pre_miRNAs
+      )
+    )
+}
+```
+
+```{r}
+interactions_by_dataset <- list()
+gene_summaries_by_dataset <- list()
+
+for (dataset_name in c("CRC", "UCEC")) {
+  interactions_by_dataset[[
+    dataset_name
+  ]] <- integrate_dataset(
+    dataset_name =
+      dataset_name,
+
+    mirna_table =
+      analysis_data[[
+        dataset_name
+      ]]$
+        pre_miRNA$
+        validated,
+
+    mrna_table =
+      analysis_data[[
+        dataset_name
+      ]]$
+        mRNA$
+        validated,
+
+    multimir_table =
+      multimir_edges
+  )
+
+  gene_summaries_by_dataset[[
+    dataset_name
+  ]] <- summarise_supported_genes(
+    interactions_by_dataset[[
+      dataset_name
+    ]]
+  )
+
+  write.csv(
+    interactions_by_dataset[[
+      dataset_name
+    ]],
+    file.path(
+      table_dir,
+      paste0(
+        dataset_name,
+        "_validated_miRNA_target_bootstrap_validated_DEG_interactions.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+
+  write.csv(
+    interactions_by_dataset[[
+      dataset_name
+    ]] %>%
+      filter(
+        inverse_direction
+      ),
+    file.path(
+      table_dir,
+      paste0(
+        dataset_name,
+        "_inverse_direction_miRNA_target_DEG_interactions.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+
+  write.csv(
+    gene_summaries_by_dataset[[
+      dataset_name
+    ]],
+    file.path(
+      table_dir,
+      paste0(
+        dataset_name,
+        "_miRNA_supported_bootstrap_validated_DEG_summary.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+}
+```
+
+```{r}
+cancer_count_summary <- bind_rows(
+  lapply(
+    c("CRC", "UCEC"),
+    function(dataset_name) {
+      interactions <-
+        interactions_by_dataset[[
+          dataset_name
+        ]]
+
+      tibble(
+        Dataset =
+          dataset_name,
+
+        Bootstrap_validated_pre_miRNAs =
+          n_distinct(
+            analysis_data[[
+              dataset_name
+            ]]$
+              pre_miRNA$
+              validated$
+              pre_miRNA
+          ),
+
+        Bootstrap_validated_DEGs =
+          n_distinct(
+            analysis_data[[
+              dataset_name
+            ]]$
+              mRNA$
+              validated$
+              Gene
+          ),
+
+        miRNA_target_DEG_interactions =
+          nrow(
+            interactions
+          ),
+
+        Unique_miRNA_supported_DEGs =
+          n_distinct(
+            interactions$
+              target_symbol_DE
+          ),
+
+        Inverse_direction_interactions =
+          sum(
+            interactions$
+              inverse_direction,
+            na.rm = TRUE
+          ),
+
+        Unique_inverse_direction_DEGs =
+          n_distinct(
+            interactions$
+              target_symbol_DE[
+                interactions$
+                  inverse_direction
+              ]
+          )
+      )
+    }
+  )
+)
+
+write.csv(
+  cancer_count_summary,
+  file.path(
+    table_dir,
+    "CRC_UCEC_miRNA_target_DEG_counts.csv"
+  ),
+  row.names = FALSE
+)
+
+knitr::kable(
+  cancer_count_summary,
+  caption =
+    "Cancer-specific bootstrap-validated miRNA-target integration."
+)
+```
+
+```{r}
+shared_mirna <- inner_join(
+  analysis_data$CRC$
+    pre_miRNA$
+    validated %>%
+    dplyr::select(
+      pre_miRNA,
+      CRC_miRNA_logFC = logFC,
+      CRC_miRNA_FDR = FDR,
+      CRC_miRNA_Direction =
+        Direction
+    ),
+
+  analysis_data$UCEC$
+    pre_miRNA$
+    validated %>%
+    dplyr::select(
+      pre_miRNA,
+      UCEC_miRNA_logFC = logFC,
+      UCEC_miRNA_FDR = FDR,
+      UCEC_miRNA_Direction =
+        Direction
+    ),
+
+  by = "pre_miRNA"
+) %>%
+  mutate(
+    Direction_consistent =
+      sign(
+        CRC_miRNA_logFC
+      ) ==
+      sign(
+        UCEC_miRNA_logFC
+      ),
+
+    mean_miRNA_logFC =
+      rowMeans(
+        cbind(
+          CRC_miRNA_logFC,
+          UCEC_miRNA_logFC
+        )
+      ),
+
+    miRNA_Direction = case_when(
+      mean_miRNA_logFC > 0 ~
+        "Up in MSS/TMB-H",
+
+      mean_miRNA_logFC < 0 ~
+        "Down in MSS/TMB-H",
+
+      TRUE ~
+        "No direction"
+    )
+  ) %>%
+  filter(
+    Direction_consistent
+  )
+
+
+shared_mrna <- inner_join(
+  analysis_data$CRC$
+    mRNA$
+    validated %>%
+    transmute(
+      target_key = toupper(
+        Gene
+      ),
+
+      CRC_Gene = Gene,
+      CRC_gene_logFC = logFC,
+      CRC_gene_FDR = FDR,
+      CRC_gene_Direction =
+        Direction
+    ),
+
+  analysis_data$UCEC$
+    mRNA$
+    validated %>%
+    transmute(
+      target_key = toupper(
+        Gene
+      ),
+
+      UCEC_Gene = Gene,
+      UCEC_gene_logFC = logFC,
+      UCEC_gene_FDR = FDR,
+      UCEC_gene_Direction =
+        Direction
+    ),
+
+  by = "target_key"
+) %>%
+  mutate(
+    Direction_consistent =
+      sign(
+        CRC_gene_logFC
+      ) ==
+      sign(
+        UCEC_gene_logFC
+      ),
+
+    mean_gene_logFC =
+      rowMeans(
+        cbind(
+          CRC_gene_logFC,
+          UCEC_gene_logFC
+        )
+      ),
+
+    gene_Direction = case_when(
+      mean_gene_logFC > 0 ~
+        "Up in MSS/TMB-H",
+
+      mean_gene_logFC < 0 ~
+        "Down in MSS/TMB-H",
+
+      TRUE ~
+        "No direction"
+    ),
+
+    target_symbol =
+      coalesce(
+        CRC_Gene,
+        UCEC_Gene
+      )
+  ) %>%
+  filter(
+    Direction_consistent
+  )
+
+
+shared_interactions <- multimir_edges %>%
+  rename(
+    target_symbol_multiMiR = target_symbol
+  ) %>%
+  filter(
+    pre_miRNA %in% shared_mirna$pre_miRNA
+  ) %>%
+  inner_join(
+    shared_mirna %>%
+      dplyr::select(
+        pre_miRNA,
+        CRC_miRNA_logFC,
+        UCEC_miRNA_logFC,
+        CRC_miRNA_FDR,
+        UCEC_miRNA_FDR,
+        miRNA_Direction
+      ),
+    by = "pre_miRNA"
+  ) %>%
+  inner_join(
+    shared_mrna %>%
+      dplyr::transmute(
+        target_key,
+        target_symbol_DE = target_symbol,
+        CRC_gene_logFC,
+        UCEC_gene_logFC,
+        CRC_gene_FDR,
+        UCEC_gene_FDR,
+        gene_Direction
+      ),
+    by = "target_key"
+  ) %>%
+  mutate(
+    Dataset = "Shared CRC-UCEC",
+
+    
+    target_symbol = coalesce(
+      target_symbol_DE,
+      target_symbol_multiMiR
+    ),
+
+    inverse_direction = case_when(
+      miRNA_Direction == "Up in MSS/TMB-H" &
+        gene_Direction == "Down in MSS/TMB-H" ~ TRUE,
+
+      miRNA_Direction == "Down in MSS/TMB-H" &
+        gene_Direction == "Up in MSS/TMB-H" ~ TRUE,
+
+      TRUE ~ FALSE
+    ),
+
+    .before = 1
+  ) %>%
+  arrange(
+    target_symbol,
+    pre_miRNA
+  )
+
+
+write.csv(
+  shared_mirna,
+  file.path(
+    table_dir,
+    "shared_direction_consistent_bootstrap_validated_pre_miRNAs.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  shared_mrna,
+  file.path(
+    table_dir,
+    "shared_direction_consistent_bootstrap_validated_DEGs.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  shared_interactions,
+  file.path(
+    table_dir,
+    "shared_validated_miRNA_target_bootstrap_validated_DEG_interactions.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  shared_interactions %>%
+    filter(
+      inverse_direction
+    ),
+  file.path(
+    table_dir,
+    "shared_inverse_direction_miRNA_target_DEG_interactions.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+```{r}
+shared_count_summary <- tibble(
+  Shared_direction_consistent_pre_miRNAs =
+    n_distinct(
+      shared_mirna$
+        pre_miRNA
+    ),
+
+  Shared_direction_consistent_DEGs =
+    n_distinct(
+      shared_mrna$
+        target_symbol
+    ),
+
+  Shared_miRNA_target_DEG_interactions =
+    nrow(
+      shared_interactions
+    ),
+
+  Shared_unique_miRNA_supported_DEGs =
+    n_distinct(
+      shared_interactions$
+        target_symbol
+    ),
+
+  Shared_inverse_direction_interactions =
+    sum(
+      shared_interactions$
+        inverse_direction,
+      na.rm = TRUE
+    ),
+
+  Shared_unique_inverse_direction_DEGs =
+    n_distinct(
+      shared_interactions$
+        target_symbol[
+          shared_interactions$
+            inverse_direction
+        ]
+    )
+)
+
+write.csv(
+  shared_count_summary,
+  file.path(
+    table_dir,
+    "shared_miRNA_target_DEG_counts.csv"
+  ),
+  row.names = FALSE
+)
+
+knitr::kable(
+  shared_count_summary,
+  caption =
+    "Shared CRC–UCEC bootstrap-validated miRNA-target integration."
+)
+```
+
+```{r}
+target_count_data <- bind_rows(
+  interactions_by_dataset$CRC %>%
+    distinct(
+      pre_miRNA,
+      target_symbol_DE
+    ) %>%
+    count(
+      pre_miRNA,
+      name =
+        "Number_of_targets"
+    ) %>%
+    mutate(
+      Dataset = "CRC"
+    ),
+
+  interactions_by_dataset$UCEC %>%
+    distinct(
+      pre_miRNA,
+      target_symbol_DE
+    ) %>%
+    count(
+      pre_miRNA,
+      name =
+        "Number_of_targets"
+    ) %>%
+    mutate(
+      Dataset = "UCEC"
+    )
+)
+
+if (nrow(target_count_data) == 0) {
+  save_placeholder_svg(
+    file.path(
+      plot_dir,
+      "validated_pre_miRNA_target_counts.svg"
+    ),
+    "Validated pre-miRNA target counts",
+    "No overlapping bootstrap-validated target genes"
+  )
+} else {
+  p_target_counts <- ggplot(
+    target_count_data,
+    aes(
+      reorder(
+        pre_miRNA,
+        Number_of_targets
+      ),
+      Number_of_targets,
+      fill = Dataset
+    )
+  ) +
+    geom_col(
+      position = "dodge"
+    ) +
+    coord_flip() +
+    labs(
+      title =
+        "Bootstrap-validated DE targets of validated pre-miRNAs",
+      x = NULL,
+      y =
+        "Number of unique target DEGs",
+      fill = NULL
+    ) +
+    theme_classic(
+      base_size = 12
+    ) +
+    theme(
+      plot.title = element_text(
+        face = "bold",
+        hjust = 0.5
+      ),
+      legend.position = "top"
+    )
+
+  ggsave(
+    file.path(
+      plot_dir,
+      "validated_pre_miRNA_target_counts.svg"
+    ),
+    p_target_counts,
+    width = 8,
+    height = max(
+      5,
+      0.35 *
+        n_distinct(
+          target_count_data$
+            pre_miRNA
+        )
+    ),
+    device = "svg"
+  )
+
+  p_target_counts
+}
+```
+
+```{r}
+empty_enrichment_table <- function() {
+  tibble(
+    Analysis = character(),
+    Dataset = character(),
+    Target_subset = character(),
+    Gene_direction = character(),
+    Correction = character(),
+    Significant = logical(),
+    source = character(),
+    term_id = character(),
+    term_name = character(),
+    p_value = numeric(),
+    term_size = integer(),
+    query_size = integer(),
+    intersection_size = integer(),
+    effective_domain_size =
+      integer(),
+    intersection = character()
+  )
+}
+
+
+run_gost_safe <- function(
+    genes,
+    background,
+    analysis,
+    dataset,
+    target_subset,
+    gene_direction,
+    correction
+) {
+  genes <- unique(
+    genes[
+      !is.na(genes) &
+      nzchar(genes)
+    ]
+  )
+
+  background <- unique(
+    background[
+      !is.na(background) &
+      nzchar(background)
+    ]
+  )
+
+  genes <- intersect(
+    genes,
+    background
+  )
+
+  if (
+    length(genes) <
+      params$minimum_query_size
+  ) {
+    message(
+      dataset,
+      " / ",
+      target_subset,
+      " / ",
+      gene_direction,
+      ": fewer than ",
+      params$minimum_query_size,
+      " genes; enrichment skipped."
+    )
+
+    return(
+      empty_enrichment_table()
+    )
+  }
+
+  if (!params$run_gprofiler) {
+    return(
+      empty_enrichment_table()
+    )
+  }
+
+  result <- tryCatch(
+    suppressMessages(
+      suppressWarnings(
+        gprofiler2::gost(
+          query = genes,
+          organism =
+            params$organism,
+          ordered_query = FALSE,
+          multi_query = FALSE,
+          significant = FALSE,
+          exclude_iea = FALSE,
+          measure_underrepresentation =
+            FALSE,
+          evcodes = TRUE,
+          user_threshold = 1,
+          correction_method =
+            correction,
+          domain_scope =
+            params$domain_scope,
+          custom_bg =
+            background,
+          sources =
+            params$enrichment_sources,
+          highlight = FALSE
+        )
+      )
+    ),
+    error = function(error) {
+      message(
+        "g:Profiler failed for ",
+        dataset,
+        " / ",
+        target_subset,
+        " / ",
+        gene_direction,
+        " / ",
+        correction,
+        ": ",
+        conditionMessage(error)
+      )
+
+      return(NULL)
+    }
+  )
+
+  if (
+    is.null(result) ||
+    is.null(result$result) ||
+    nrow(result$result) == 0
+  ) {
+    return(
+      empty_enrichment_table()
+    )
+  }
+
+  result$result %>%
+    as_tibble() %>%
+    mutate(
+      Analysis = analysis,
+      Dataset = dataset,
+      Target_subset =
+        target_subset,
+      Gene_direction =
+        gene_direction,
+      Correction = correction,
+      Significant =
+        p_value <=
+        params$fdr_cutoff,
+      intersection = vapply(
+        intersection,
+        function(values) {
+          paste(
+            values,
+            collapse = "; "
+          )
+        },
+        character(1)
+      ),
+      .before = 1
+    ) %>%
+    dplyr::select(
+      Analysis,
+      Dataset,
+      Target_subset,
+      Gene_direction,
+      Correction,
+      Significant,
+      source,
+      term_id,
+      term_name,
+      p_value,
+      term_size,
+      query_size,
+      intersection_size,
+      effective_domain_size,
+      intersection,
+      everything()
+    )
+}
+
+
+make_gene_queries <- function(
+    interactions,
+    gene_symbol_column,
+    gene_direction_column
+) {
+  all_genes <- interactions %>%
+    transmute(
+      Gene =
+        .data[[
+          gene_symbol_column
+        ]],
+
+      Direction =
+        .data[[
+          gene_direction_column
+        ]]
+    ) %>%
+    distinct()
+
+  inverse_genes <- interactions %>%
+    filter(
+      inverse_direction
+    ) %>%
+    transmute(
+      Gene =
+        .data[[
+          gene_symbol_column
+        ]],
+
+      Direction =
+        .data[[
+          gene_direction_column
+        ]]
+    ) %>%
+    distinct()
+
+  list(
+    All_validated_target_overlaps =
+      list(
+        `Up in MSS/TMB-H` =
+          all_genes %>%
+          filter(
+            Direction ==
+              "Up in MSS/TMB-H"
+          ) %>%
+          pull(Gene),
+
+        `Down in MSS/TMB-H` =
+          all_genes %>%
+          filter(
+            Direction ==
+              "Down in MSS/TMB-H"
+          ) %>%
+          pull(Gene)
+      ),
+
+    Inverse_direction_only =
+      list(
+        `Up in MSS/TMB-H` =
+          inverse_genes %>%
+          filter(
+            Direction ==
+              "Up in MSS/TMB-H"
+          ) %>%
+          pull(Gene),
+
+        `Down in MSS/TMB-H` =
+          inverse_genes %>%
+          filter(
+            Direction ==
+              "Down in MSS/TMB-H"
+          ) %>%
+          pull(Gene)
+      )
+  )
+}
+
+
+run_query_collection <- function(
+    queries,
+    background,
+    dataset,
+    analysis
+) {
+  bind_rows(
+    lapply(
+      names(queries),
+      function(target_subset) {
+        bind_rows(
+          lapply(
+            names(
+              queries[[
+                target_subset
+              ]]
+            ),
+            function(gene_direction) {
+              genes <-
+                queries[[
+                  target_subset
+                ]][[
+                  gene_direction
+                ]]
+
+              bind_rows(
+                run_gost_safe(
+                  genes = genes,
+                  background =
+                    background,
+                  analysis =
+                    analysis,
+                  dataset =
+                    dataset,
+                  target_subset =
+                    target_subset,
+                  gene_direction =
+                    gene_direction,
+                  correction =
+                    "g_SCS"
+                ),
+
+                run_gost_safe(
+                  genes = genes,
+                  background =
+                    background,
+                  analysis =
+                    analysis,
+                  dataset =
+                    dataset,
+                  target_subset =
+                    target_subset,
+                  gene_direction =
+                    gene_direction,
+                  correction =
+                    "fdr"
+                )
+              )
+            }
+          )
+        )
+      }
+    )
+  )
+}
+```
+
+```{r}
+crc_queries <- make_gene_queries(
+  interactions_by_dataset$CRC,
+  gene_symbol_column =
+    "target_symbol_DE",
+  gene_direction_column =
+    "gene_Direction"
+)
+
+ucec_queries <- make_gene_queries(
+  interactions_by_dataset$UCEC,
+  gene_symbol_column =
+    "target_symbol_DE",
+  gene_direction_column =
+    "gene_Direction"
+)
+
+shared_queries <- make_gene_queries(
+  shared_interactions,
+  gene_symbol_column =
+    "target_symbol",
+  gene_direction_column =
+    "gene_Direction"
+)
+
+crc_background <- unique(
+  analysis_data$CRC$
+    mRNA$
+    all$
+    Gene
+)
+
+ucec_background <- unique(
+  analysis_data$UCEC$
+    mRNA$
+    all$
+    Gene
+)
+
+shared_background <- intersect(
+  toupper(
+    crc_background
+  ),
+  toupper(
+    ucec_background
+  )
+)
+
+
+shared_background <- analysis_data$CRC$
+  mRNA$
+  all %>%
+  filter(
+    toupper(Gene) %in%
+      shared_background
+  ) %>%
+  pull(Gene) %>%
+  unique()
+
+enrichment_results <- bind_rows(
+  run_query_collection(
+    crc_queries,
+    background =
+      crc_background,
+    dataset = "CRC",
+    analysis =
+      "Cancer-specific"
+  ),
+
+  run_query_collection(
+    ucec_queries,
+    background =
+      ucec_background,
+    dataset = "UCEC",
+    analysis =
+      "Cancer-specific"
+  ),
+
+  run_query_collection(
+    shared_queries,
+    background =
+      shared_background,
+    dataset =
+      "Shared CRC-UCEC",
+    analysis =
+      "Shared direction-consistent"
+  )
+)
+flatten_list_columns <- function(df) {
+  list_columns <- names(df)[
+    vapply(df, is.list, logical(1))
+  ]
+
+  if (length(list_columns) == 0) {
+    return(df)
+  }
+
+  df %>%
+    mutate(
+      across(
+        all_of(list_columns),
+        ~ vapply(
+          .x,
+          function(value) {
+            if (
+              is.null(value) ||
+              length(value) == 0
+            ) {
+              return("")
+            }
+
+            paste(
+              unlist(
+                value,
+                recursive = TRUE,
+                use.names = FALSE
+              ),
+              collapse = "; "
+            )
+          },
+          character(1)
+        )
+      )
+    )
+}
+enrichment_results_export <- flatten_list_columns(
+  enrichment_results
+)
+
+write.csv(
+  enrichment_results_export,
+  file.path(
+    enrichment_dir,
+    "all_miRNA_supported_bootstrap_validated_DEG_enrichment_results.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  enrichment_results_export %>%
+    filter(Significant),
+  file.path(
+    enrichment_dir,
+    "significant_miRNA_supported_bootstrap_validated_DEG_enrichment_results.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+```{r}
+select_top_terms <- function(
+    enrichment,
+    correction,
+    target_subset
+) {
+  enrichment %>%
+    filter(
+      Correction ==
+        correction,
+      Target_subset ==
+        target_subset,
+      Significant
+    ) %>%
+    group_by(
+      Dataset,
+      Gene_direction,
+      source
+    ) %>%
+    arrange(
+      p_value,
+      .by_group = TRUE
+    ) %>%
+    slice_head(
+      n =
+        params$top_terms_per_source
+    ) %>%
+    ungroup() %>%
+    mutate(
+      neglog10_p =
+        -log10(
+          pmax(
+            p_value,
+            1e-300
+          )
+        ),
+
+      term_label = paste0(
+        source,
+        ": ",
+        str_trunc(
+          term_name,
+          72
+        )
+      )
+    )
+}
+
+
+plot_enrichment <- function(
+    enrichment,
+    correction,
+    target_subset,
+    title,
+    output_file
+) {
+  plot_data <- select_top_terms(
+    enrichment,
+    correction,
+    target_subset
+  )
+
+  if (nrow(plot_data) == 0) {
+    save_placeholder_svg(
+      output_file,
+      title,
+      paste0(
+        "No significant ",
+        correction,
+        " terms"
+      )
+    )
+
+    return(
+      invisible(NULL)
+    )
+  }
+
+  plot_data <- plot_data %>%
+    arrange(
+      Dataset,
+      Gene_direction,
+      p_value
+    ) %>%
+    mutate(
+      term_label = factor(
+        term_label,
+        levels = rev(
+          unique(
+            term_label
+          )
+        )
+      )
+    )
+
+  p <- ggplot(
+    plot_data,
+    aes(
+      neglog10_p,
+      term_label
+    )
+  ) +
+    geom_point(
+      aes(
+        size =
+          intersection_size,
+        color =
+          Gene_direction
+      ),
+      alpha = 0.9
+    ) +
+    facet_grid(
+      Dataset ~ Gene_direction,
+      scales = "free_y",
+      space = "free_y"
+    ) +
+    scale_color_manual(
+      values =
+        direction_colors
+    ) +
+    labs(
+      title = title,
+      subtitle = paste0(
+        "Correction: ",
+        correction,
+        "; custom background = genes tested by edgeR"
+      ),
+      x =
+        expression(-log[10]("adjusted p-value")),
+      y = NULL,
+      size =
+        "Target genes",
+      color = NULL
+    ) +
+    theme_classic(
+      base_size = 11
+    ) +
+    theme(
+      plot.title = element_text(
+        face = "bold",
+        hjust = 0.5
+      ),
+      plot.subtitle = element_text(
+        hjust = 0.5
+      ),
+      strip.text = element_text(
+        face = "bold"
+      ),
+      legend.position = "right"
+    )
+
+  ggsave(
+    output_file,
+    p,
+    width = 12,
+    height = max(
+      7,
+      0.22 *
+        nrow(
+          plot_data
+        )
+    ),
+    device = "svg",
+    limitsize = FALSE
+  )
+
+  invisible(p)
+}
+```
+
+```{r}
+plot_enrichment(
+  enrichment_results,
+  correction = "g_SCS",
+  target_subset =
+    "All_validated_target_overlaps",
+  title =
+    "Functional enrichment of miRNA-supported bootstrap-validated DEGs",
+  output_file = file.path(
+    plot_dir,
+    "enrichment_confirmatory_gSCS_all_validated_target_overlaps.svg"
+  )
+)
+
+plot_enrichment(
+  enrichment_results,
+  correction = "fdr",
+  target_subset =
+    "All_validated_target_overlaps",
+  title =
+    "Functional enrichment sensitivity analysis",
+  output_file = file.path(
+    plot_dir,
+    "enrichment_sensitivity_FDR_all_validated_target_overlaps.svg"
+  )
+)
+
+plot_enrichment(
+  enrichment_results,
+  correction = "g_SCS",
+  target_subset =
+    "Inverse_direction_only",
+  title =
+    "Enrichment of inverse-direction miRNA-target interactions",
+  output_file = file.path(
+    plot_dir,
+    "enrichment_confirmatory_gSCS_inverse_direction_only.svg"
+  )
+)
+
+plot_enrichment(
+  enrichment_results,
+  correction = "fdr",
+  target_subset =
+    "Inverse_direction_only",
+  title =
+    "Inverse-direction enrichment sensitivity analysis",
+  output_file = file.path(
+    plot_dir,
+    "enrichment_sensitivity_FDR_inverse_direction_only.svg"
+  )
+)
+```
+
+```{r}
+enrichment_summary <- enrichment_results %>%
+  group_by(
+    Dataset,
+    Target_subset,
+    Gene_direction,
+    Correction
+  ) %>%
+  summarise(
+    Returned_terms = n(),
+
+    Significant_terms =
+      sum(
+        Significant,
+        na.rm = TRUE
+      ),
+
+    .groups = "drop"
+  )
+
+write.csv(
+  enrichment_summary,
+  file.path(
+    enrichment_dir,
+    "miRNA_supported_DEG_enrichment_summary.csv"
+  ),
+  row.names = FALSE
+)
+
+knitr::kable(
+  enrichment_summary,
+  caption =
+    "Functional-enrichment summary."
+)
+```
+
+```{r}
+workbook_file <- file.path(
+  analysis_root,
+  "bootstrap_validated_miRNA_target_pathway_analysis.xlsx"
+)
+
+openxlsx::write.xlsx(
+  list(
+    Validation_summary =
+      validation_summary,
+
+    Cancer_counts =
+      cancer_count_summary,
+
+    Shared_counts =
+      shared_count_summary,
+
+    CRC_validated_pre_miRNAs =
+      analysis_data$CRC$
+      pre_miRNA$
+      validated,
+
+    UCEC_validated_pre_miRNAs =
+      analysis_data$UCEC$
+      pre_miRNA$
+      validated,
+
+    Shared_pre_miRNAs =
+      shared_mirna,
+
+    CRC_supported_DEGs =
+      gene_summaries_by_dataset$CRC,
+
+    UCEC_supported_DEGs =
+      gene_summaries_by_dataset$UCEC,
+
+    CRC_all_interactions =
+      interactions_by_dataset$CRC,
+
+    CRC_inverse_interactions =
+      interactions_by_dataset$CRC %>%
+      filter(
+        inverse_direction
+      ),
+
+    UCEC_all_interactions =
+      interactions_by_dataset$UCEC,
+
+    UCEC_inverse_interactions =
+      interactions_by_dataset$UCEC %>%
+      filter(
+        inverse_direction
+      ),
+
+    Shared_all_interactions =
+      shared_interactions,
+
+    Shared_inverse_interactions =
+      shared_interactions %>%
+      filter(
+        inverse_direction
+      ),
+
+    Enrichment_summary =
+      enrichment_summary,
+
+    Enrichment_significant =
+      enrichment_results %>%
+      filter(
+        Significant
+      ),
+
+    Enrichment_all =
+      enrichment_results
+  ),
+  file = workbook_file,
+  overwrite = TRUE
+)
+
+workbook_file
+```
+
+```{r}
+manuscript_counts <- bind_rows(
+  cancer_count_summary %>%
+    transmute(
+      Analysis = Dataset,
+
+      Number_of_bootstrap_validated_pre_miRNAs =
+        Bootstrap_validated_pre_miRNAs,
+
+      Number_of_miRNA_supported_bootstrap_validated_DEGs =
+        Unique_miRNA_supported_DEGs,
+
+      Number_of_inverse_direction_DEGs =
+        Unique_inverse_direction_DEGs
+    ),
+
+  shared_count_summary %>%
+    transmute(
+      Analysis =
+        "Shared CRC-UCEC",
+
+      Number_of_bootstrap_validated_pre_miRNAs =
+        Shared_direction_consistent_pre_miRNAs,
+
+      Number_of_miRNA_supported_bootstrap_validated_DEGs =
+        Shared_unique_miRNA_supported_DEGs,
+
+      Number_of_inverse_direction_DEGs =
+        Shared_unique_inverse_direction_DEGs
+    )
+)
+
+write.csv(
+  manuscript_counts,
+  file.path(
+    table_dir,
+    "manuscript_miRNA_target_overlap_counts.csv"
+  ),
+  row.names = FALSE
+)
+
+knitr::kable(
+  manuscript_counts,
+  caption =
+    "Counts for manuscript reporting."
+)
+```
+
+```{r}
+output_manifest <- list.files(
+  analysis_root,
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+writeLines(
+  output_manifest,
+  file.path(
+    analysis_root,
+    "output_manifest.txt"
+  )
+)
+
+cat(
+  paste(
+    output_manifest,
+    collapse = "\n"
+  )
+)
+```
+
+```{r}
+sessionInfo()
+```

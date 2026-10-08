@@ -1,0 +1,1502 @@
+```{r}
+params <- list(
+  clinical_file = "data/clinical_data.csv",
+  crc_counts_file = "data/prepared/counts_coad_read_HUGO_shortbarcodes.csv",
+  ucec_clinical_file = "data/ucec_clinical.csv",
+  ucec_counts_file = "data/UCEC/count_gene_name.csv",
+  mirna_counts_file = "data/coad/miRNA_counts_matrix.csv",
+  ucec_mirna_counts_file = NA_character_,
+
+  original_crc_de_dir = "data/DE_results",
+  original_ucec_de_dir = "data/DE_results/ucec_gene_DE",
+  original_ucec_mir_dir = "data/DE_results/pre_miRNA/ucec",
+
+  stability_file = "data/DE_results/stability_analysis/combined_primary_bootstrap_LOO_stability.csv",
+  stability_flag_column = "bootstrap_robust_effect",
+
+  output_root = "bootstrap_stable_analysis",
+  fdr_cutoff = 0.05,
+  logfc_cutoff = 1,
+  pathway_logfc_cutoff = 0.03,
+
+  run_gprofiler = TRUE,
+  run_multimir = TRUE,
+  run_stringdb = TRUE
+)
+
+core_packages <- c(
+  "edgeR", "limma", "dplyr", "tidyr", "tibble", "stringr",
+  "ggplot2", "ggrepel", "ggVennDiagram", "svglite", "GSVA",
+  "msigdbr", "pheatmap", "openxlsx"
+)
+
+missing_core <- core_packages[
+  !vapply(core_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_core) > 0) {
+  stop("Missing required R packages: ", paste(missing_core, collapse = ", "))
+}
+
+library(edgeR)
+library(limma)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(ggplot2)
+library(ggrepel)
+library(ggVennDiagram)
+library(svglite)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 9,
+  fig.height = 6
+)
+
+set.seed(20260805)
+
+
+stable_crc_de_dir <- file.path(params$output_root, "data", "DE_results", "CRC")
+stable_crc_only_dir <- file.path(stable_crc_de_dir, "stable_only")
+stable_ucec_de_dir <- file.path(params$output_root, "data", "DE_results", "UCEC")
+stable_coad_mir_dir <- file.path(params$output_root, "data", "DE_results", "pre_miRNA", "coad")
+stable_ucec_mir_dir <- file.path(params$output_root, "data", "DE_results", "pre_miRNA", "ucec")
+gsea_prepared_dir <- file.path(params$output_root, "data", "prepared")
+gsea_out_dir <- file.path(params$output_root, "results", "GSEA")
+deg_plot_dir <- file.path(params$output_root, "results", "figures", "DEG")
+mirna_plot_dir <- file.path(params$output_root, "results", "figures", "pre_miRNA")
+string_out_dir <- file.path(params$output_root, "results", "STRING", "CRC")
+
+output_dirs <- c(
+  stable_crc_de_dir, stable_crc_only_dir, stable_ucec_de_dir,
+  stable_coad_mir_dir, stable_ucec_mir_dir, gsea_prepared_dir,
+  gsea_out_dir, deg_plot_dir, mirna_plot_dir, string_out_dir
+)
+invisible(lapply(output_dirs, dir.create, recursive = TRUE, showWarnings = FALSE))
+
+as_flag <- function(x) {
+  if (is.logical(x)) return(replace(x, is.na(x), FALSE))
+  if (is.numeric(x)) return(!is.na(x) & x != 0)
+  tolower(trimws(as.character(x))) %in% c("true", "t", "1", "yes", "y")
+}
+
+save_placeholder_svg <- function(file, title, detail = "No results available") {
+  p <- ggplot() +
+    annotate("text", x = 0, y = 0.15, label = title, fontface = "bold", size = 5) +
+    annotate("text", x = 0, y = -0.10, label = detail, size = 4) +
+    xlim(-1, 1) + ylim(-1, 1) + theme_void()
+  ggsave(file, p, width = 7, height = 5, device = "svg")
+  invisible(p)
+}
+
+save_placeholder_pdf <- function(file, title, detail = "No results available",
+                                 width = 8, height = 6) {
+  grDevices::pdf(file, width = width, height = height)
+  plot.new()
+  title(main = title, sub = detail)
+  grDevices::dev.off()
+}
+
+write_empty_csv <- function(file, columns) {
+  x <- as.data.frame(setNames(replicate(length(columns), logical(0), simplify = FALSE), columns))
+  write.csv(x, file, row.names = FALSE)
+}
+```
+
+```{r}
+if (!file.exists(params$stability_file)) {
+  stop("Stability table not found: ", params$stability_file)
+}
+
+stability_raw <- read.csv(
+  params$stability_file,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+if (!all(c("Contrast", "Gene") %in% names(stability_raw))) {
+  stop("The stability table must contain Contrast and Gene columns.")
+}
+
+available_stability_contrasts <- unique(stability_raw$Contrast)
+
+if (params$stability_flag_column %in% names(stability_raw)) {
+  stability_raw$selected_stable <- as_flag(
+    stability_raw[[params$stability_flag_column]]
+  )
+} else if (all(c("Method", "robust_effect") %in% names(stability_raw))) {
+  stability_raw <- stability_raw[
+    grepl("bootstrap", stability_raw$Method, ignore.case = TRUE),
+    , drop = FALSE
+  ]
+  available_stability_contrasts <- unique(stability_raw$Contrast)
+  stability_raw$selected_stable <- as_flag(stability_raw$robust_effect)
+} else {
+  stop(
+    "Could not find '", params$stability_flag_column,
+    "' or long-format Method/robust_effect columns."
+  )
+}
+
+stable_gene_table <- stability_raw %>%
+  filter(selected_stable) %>%
+  distinct(Contrast, Gene)
+
+write.csv(
+  stable_gene_table,
+  file.path(params$output_root, "bootstrap_stable_genes_all_contrasts.csv"),
+  row.names = FALSE
+)
+
+contrast_names <- c(
+  "MSI_H_vs_MSS_TMB_H",
+  "MSI_H_vs_MSS_TMB_L",
+  "MSS_TMB_H_vs_MSS_TMB_L"
+)
+
+stable_counts <- list()
+
+for (contrast_name in contrast_names) {
+  source_file <- file.path(
+    params$original_crc_de_dir,
+    paste0(contrast_name, ".csv")
+  )
+  if (!file.exists(source_file)) stop("Missing CRC DEG file: ", source_file)
+
+  tab <- read.csv(source_file, row.names = 1, check.names = FALSE)
+  stable_genes <- stable_gene_table$Gene[
+    stable_gene_table$Contrast == contrast_name
+  ]
+
+  if (contrast_name %in% available_stability_contrasts) {
+    tab$bootstrap_stable <- rownames(tab) %in% stable_genes
+  } else {
+    
+    
+    tab$bootstrap_stable <- TRUE
+  }
+
+  write.csv(tab, file.path(stable_crc_de_dir, paste0(contrast_name, ".csv")))
+  write.csv(
+    tab[tab$bootstrap_stable, , drop = FALSE],
+    file.path(stable_crc_only_dir, paste0(contrast_name, ".csv"))
+  )
+
+  stable_counts[[contrast_name]] <- data.frame(
+    Contrast = contrast_name,
+    Genes_tested = nrow(tab),
+    Bootstrap_stable = sum(tab$bootstrap_stable),
+    stringsAsFactors = FALSE
+  )
+}
+
+stable_counts <- bind_rows(stable_counts)
+write.csv(
+  stable_counts,
+  file.path(params$output_root, "bootstrap_stable_gene_counts.csv"),
+  row.names = FALSE
+)
+knitr::kable(stable_counts)
+```
+
+```{r}
+fit_three_group_edger <- function(counts, clinical_data, min_count = 10) {
+  common_samples <- intersect(colnames(counts), rownames(clinical_data))
+  counts <- counts[, common_samples, drop = FALSE]
+  clinical_data <- clinical_data[common_samples, , drop = FALSE]
+  stopifnot(identical(colnames(counts), rownames(clinical_data)))
+
+  y <- DGEList(counts = counts, group = clinical_data$MSI_TMB)
+  keep <- filterByExpr(y, group = clinical_data$MSI_TMB, min.count = min_count)
+  y <- y[keep, , keep.lib.sizes = FALSE]
+  y <- calcNormFactors(y, method = "TMM")
+
+  design <- model.matrix(~0 + clinical_data$MSI_TMB)
+  colnames(design) <- levels(clinical_data$MSI_TMB)
+  y <- estimateDisp(y, design, robust = TRUE)
+  fit <- glmQLFit(y, design, robust = TRUE)
+
+  contrasts <- list(
+    MSI_H_vs_MSS_TMB_H = makeContrasts(MSI_H - MSS_TMB_H, levels = design),
+    MSI_H_vs_MSS_TMB_L = makeContrasts(MSI_H - MSS_TMB_L, levels = design),
+    MSS_TMB_H_vs_MSS_TMB_L = makeContrasts(MSS_TMB_H - MSS_TMB_L, levels = design)
+  )
+
+  lapply(contrasts, function(ct) {
+    qlf <- glmQLFTest(fit, contrast = ct)
+    tab <- qlf$table
+    tab$FDR <- p.adjust(tab$PValue, method = "BH")
+    tab
+  })
+}
+
+ucec_available <- all(file.exists(file.path(
+  params$original_ucec_de_dir,
+  paste0(contrast_names, ".csv")
+)))
+
+if (ucec_available) {
+  for (contrast_name in contrast_names) {
+    tab <- read.csv(
+      file.path(params$original_ucec_de_dir, paste0(contrast_name, ".csv")),
+      row.names = 1,
+      check.names = FALSE
+    )
+    tab$bootstrap_stable <- TRUE
+    write.csv(tab, file.path(stable_ucec_de_dir, paste0(contrast_name, ".csv")))
+  }
+} else {
+  ucec_clinical <- read.csv(
+    params$ucec_clinical_file,
+    stringsAsFactors = FALSE,
+    fileEncoding = "UTF-8",
+    na.strings = c("NA", "")
+  )
+  rownames(ucec_clinical) <- ucec_clinical$sample_submitter_id
+  ucec_clinical <- ucec_clinical[!is.na(ucec_clinical$MSI_TMB), , drop = FALSE]
+  ucec_clinical$MSI_TMB <- factor(
+    ucec_clinical$MSI_TMB,
+    levels = c("MSI-H", "MSS/TMB-H", "MSS/TMB-L"),
+    labels = c("MSI_H", "MSS_TMB_H", "MSS_TMB_L")
+  )
+
+  ucec_counts <- as.matrix(read.csv(
+    params$ucec_counts_file,
+    row.names = 1,
+    check.names = FALSE
+  ))
+  storage.mode(ucec_counts) <- "numeric"
+
+  ucec_results <- fit_three_group_edger(ucec_counts, ucec_clinical)
+  for (contrast_name in names(ucec_results)) {
+    tab <- ucec_results[[contrast_name]]
+    tab$bootstrap_stable <- TRUE
+    write.csv(tab, file.path(stable_ucec_de_dir, paste0(contrast_name, ".csv")))
+  }
+}
+```
+
+```{r}
+crc_clinical <- read.csv(
+  params$clinical_file,
+  stringsAsFactors = FALSE,
+  fileEncoding = "UTF-8",
+  na.strings = c("NA", "")
+)
+rownames(crc_clinical) <- crc_clinical$sample_submitter_id
+crc_clinical <- crc_clinical[!is.na(crc_clinical$MSI_TMB), , drop = FALSE]
+crc_clinical$MSI_TMB <- factor(
+  crc_clinical$MSI_TMB,
+  levels = c("MSI-H", "MSS/TMB-H", "MSS/TMB-L"),
+  labels = c("MSI_H", "MSS_TMB_H", "MSS_TMB_L")
+)
+
+crc_counts <- as.matrix(read.csv(
+  params$crc_counts_file,
+  row.names = 1,
+  check.names = FALSE
+))
+storage.mode(crc_counts) <- "numeric"
+
+common_samples <- intersect(colnames(crc_counts), rownames(crc_clinical))
+crc_counts <- crc_counts[, common_samples, drop = FALSE]
+crc_clinical <- crc_clinical[common_samples, , drop = FALSE]
+
+crc_y <- DGEList(counts = crc_counts, group = crc_clinical$MSI_TMB)
+keep <- filterByExpr(crc_y, group = crc_clinical$MSI_TMB, min.count = 10)
+crc_y <- crc_y[keep, , keep.lib.sizes = FALSE]
+crc_y <- calcNormFactors(crc_y, method = "TMM")
+expr_matrix <- cpm(crc_y, log = TRUE, prior.count = 1)
+expr_matrix <- expr_matrix[!duplicated(rownames(expr_matrix)), , drop = FALSE]
+
+out_expr <- file.path(gsea_prepared_dir, "expr_logCPM_TMM.csv")
+write.csv(expr_matrix, out_expr)
+```
+
+```{r}
+msig_h <- msigdbr::msigdbr(species = "Homo sapiens", collection = "H")
+pathways_list <- split(msig_h$gene_symbol, msig_h$gs_name)
+pathways_list <- lapply(pathways_list, intersect, y = rownames(expr_matrix))
+pathways_list <- pathways_list[vapply(pathways_list, length, integer(1)) >= 10]
+
+expr_hallmark <- expr_matrix[
+  rownames(expr_matrix) %in% unique(unlist(pathways_list)),
+  , drop = FALSE
+]
+
+if (exists("ssgseaParam", where = asNamespace("GSVA"), inherits = FALSE)) {
+  gsva_params <- GSVA::ssgseaParam(expr = expr_hallmark, geneSets = pathways_list)
+  gsva_scores <- GSVA::gsva(gsva_params)
+} else {
+  gsva_scores <- GSVA::gsva(
+    expr_hallmark,
+    pathways_list,
+    method = "ssgsea",
+    kcdf = "Gaussian",
+    verbose = FALSE
+  )
+}
+
+out_gsva <- file.path(gsea_prepared_dir, "gsva_ssgsea_hallmark.csv")
+write.csv(gsva_scores, out_gsva)
+```
+
+```{r}
+gsva_design <- model.matrix(~0 + crc_clinical$MSI_TMB)
+colnames(gsva_design) <- levels(crc_clinical$MSI_TMB)
+gsva_fit <- lmFit(gsva_scores, gsva_design)
+
+gsva_contrasts <- makeContrasts(
+  MSI_H_vs_MSS_TMB_L = MSI_H - MSS_TMB_L,
+  MSI_H_vs_MSS_TMB_H = MSI_H - MSS_TMB_H,
+  MSS_TMB_H_vs_MSS_TMB_L = MSS_TMB_H - MSS_TMB_L,
+  levels = gsva_design
+)
+
+gsva_fit2 <- eBayes(contrasts.fit(gsva_fit, gsva_contrasts))
+
+gsva_results <- lapply(colnames(gsva_contrasts), function(contrast_name) {
+  topTable(gsva_fit2, coef = contrast_name, number = Inf, adjust.method = "BH") %>%
+    rownames_to_column("pathway")
+})
+names(gsva_results) <- colnames(gsva_contrasts)
+
+for (contrast_name in names(gsva_results)) {
+  write.csv(
+    gsva_results[[contrast_name]],
+    file.path(gsea_out_dir, paste0(contrast_name, "_pathways.csv")),
+    row.names = FALSE
+  )
+}
+
+write_directional_pathways <- function(df, group_a, group_b) {
+  up_a <- df %>% filter(logFC > params$pathway_logfc_cutoff, adj.P.Val < params$fdr_cutoff)
+  down_a <- df %>% filter(logFC < -params$pathway_logfc_cutoff, adj.P.Val < params$fdr_cutoff)
+
+  paths <- c(
+    file.path(gsea_out_dir, group_a, "upregulated"),
+    file.path(gsea_out_dir, group_a, "downregulated"),
+    file.path(gsea_out_dir, group_b, "upregulated"),
+    file.path(gsea_out_dir, group_b, "downregulated")
+  )
+  invisible(lapply(paths, dir.create, recursive = TRUE, showWarnings = FALSE))
+
+  write.csv(up_a, file.path(paths[1], paste0("pathways_compared_to_", group_b, ".csv")), row.names = FALSE)
+  write.csv(down_a, file.path(paths[2], paste0("pathways_compared_to_", group_b, ".csv")), row.names = FALSE)
+
+  up_b <- down_a %>% mutate(logFC = -logFC) %>% arrange(desc(logFC))
+  down_b <- up_a %>% mutate(logFC = -logFC) %>% arrange(logFC)
+  write.csv(up_b, file.path(paths[3], paste0("pathways_compared_to_", group_a, ".csv")), row.names = FALSE)
+  write.csv(down_b, file.path(paths[4], paste0("pathways_compared_to_", group_a, ".csv")), row.names = FALSE)
+}
+
+for (contrast_name in names(gsva_results)) {
+  groups <- strsplit(contrast_name, "_vs_", fixed = TRUE)[[1]]
+  write_directional_pathways(gsva_results[[contrast_name]], groups[1], groups[2])
+}
+```
+
+```{r}
+gsva_plot_df <- bind_rows(lapply(names(gsva_results), function(contrast_name) {
+  gsva_results[[contrast_name]] %>%
+    filter(adj.P.Val <= params$fdr_cutoff) %>%
+    mutate(comparison = contrast_name)
+}))
+
+pdf_groupwise <- file.path(gsea_out_dir, "top_pathways_groupwise.pdf")
+if (nrow(gsva_plot_df) == 0) {
+  save_placeholder_pdf(pdf_groupwise, "Significant Hallmark pathways")
+} else {
+  grDevices::pdf(pdf_groupwise, width = 10, height = 10)
+  for (contrast_name in unique(gsva_plot_df$comparison)) {
+    subdf <- gsva_plot_df %>%
+      filter(comparison == contrast_name) %>%
+      arrange(logFC) %>%
+      mutate(pathway = factor(pathway, levels = pathway))
+    p <- ggplot(subdf, aes(pathway, logFC, fill = logFC > 0)) +
+      geom_col() + coord_flip() +
+      scale_fill_manual(values = c("TRUE" = "firebrick", "FALSE" = "steelblue"), guide = "none") +
+      labs(title = contrast_name, x = NULL, y = "GSVA logFC") +
+      theme_minimal()
+    print(p)
+  }
+  grDevices::dev.off()
+}
+```
+
+```{r}
+selected_pathways <- intersect(
+  c("HALLMARK_MTORC1_SIGNALING", "HALLMARK_E2F_TARGETS", "HALLMARK_G2M_CHECKPOINT"),
+  rownames(gsva_scores)
+)
+
+pdf_violin <- file.path(gsea_out_dir, "gsva_violin_selected_pathways.pdf")
+if (length(selected_pathways) == 0) {
+  save_placeholder_pdf(pdf_violin, "Selected Hallmark pathways")
+} else {
+  gsva_long <- as.data.frame(t(gsva_scores[selected_pathways, , drop = FALSE])) %>%
+    rownames_to_column("sample") %>%
+    left_join(
+      tibble(sample = rownames(crc_clinical), MSI_TMB = crc_clinical$MSI_TMB),
+      by = "sample"
+    ) %>%
+    pivot_longer(all_of(selected_pathways), names_to = "pathway", values_to = "score")
+
+  p_violin <- ggplot(gsva_long, aes(MSI_TMB, score, fill = MSI_TMB)) +
+    geom_violin(trim = TRUE, alpha = 0.6, color = NA) +
+    geom_jitter(width = 0.15, size = 0.9, alpha = 0.6) +
+    stat_summary(fun = median, geom = "crossbar", width = 0.5, fatten = 0) +
+    facet_wrap(~pathway, ncol = 1, scales = "free_y") +
+    scale_fill_manual(values = c(MSI_H = "#1f77b4", MSS_TMB_H = "#d62728", MSS_TMB_L = "#2ca02c")) +
+    labs(title = "Per-sample GSVA scores by MSI/TMB group", x = NULL, y = "ssGSEA score") +
+    theme_minimal() + theme(legend.position = "bottom")
+  ggsave(pdf_violin, p_violin, width = 10, height = 7)
+
+  mat <- gsva_scores[selected_pathways, rownames(crc_clinical), drop = FALSE]
+  mat_z <- t(scale(t(mat)))
+  annotation <- data.frame(MSI_TMB = crc_clinical[colnames(mat_z), "MSI_TMB"])
+  rownames(annotation) <- colnames(mat_z)
+  ord <- order(annotation$MSI_TMB, colMeans(mat_z, na.rm = TRUE))
+
+  pheatmap::pheatmap(
+    mat_z[, ord, drop = FALSE],
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    show_colnames = FALSE,
+    border_color = NA,
+    annotation_col = annotation[ord, , drop = FALSE],
+    annotation_colors = list(MSI_TMB = c(MSI_H = "#1f77b4", MSS_TMB_H = "#d62728", MSS_TMB_L = "#2ca02c")),
+    filename = file.path(gsea_out_dir, "gsva_heatmap_selected_pathways_sorted.pdf"),
+    width = 10,
+    height = 2
+  )
+}
+```
+
+```{r}
+read_deg <- function(file, contrast_name, flip_logfc = FALSE) {
+  df <- read.csv(file, row.names = 1, check.names = FALSE) %>%
+    rownames_to_column("Gene") %>% as_tibble()
+  if (!"bootstrap_stable" %in% names(df)) df$bootstrap_stable <- TRUE
+  df$bootstrap_stable <- as_flag(df$bootstrap_stable)
+  if (flip_logfc) df$logFC <- -df$logFC
+
+  df %>% mutate(
+    contrast = contrast_name,
+    sig = FDR <= params$fdr_cutoff & abs(logFC) >= params$logfc_cutoff & bootstrap_stable,
+    direction = case_when(
+      sig & logFC > 0 ~ "Up in MSS/TMB-H",
+      sig & logFC < 0 ~ "Down in MSS/TMB-H",
+      TRUE ~ "Not significant"
+    ),
+    neglog10FDR = -log10(pmax(FDR, 1e-300))
+  )
+}
+
+plot_volcano <- function(df, title, file, label_n = 12) {
+  labels <- df %>% filter(sig) %>% arrange(FDR, desc(abs(logFC))) %>% slice_head(n = label_n)
+  p <- ggplot(df, aes(logFC, neglog10FDR)) +
+    geom_point(aes(color = direction), alpha = 0.75, size = 1.4) +
+    geom_vline(xintercept = c(-params$logfc_cutoff, params$logfc_cutoff), linetype = "dashed", linewidth = 0.35) +
+    geom_hline(yintercept = -log10(params$fdr_cutoff), linetype = "dashed", linewidth = 0.35) +
+    geom_text_repel(data = labels, aes(label = Gene), size = 3, max.overlaps = Inf) +
+    scale_color_manual(values = c(
+      "Up in MSS/TMB-H" = "#D55E00",
+      "Down in MSS/TMB-H" = "#0072B2",
+      "Not significant" = "grey75"
+    )) +
+    labs(title = title, x = "log2 fold-change", y = expression(-log[10]("FDR")), color = NULL) +
+    theme_classic(base_size = 13) +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5), legend.position = "top")
+  ggsave(file, p, width = 6.5, height = 5.2, device = "svg")
+  p
+}
+
+save_venn <- function(sets, title, file, high_color) {
+  if (all(vapply(sets, length, integer(1)) == 0)) {
+    save_placeholder_svg(file, title, "No significant stable genes")
+    return(invisible(NULL))
+  }
+  p <- ggVennDiagram(sets, label_alpha = 0) +
+    scale_fill_gradient(low = "white", high = high_color) +
+    labs(title = title) +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5))
+  ggsave(file, p, width = 7, height = 6, device = "svg")
+  p
+}
+```
+
+```{r}
+crc_mssh_vs_msih <- read_deg(
+  file.path(stable_crc_de_dir, "MSI_H_vs_MSS_TMB_H.csv"),
+  "CRC_MSS/TMB-H_vs_MSI-H",
+  flip_logfc = TRUE
+)
+crc_mssh_vs_mssl <- read_deg(
+  file.path(stable_crc_de_dir, "MSS_TMB_H_vs_MSS_TMB_L.csv"),
+  "CRC_MSS/TMB-H_vs_MSS/TMB-L"
+)
+ucec_mssh_vs_msih <- read_deg(
+  file.path(stable_ucec_de_dir, "MSI_H_vs_MSS_TMB_H.csv"),
+  "UCEC_MSS/TMB-H_vs_MSI-H",
+  flip_logfc = TRUE
+)
+ucec_mssh_vs_mssl <- read_deg(
+  file.path(stable_ucec_de_dir, "MSS_TMB_H_vs_MSS_TMB_L.csv"),
+  "UCEC_MSS/TMB-H_vs_MSS/TMB-L"
+)
+
+plot_volcano(crc_mssh_vs_msih, "CRC: MSS/TMB-H vs MSI-H", file.path(deg_plot_dir, "volcano_CRC_MSS_TMB_H_vs_MSI_H.svg"))
+plot_volcano(crc_mssh_vs_mssl, "CRC: MSS/TMB-H vs MSS/TMB-L", file.path(deg_plot_dir, "volcano_CRC_MSS_TMB_H_vs_MSS_TMB_L.svg"))
+plot_volcano(ucec_mssh_vs_msih, "UCEC: MSS/TMB-H vs MSI-H", file.path(deg_plot_dir, "volcano_UCEC_MSS_TMB_H_vs_MSI_H.svg"))
+plot_volcano(ucec_mssh_vs_mssl, "UCEC: MSS/TMB-H vs MSS/TMB-L", file.path(deg_plot_dir, "volcano_UCEC_MSS_TMB_H_vs_MSS_TMB_L.svg"))
+
+crc_sets <- list(
+  "CRC: MSS/TMB-H vs MSI-H" = crc_mssh_vs_msih %>% filter(sig) %>% pull(Gene),
+  "CRC: MSS/TMB-H vs MSS/TMB-L" = crc_mssh_vs_mssl %>% filter(sig) %>% pull(Gene)
+)
+save_venn(crc_sets, "Overlap of bootstrap-stable DEGs in CRC", file.path(deg_plot_dir, "venn_CRC_significant_DEGs.svg"), "#56B4E9")
+
+combined_sets <- list(
+  "CRC\nMSS/TMB-H vs MSI-H" = crc_mssh_vs_msih %>% filter(sig) %>% pull(Gene),
+  "CRC\nMSS/TMB-H vs MSS/TMB-L" = crc_mssh_vs_mssl %>% filter(sig) %>% pull(Gene),
+  "UCEC\nMSS/TMB-H vs MSI-H" = ucec_mssh_vs_msih %>% filter(sig) %>% pull(Gene),
+  "UCEC\nMSS/TMB-H vs MSS/TMB-L" = ucec_mssh_vs_mssl %>% filter(sig) %>% pull(Gene)
+)
+save_venn(combined_sets, "Overlap of stable CRC and significant UCEC DEGs", file.path(deg_plot_dir, "venn_CRC_UCEC_significant_DEGs.svg"), "#CC79A7")
+```
+
+```{r}
+make_shared_table <- function(crc_df, ucec_df) {
+  inner_join(
+    crc_df %>% filter(sig) %>% select(Gene, CRC = logFC),
+    ucec_df %>% filter(sig) %>% select(Gene, UCEC = logFC),
+    by = "Gene"
+  ) %>% mutate(consistent = sign(CRC) == sign(UCEC))
+}
+
+shared_msih <- make_shared_table(crc_mssh_vs_msih, ucec_mssh_vs_msih)
+shared_mssl <- make_shared_table(crc_mssh_vs_mssl, ucec_mssh_vs_mssl)
+
+write.csv(shared_msih, file.path(deg_plot_dir, "shared_genes_MSS_TMB_H_vs_MSI_H_CRC_UCEC.csv"), row.names = FALSE)
+write.csv(shared_mssl, file.path(deg_plot_dir, "shared_genes_MSS_TMB_H_vs_MSS_TMB_L_CRC_UCEC.csv"), row.names = FALSE)
+```
+
+```{r}
+safe_gost <- function(genes, sources = c("GO:BP", "REAC", "CORUM")) {
+  genes <- unique(na.omit(genes))
+  if (!params$run_gprofiler || length(genes) < 3 || !requireNamespace("gprofiler2", quietly = TRUE)) return(NULL)
+  tryCatch(
+    gprofiler2::gost(
+      query = genes,
+      organism = "hsapiens",
+      sources = sources,
+      significant = TRUE,
+      correction_method = "g_SCS"
+    ),
+    error = function(e) {
+      warning("g:Profiler failed: ", conditionMessage(e))
+      NULL
+    }
+  )
+}
+
+extract_gost <- function(gost_result, comparison, direction = "All", top_n = 10) {
+  if (is.null(gost_result) || is.null(gost_result$result) || nrow(gost_result$result) == 0) return(tibble())
+  gost_result$result %>%
+    filter(!is.na(p_value)) %>%
+    group_by(source) %>% arrange(p_value, .by_group = TRUE) %>%
+    slice_head(n = top_n) %>% ungroup() %>%
+    mutate(
+      comparison = comparison,
+      direction = direction,
+      neglog10_p = -log10(p_value),
+      term_label = paste0(source, ": ", str_trunc(term_name, 65))
+    )
+}
+
+plot_enrichment <- function(df, title, file, direction_axis = FALSE) {
+  if (nrow(df) == 0) {
+    save_placeholder_svg(file, title, "No significant enrichment or too few genes")
+    return(invisible(NULL))
+  }
+  if (direction_axis) {
+    df <- df %>% arrange(direction, p_value) %>%
+      mutate(term_label = factor(term_label, levels = rev(unique(term_label))))
+    p <- ggplot(df, aes(direction, term_label)) +
+      geom_point(aes(size = intersection_size, color = neglog10_p), alpha = 0.9)
+  } else {
+    df <- df %>% arrange(p_value) %>%
+      mutate(term_label = factor(term_label, levels = rev(unique(term_label))))
+    p <- ggplot(df, aes(neglog10_p, term_label)) +
+      geom_point(aes(size = intersection_size, color = source), alpha = 0.9)
+  }
+  p <- p + labs(title = title, x = NULL, y = NULL, size = "Gene count") +
+    theme_classic(base_size = 12) + theme(plot.title = element_text(face = "bold", hjust = 0.5))
+  ggsave(file, p, width = 8.5, height = 7, device = "svg")
+  p
+}
+
+run_shared_enrichment <- function(shared_df, comparison_label, file_tag) {
+  consistent <- shared_df %>% filter(consistent)
+  up <- consistent %>% filter(CRC > 0, UCEC > 0) %>% pull(Gene)
+  down <- consistent %>% filter(CRC < 0, UCEC < 0) %>% pull(Gene)
+
+  directional <- bind_rows(
+    extract_gost(safe_gost(up), comparison_label, "Up in MSS/TMB-H", 6),
+    extract_gost(safe_gost(down), comparison_label, "Down in MSS/TMB-H", 6)
+  )
+  write.csv(directional, file.path(deg_plot_dir, paste0("directional_enrichment_", file_tag, ".csv")), row.names = FALSE)
+  plot_enrichment(
+    directional,
+    comparison_label,
+    file.path(deg_plot_dir, paste0("directional_enrichment_", file_tag, ".svg")),
+    direction_axis = TRUE
+  )
+
+  overall_result <- safe_gost(consistent$Gene)
+  overall <- extract_gost(overall_result, comparison_label, "All", 10)
+  write.csv(overall, file.path(deg_plot_dir, paste0("enrichment_", file_tag, ".csv")), row.names = FALSE)
+  plot_enrichment(
+    overall,
+    paste0("Shared DEGs: ", comparison_label, " (CRC + UCEC)"),
+    file.path(deg_plot_dir, paste0("enrichment_dotplot_", file_tag, ".svg"))
+  )
+
+  go_only <- overall %>% filter(source == "GO:BP") %>% slice_head(n = 20)
+  plot_enrichment(
+    go_only,
+    paste0("Shared DEGs: ", comparison_label, " (CRC + UCEC)"),
+    file.path(deg_plot_dir, paste0("GO_dotplot_", file_tag, ".svg"))
+  )
+}
+
+run_shared_enrichment(shared_msih, "MSS/TMB-H vs MSI-H", "MSS_TMB_H_vs_MSI_H")
+run_shared_enrichment(shared_mssl, "MSS/TMB-H vs MSS/TMB-L", "MSS_TMB_H_vs_MSS_TMB_L")
+```
+
+```{r}
+prepare_clinical <- function(file) {
+  x <- read.csv(file, stringsAsFactors = FALSE, fileEncoding = "UTF-8", na.strings = c("NA", ""))
+  rownames(x) <- x$sample_submitter_id
+  x <- x[!is.na(x$MSI_TMB), , drop = FALSE]
+  x$MSI_TMB <- factor(
+    x$MSI_TMB,
+    levels = c("MSI-H", "MSS/TMB-H", "MSS/TMB-L"),
+    labels = c("MSI_H", "MSS_TMB_H", "MSS_TMB_L")
+  )
+  x
+}
+
+fit_mirna_de <- function(count_file, clinical_file, output_dir) {
+  clinical <- prepare_clinical(clinical_file)
+  counts <- as.matrix(read.csv(count_file, row.names = 1, check.names = FALSE))
+  storage.mode(counts) <- "numeric"
+  colnames(counts) <- substr(colnames(counts), 1, 16)
+
+  common <- intersect(colnames(counts), rownames(clinical))
+  counts <- counts[, common, drop = FALSE]
+  clinical <- clinical[common, , drop = FALSE]
+
+  y <- DGEList(counts = counts, group = clinical$MSI_TMB)
+  keep <- filterByExpr(y, group = clinical$MSI_TMB, min.count = 5)
+  y <- y[keep, , keep.lib.sizes = FALSE]
+  y <- calcNormFactors(y, method = "TMM")
+
+  design <- model.matrix(~0 + clinical$MSI_TMB)
+  colnames(design) <- levels(clinical$MSI_TMB)
+  y <- estimateDisp(y, design, robust = TRUE)
+  fit <- glmQLFit(y, design, robust = TRUE)
+
+  contrasts <- list(
+    MSI_H_vs_MSS_TMB_H = makeContrasts(MSI_H - MSS_TMB_H, levels = design),
+    MSI_H_vs_MSS_TMB_L = makeContrasts(MSI_H - MSS_TMB_L, levels = design),
+    MSS_TMB_H_vs_MSS_TMB_L = makeContrasts(MSS_TMB_H - MSS_TMB_L, levels = design)
+  )
+
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  results <- lapply(contrasts, function(ct) {
+    qlf <- glmQLFTest(fit, contrast = ct)
+    tab <- qlf$table
+    tab$FDR <- p.adjust(tab$PValue, "BH")
+    tab
+  })
+  for (nm in names(results)) write.csv(results[[nm]], file.path(output_dir, paste0(nm, ".csv")))
+  invisible(results)
+}
+```
+
+```{r}
+fit_mirna_de(params$mirna_counts_file, params$clinical_file, stable_coad_mir_dir)
+
+ucec_mir_files <- file.path(params$original_ucec_mir_dir, paste0(contrast_names, ".csv"))
+if (all(file.exists(ucec_mir_files))) {
+  file.copy(ucec_mir_files, stable_ucec_mir_dir, overwrite = TRUE)
+} else if (!is.na(params$ucec_mirna_counts_file) && file.exists(params$ucec_mirna_counts_file)) {
+  fit_mirna_de(params$ucec_mirna_counts_file, params$ucec_clinical_file, stable_ucec_mir_dir)
+} else {
+  stop(
+    "UCEC pre-miRNA result files were not found in ", params$original_ucec_mir_dir,
+    ". Provide params$ucec_mirna_counts_file or the existing result CSV files."
+  )
+}
+```
+
+```{r}
+read_mir_de <- function(file, contrast_name, dataset, flip_logfc = FALSE) {
+  df <- read.csv(file, row.names = 1, check.names = FALSE) %>%
+    rownames_to_column("pre_miRNA") %>% as_tibble()
+  if (flip_logfc) df$logFC <- -df$logFC
+  df %>% mutate(
+    contrast = contrast_name,
+    dataset = dataset,
+    sig = FDR <= params$fdr_cutoff & abs(logFC) >= params$logfc_cutoff,
+    direction = case_when(
+      sig & logFC > 0 ~ "Up in MSS/TMB-H",
+      sig & logFC < 0 ~ "Down in MSS/TMB-H",
+      TRUE ~ "Not significant"
+    ),
+    neglog10FDR = -log10(pmax(FDR, 1e-300))
+  )
+}
+
+coad_mssh_vs_msih <- read_mir_de(file.path(stable_coad_mir_dir, "MSI_H_vs_MSS_TMB_H.csv"), "MSS/TMB-H vs MSI-H", "COAD", TRUE)
+coad_mssh_vs_mssl <- read_mir_de(file.path(stable_coad_mir_dir, "MSS_TMB_H_vs_MSS_TMB_L.csv"), "MSS/TMB-H vs MSS/TMB-L", "COAD")
+ucec_mir_mssh_vs_msih <- read_mir_de(file.path(stable_ucec_mir_dir, "MSI_H_vs_MSS_TMB_H.csv"), "MSS/TMB-H vs MSI-H", "UCEC", TRUE)
+ucec_mir_mssh_vs_mssl <- read_mir_de(file.path(stable_ucec_mir_dir, "MSS_TMB_H_vs_MSS_TMB_L.csv"), "MSS/TMB-H vs MSS/TMB-L", "UCEC")
+
+plot_mir_volcano <- function(df, title, file, label_n = 10) {
+  labels <- df %>% filter(sig) %>% arrange(FDR, desc(abs(logFC))) %>% slice_head(n = label_n)
+  p <- ggplot(df, aes(logFC, neglog10FDR)) +
+    geom_point(aes(color = direction), alpha = 0.75, size = 1.6) +
+    geom_vline(xintercept = c(-params$logfc_cutoff, params$logfc_cutoff), linetype = "dashed", linewidth = 0.35) +
+    geom_hline(yintercept = -log10(params$fdr_cutoff), linetype = "dashed", linewidth = 0.35) +
+    geom_text_repel(data = labels, aes(label = pre_miRNA), size = 3, max.overlaps = Inf) +
+    scale_color_manual(values = c("Up in MSS/TMB-H" = "#D55E00", "Down in MSS/TMB-H" = "#0072B2", "Not significant" = "grey75")) +
+    labs(title = title, x = "log2 fold-change", y = expression(-log[10]("FDR")), color = NULL) +
+    theme_classic(base_size = 13) + theme(plot.title = element_text(face = "bold", hjust = 0.5), legend.position = "top")
+  ggsave(file, p, width = 6.5, height = 5.2, device = "svg")
+}
+
+plot_mir_volcano(coad_mssh_vs_msih, "COAD pre-miRNA: MSS/TMB-H vs MSI-H", file.path(mirna_plot_dir, "volcano_COAD_pre_miRNA_MSS_TMB_H_vs_MSI_H.svg"))
+plot_mir_volcano(coad_mssh_vs_mssl, "COAD pre-miRNA: MSS/TMB-H vs MSS/TMB-L", file.path(mirna_plot_dir, "volcano_COAD_pre_miRNA_MSS_TMB_H_vs_MSS_TMB_L.svg"))
+plot_mir_volcano(ucec_mir_mssh_vs_msih, "UCEC pre-miRNA: MSS/TMB-H vs MSI-H", file.path(mirna_plot_dir, "volcano_UCEC_pre_miRNA_MSS_TMB_H_vs_MSI_H.svg"))
+plot_mir_volcano(ucec_mir_mssh_vs_mssl, "UCEC pre-miRNA: MSS/TMB-H vs MSS/TMB-L", file.path(mirna_plot_dir, "volcano_UCEC_pre_miRNA_MSS_TMB_H_vs_MSS_TMB_L.svg"))
+
+sets_msih <- list(
+  "COAD\nMSS/TMB-H vs MSI-H" = coad_mssh_vs_msih %>% filter(sig) %>% pull(pre_miRNA),
+  "UCEC\nMSS/TMB-H vs MSI-H" = ucec_mir_mssh_vs_msih %>% filter(sig) %>% pull(pre_miRNA)
+)
+sets_mssl <- list(
+  "COAD\nMSS/TMB-H vs MSS/TMB-L" = coad_mssh_vs_mssl %>% filter(sig) %>% pull(pre_miRNA),
+  "UCEC\nMSS/TMB-H vs MSS/TMB-L" = ucec_mir_mssh_vs_mssl %>% filter(sig) %>% pull(pre_miRNA)
+)
+sets_all <- c(sets_msih, sets_mssl)
+
+save_venn(sets_msih, "Shared significant pre-miRNAs: MSS/TMB-H vs MSI-H", file.path(mirna_plot_dir, "venn_pre_miRNA_MSS_TMB_H_vs_MSI_H_COAD_UCEC.svg"), "#56B4E9")
+save_venn(sets_mssl, "Shared significant pre-miRNAs: MSS/TMB-H vs MSS/TMB-L", file.path(mirna_plot_dir, "venn_pre_miRNA_MSS_TMB_H_vs_MSS_TMB_L_COAD_UCEC.svg"), "#CC79A7")
+save_venn(sets_all, "Shared significant pre-miRNAs across cancers and contrasts", file.path(mirna_plot_dir, "venn_pre_miRNA_all_COAD_UCEC_contrasts.svg"), "#CC79A7")
+
+shared_msih_premir <- intersect(sets_msih[[1]], sets_msih[[2]])
+shared_mssl_premir <- intersect(sets_mssl[[1]], sets_mssl[[2]])
+write.csv(data.frame(pre_miRNA = shared_msih_premir), file.path(mirna_plot_dir, "shared_pre_miRNAs_MSS_TMB_H_vs_MSI_H_COAD_UCEC.csv"), row.names = FALSE)
+write.csv(data.frame(pre_miRNA = shared_mssl_premir), file.path(mirna_plot_dir, "shared_pre_miRNAs_MSS_TMB_H_vs_MSS_TMB_L_COAD_UCEC.csv"), row.names = FALSE)
+```
+
+```{r}
+all_premir_df <- bind_rows(coad_mssh_vs_msih, coad_mssh_vs_mssl, ucec_mir_mssh_vs_msih, ucec_mir_mssh_vs_mssl)
+premir_export <- all_premir_df %>% select(dataset, contrast, pre_miRNA, logFC, logCPM, PValue, FDR, sig, direction) %>% arrange(dataset, contrast, FDR)
+premir_sig_export <- premir_export %>% filter(sig)
+premir_summary <- premir_export %>% count(dataset, contrast, direction)
+shared_export <- dplyr::bind_rows(
+  data.frame(
+    comparison = rep("MSS/TMB-H vs MSI-H", length(shared_msih_premir)),
+    pre_miRNA = shared_msih_premir,
+    stringsAsFactors = FALSE
+  ),
+  data.frame(
+    comparison = rep("MSS/TMB-H vs MSS/TMB-L", length(shared_mssl_premir)),
+    pre_miRNA = shared_mssl_premir,
+    stringsAsFactors = FALSE
+  )
+)
+
+wb <- openxlsx::createWorkbook()
+for (nm in c("All_DE_results", "Significant_DE", "Summary_counts", "Shared_COAD_UCEC")) openxlsx::addWorksheet(wb, nm)
+openxlsx::writeData(wb, "All_DE_results", premir_export)
+openxlsx::writeData(wb, "Significant_DE", premir_sig_export)
+openxlsx::writeData(wb, "Summary_counts", premir_summary)
+openxlsx::writeData(wb, "Shared_COAD_UCEC", shared_export)
+openxlsx::saveWorkbook(wb, file.path(mirna_plot_dir, "pre_miRNA_DE_results_COAD_UCEC.xlsx"), overwrite = TRUE)
+```
+
+```{r}
+shared_premir <- unique(c(shared_msih_premir, shared_mssl_premir))
+mir_counts <- as.matrix(read.csv(params$mirna_counts_file, row.names = 1, check.names = FALSE))
+storage.mode(mir_counts) <- "numeric"
+colnames(mir_counts) <- substr(colnames(mir_counts), 1, 16)
+
+crc_clin_plot <- read.csv(params$clinical_file, stringsAsFactors = FALSE) %>% mutate(dataset = "CRC")
+ucec_clin_plot <- read.csv(params$ucec_clinical_file, stringsAsFactors = FALSE) %>% mutate(dataset = "UCEC")
+clinical_plot <- bind_rows(crc_clin_plot, ucec_clin_plot) %>%
+  filter(!is.na(MSI_TMB)) %>%
+  transmute(sample = sample_submitter_id, dataset, MSI_TMB = factor(MSI_TMB, levels = c("MSI-H", "MSS/TMB-H", "MSS/TMB-L")))
+
+common_mir_samples <- intersect(colnames(mir_counts), clinical_plot$sample)
+shared_present <- intersect(shared_premir, rownames(mir_counts))
+
+if (length(shared_present) == 0 || length(common_mir_samples) == 0) {
+  save_placeholder_svg(file.path(mirna_plot_dir, "shared_pre_miRNA_expression_boxplots_COAD_UCEC.svg"), "Shared pre-miRNA expression")
+  save_placeholder_svg(file.path(mirna_plot_dir, "shared_pre_miRNA_expression_barplots_COAD_UCEC.svg"), "Shared pre-miRNA expression")
+} else {
+  mir_y <- DGEList(mir_counts[, common_mir_samples, drop = FALSE])
+  mir_y <- calcNormFactors(mir_y)
+  mir_logcpm <- cpm(mir_y, log = TRUE, prior.count = 1)
+  mir_long <- as.data.frame(t(mir_logcpm[shared_present, , drop = FALSE])) %>%
+    rownames_to_column("sample") %>%
+    left_join(clinical_plot, by = "sample") %>%
+    pivot_longer(all_of(shared_present), names_to = "pre_miRNA", values_to = "logCPM")
+
+  p_box <- ggplot(mir_long, aes(MSI_TMB, logCPM, fill = MSI_TMB)) +
+    geom_boxplot(outlier.shape = NA) + geom_jitter(width = 0.15, alpha = 0.5, size = 0.8) +
+    facet_grid(dataset ~ pre_miRNA, scales = "free_y") +
+    scale_fill_manual(values = c("MSI-H" = "#009E73", "MSS/TMB-H" = "#D55E00", "MSS/TMB-L" = "#0072B2")) +
+    labs(title = "Expression of shared pre-miRNAs in CRC and UCEC", x = NULL, y = "TMM-normalized logCPM") +
+    theme_classic() + theme(axis.text.x = element_text(angle = 35, hjust = 1), legend.position = "bottom")
+  ggsave(file.path(mirna_plot_dir, "shared_pre_miRNA_expression_boxplots_COAD_UCEC.svg"), p_box, width = 14, height = 6, device = "svg")
+
+  mir_summary <- mir_long %>% group_by(dataset, MSI_TMB, pre_miRNA) %>%
+    summarise(mean = mean(logCPM), se = sd(logCPM) / sqrt(n()), .groups = "drop")
+  p_bar <- ggplot(mir_summary, aes(MSI_TMB, mean, fill = MSI_TMB)) +
+    geom_col() + geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2) +
+    facet_grid(dataset ~ pre_miRNA, scales = "free_y") +
+    scale_fill_manual(values = c("MSI-H" = "#009E73", "MSS/TMB-H" = "#D55E00", "MSS/TMB-L" = "#0072B2")) +
+    labs(title = "Mean expression of shared pre-miRNAs", x = NULL, y = "Mean TMM-normalized logCPM") +
+    theme_classic() + theme(axis.text.x = element_text(angle = 35, hjust = 1), legend.position = "bottom")
+  ggsave(file.path(mirna_plot_dir, "shared_pre_miRNA_expression_barplots_COAD_UCEC.svg"), p_bar, width = 14, height = 6, device = "svg")
+}
+```
+
+```{r}
+premir_to_mature_base <- function(x) {
+  x %>% str_replace("^hsa-mir", "hsa-miR") %>% str_replace("^hsa-let", "hsa-let")
+}
+
+mir_query <- unique(c(
+  paste0(premir_to_mature_base(shared_mssl_premir), "-5p"),
+  paste0(premir_to_mature_base(shared_mssl_premir), "-3p")
+))
+mir_query <- mir_query[nzchar(mir_query)]
+
+mir_gene_raw <- tibble()
+if (params$run_multimir && length(mir_query) > 0 && requireNamespace("multiMiR", quietly = TRUE)) {
+  safe_get_multimir <- function(mir) {
+    tryCatch({
+      res <- multiMiR::get_multimir(mirna = mir, table = "validated", summary = TRUE)
+      if (is.null(res@data) || nrow(res@data) == 0) return(tibble())
+      as_tibble(res@data) %>% mutate(query_miRNA = mir)
+    }, error = function(e) {
+      warning("multiMiR failed for ", mir, ": ", conditionMessage(e))
+      tibble()
+    })
+  }
+  mir_gene_raw <- bind_rows(lapply(mir_query, safe_get_multimir))
+}
+
+if (nrow(mir_gene_raw) == 0) {
+  mir_gene_df <- tibble(
+    mature_mirna_id = character(),
+    target_symbol = character(),
+    database = character(),
+    pre_miRNA = character()
+  )
+} else {
+  mir_gene_df <- mir_gene_raw %>%
+    transmute(
+      mature_mirna_id,
+      target_symbol,
+      database,
+      pre_miRNA = mature_mirna_id %>%
+        str_remove("-5p$") %>% str_remove("-3p$") %>% str_replace("^hsa-miR", "hsa-mir")
+    ) %>% distinct()
+}
+
+write.csv(mir_gene_df, file.path(mirna_plot_dir, "pre_miRNA_gene_associations_validated.csv"), row.names = FALSE)
+
+stable_shared_mssl <- shared_mssl %>% filter(consistent) %>%
+  mutate(gene_direction = if_else(CRC > 0, "Up in MSS/TMB-H", "Down in MSS/TMB-H"))
+
+genes_supported_by_miRNA <- mir_gene_df %>%
+  inner_join(
+    stable_shared_mssl %>% select(target_symbol = Gene, gene_logFC_CRC = CRC, gene_logFC_UCEC = UCEC, gene_direction),
+    by = "target_symbol"
+  )
+
+wb_targets <- openxlsx::createWorkbook()
+openxlsx::addWorksheet(wb_targets, "All_associations")
+openxlsx::writeData(wb_targets, "All_associations", genes_supported_by_miRNA)
+openxlsx::addWorksheet(wb_targets, "Gene_summary")
+if (nrow(genes_supported_by_miRNA) > 0) {
+  gene_summary <- genes_supported_by_miRNA %>%
+    group_by(target_symbol, gene_logFC_CRC, gene_logFC_UCEC, gene_direction) %>%
+    summarise(
+      n_pre_miRNA = n_distinct(pre_miRNA),
+      pre_miRNAs = paste(sort(unique(pre_miRNA)), collapse = "; "),
+      mature_miRNAs = paste(sort(unique(mature_mirna_id)), collapse = "; "),
+      databases = paste(sort(unique(database)), collapse = "; "),
+      .groups = "drop"
+    )
+} else {
+  gene_summary <- tibble()
+}
+openxlsx::writeData(wb_targets, "Gene_summary", gene_summary)
+openxlsx::saveWorkbook(wb_targets, file.path(mirna_plot_dir, "pre_miRNA_supported_DE_genes.xlsx"), overwrite = TRUE)
+```
+
+```{r}
+mir_supported_up <- genes_supported_by_miRNA %>% filter(gene_direction == "Up in MSS/TMB-H") %>% pull(target_symbol) %>% unique()
+mir_supported_down <- genes_supported_by_miRNA %>% filter(gene_direction == "Down in MSS/TMB-H") %>% pull(target_symbol) %>% unique()
+
+mir_enrichment <- bind_rows(
+  extract_gost(safe_gost(mir_supported_up), "MSS/TMB-H vs MSS/TMB-L", "Up in MSS/TMB-H", 6),
+  extract_gost(safe_gost(mir_supported_down), "MSS/TMB-H vs MSS/TMB-L", "Down in MSS/TMB-H", 6)
+)
+write.csv(mir_enrichment, file.path(mirna_plot_dir, "GO_miRNA_supported_DE_genes_MSS_TMB_H_vs_MSS_TMB_L.csv"), row.names = FALSE)
+plot_enrichment(
+  mir_enrichment,
+  "Functional enrichment of miRNA-supported stable shared DE genes",
+  file.path(mirna_plot_dir, "GO_dotplot_miRNA_supported_DE_genes_MSS_TMB_H_vs_MSS_TMB_L.svg"),
+  direction_axis = TRUE
+)
+```
+
+```{r}
+plot_string_network <- function(string_db, mapped_df, title, score_min = 400) {
+  if (nrow(mapped_df) < 2) {
+    plot.new(); title(main = title, sub = "Not enough mapped proteins")
+    return(invisible(NULL))
+  }
+  edges <- tryCatch(string_db$get_interactions(mapped_df$STRING_id), error = function(e) NULL)
+  if (is.null(edges) || nrow(edges) == 0) {
+    plot.new(); title(main = title, sub = "No STRING interactions")
+    return(invisible(NULL))
+  }
+  edges <- edges[edges$combined_score >= score_min, , drop = FALSE]
+  vertices <- mapped_df %>% distinct(STRING_id, gene, logFC) %>%
+    mutate(
+      direction = if_else(logFC >= 0, "Up in MSS/TMB-H", "Down in MSS/TMB-H"),
+      logFC_bin = cut(abs(logFC), breaks = c(-Inf, 0.5, 1, 2, 3, Inf), labels = c("< 0.5", "0.5-1", "1-2", "2-3", ">= 3"))
+    )
+  keep_ids <- intersect(vertices$STRING_id, unique(c(edges$from, edges$to)))
+  vertices <- vertices %>% filter(STRING_id %in% keep_ids)
+  edges <- edges %>% filter(from %in% keep_ids, to %in% keep_ids)
+  if (nrow(vertices) < 2 || nrow(edges) == 0) {
+    plot.new(); title(main = title, sub = "Network collapsed after filtering")
+    return(invisible(NULL))
+  }
+
+  graph <- igraph::graph_from_data_frame(
+    edges %>% select(from, to),
+    directed = FALSE,
+    vertices = vertices %>% transmute(name = STRING_id, gene, direction, logFC_bin)
+  )
+  p <- ggraph::ggraph(graph, layout = "fr") +
+    ggraph::geom_edge_link(alpha = 0.25, colour = "grey70") +
+    ggraph::geom_node_point(aes(size = logFC_bin, fill = direction), shape = 21, colour = "black") +
+    ggraph::geom_node_text(aes(label = gene), repel = TRUE, size = 3.2, fontface = "bold") +
+    scale_fill_manual(values = c("Up in MSS/TMB-H" = "#ff8f8f", "Down in MSS/TMB-H" = "#74aeff")) +
+    scale_size_manual(values = c("< 0.5" = 3.5, "0.5-1" = 6, "1-2" = 9, "2-3" = 12, ">= 3" = 15)) +
+    labs(title = title, fill = "Direction", size = "|logFC|") +
+    theme_void() + theme(plot.title = element_text(hjust = 0.5, face = "bold"), legend.position = "bottom")
+  print(p)
+}
+```
+
+```{r}
+contrast <- "MSS_TMB_H_vs_MSS_TMB_L"
+selected_pathways <- c(
+  "HALLMARK_KRAS_SIGNALING_DN",
+  "HALLMARK_MTORC1_SIGNALING",
+  "HALLMARK_G2M_CHECKPOINT",
+  "HALLMARK_E2F_TARGETS"
+)
+
+string_all_pdf <- file.path(string_out_dir, paste0("all_", contrast, ".pdf"))
+string_by_path_pdf <- file.path(string_out_dir, paste0("by_pathway_", contrast, ".pdf"))
+
+if (!params$run_stringdb || !all(vapply(c("STRINGdb", "igraph", "ggraph"), requireNamespace, logical(1), quietly = TRUE))) {
+  save_placeholder_pdf(string_all_pdf, "STRING network", "STRING analysis disabled or packages missing")
+  save_placeholder_pdf(string_by_path_pdf, "STRING networks by pathway", "STRING analysis disabled or packages missing")
+} else {
+  dge <- read.csv(file.path(stable_crc_de_dir, paste0(contrast, ".csv")), row.names = 1, check.names = FALSE) %>%
+    rownames_to_column("gene") %>%
+    filter(bootstrap_stable, FDR < params$fdr_cutoff)
+
+  hallmark <- msigdbr::msigdbr(species = "Homo sapiens", collection = "H") %>%
+    filter(gs_name %in% selected_pathways) %>%
+    select(gs_name, gene_symbol)
+  selected <- inner_join(dge, hallmark, by = c("gene" = "gene_symbol"))
+
+  string_db <- tryCatch(
+    STRINGdb::STRINGdb$new(version = "11.5", species = 9606, score_threshold = 400),
+    error = function(e) NULL
+  )
+
+  if (is.null(string_db) || nrow(selected) == 0) {
+    save_placeholder_pdf(string_all_pdf, "STRING network", "No stable selected genes or STRING initialization failed")
+    save_placeholder_pdf(string_by_path_pdf, "STRING networks by pathway", "No stable selected genes or STRING initialization failed")
+  } else {
+    mapped <- tryCatch(
+      string_db$map(selected, "gene", removeUnmappedRows = TRUE),
+      error = function(e) data.frame()
+    )
+
+    grDevices::pdf(string_all_pdf, width = 16, height = 12)
+    plot_string_network(string_db, mapped, sprintf("STRING network: %s (n=%d proteins)", contrast, nrow(mapped)))
+    grDevices::dev.off()
+
+    grDevices::pdf(string_by_path_pdf, width = 8, height = 6)
+    for (pw in selected_pathways) {
+      sub <- mapped[mapped$gs_name == pw, , drop = FALSE]
+      plot_string_network(string_db, sub, sprintf("%s (n=%d proteins)", pw, nrow(sub)))
+    }
+    grDevices::dev.off()
+  }
+}
+```
+
+```{r}
+output_manifest <- list.files(params$output_root, recursive = TRUE, full.names = TRUE)
+writeLines(output_manifest, file.path(params$output_root, "output_manifest.txt"))
+cat(paste(output_manifest, collapse = "\n"))
+```
+
+```{r}
+sessionInfo()
+```
+
+```{r}
+library(dplyr)
+library(tibble)
+library(readr)
+library(openxlsx)
+
+output_dir <- "data/DE_results"
+
+
+list.files(output_dir, full.names = FALSE)
+
+
+de_file <- file.path(
+  output_dir,
+  "DE_results.csv"
+)
+
+bootstrap_file <- file.path(
+  output_dir,
+  "bootstrap_gene_summary.csv"
+)
+
+if (!file.exists(de_file)) {
+  stop(
+    "DE file does not exist: ", de_file,
+    "\nAvailable files:\n",
+    paste(list.files(output_dir), collapse = "\n")
+  )
+}
+
+if (!file.exists(bootstrap_file)) {
+  stop(
+    "Bootstrap file does not exist: ", bootstrap_file,
+    "\nAvailable files:\n",
+    paste(list.files(output_dir), collapse = "\n")
+  )
+}
+
+de_results <- read.csv(
+  de_file,
+  row.names = 1,
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+bootstrap_summary <- read.csv(
+  bootstrap_file,
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+cat("DE results:", nrow(de_results), "genes\n")
+cat("Bootstrap summary:", nrow(bootstrap_summary), "genes\n")
+
+head(de_results)
+head(bootstrap_summary)
+
+read_result_file <- function(file, sheet = 1) {
+  if (!file.exists(file)) {
+    stop("File does not exist: ", file)
+  }
+
+  extension <- tolower(tools::file_ext(file))
+
+  result <- switch(
+    extension,
+
+    csv = read.csv(
+      file,
+      check.names = FALSE,
+      stringsAsFactors = FALSE
+    ),
+
+    tsv = read.delim(
+      file,
+      check.names = FALSE,
+      stringsAsFactors = FALSE
+    ),
+
+    txt = read.delim(
+      file,
+      check.names = FALSE,
+      stringsAsFactors = FALSE
+    ),
+
+    xlsx = openxlsx::read.xlsx(
+      file,
+      sheet = sheet,
+      check.names = FALSE
+    ),
+
+    xls = openxlsx::read.xlsx(
+      file,
+      sheet = sheet,
+      check.names = FALSE
+    ),
+
+    rds = readRDS(file),
+
+    stop("Unsupported file type: ", extension)
+  )
+
+  as.data.frame(result)
+}
+
+output_dir <- "data/DE_results"
+
+de_file <- file.path(
+  output_dir,
+  "DE_results.csv"
+)
+
+bootstrap_file <- file.path(
+  output_dir,
+  "bootstrap_gene_summary.csv"
+)
+
+de_results <- read_result_file(de_file)
+bootstrap_summary <- read_result_file(bootstrap_file)
+
+
+
+
+
+de_input <- de_results
+bootstrap_input <- bootstrap_summary
+
+
+fdr_threshold <- 0.05
+repeated_significance_threshold <- 0.70
+sign_consistency_threshold <- 0.90
+
+output_file <- file.path(
+  "data/DE_results",
+  "DE_vs_bootstrap_comparison.xlsx"
+)
+
+
+
+
+
+find_column <- function(data, candidates, description) {
+  found <- candidates[candidates %in% names(data)]
+
+  if (length(found) == 0) {
+    stop(
+      "Could not find ", description, ". Available columns:\n",
+      paste(names(data), collapse = ", ")
+    )
+  }
+
+  found[1]
+}
+
+add_gene_column <- function(data) {
+  gene_candidates <- c(
+    "gene", "Gene", "genes", "symbol",
+    "gene_symbol", "GeneSymbol"
+  )
+
+  found <- gene_candidates[gene_candidates %in% names(data)]
+
+  if (length(found) > 0) {
+    data <- data %>%
+      rename(gene = all_of(found[1]))
+  } else {
+    current_rownames <- rownames(data)
+    default_rownames <- as.character(seq_len(nrow(data)))
+
+    if (
+      !is.null(current_rownames) &&
+      !identical(current_rownames, default_rownames)
+    ) {
+      data <- tibble::rownames_to_column(data, "gene")
+    } else {
+      stop("No gene column or gene row names were found.")
+    }
+  }
+
+  data %>%
+    mutate(gene = as.character(gene))
+}
+
+as_fraction <- function(x) {
+  x <- as.numeric(x)
+
+  if (
+    any(!is.na(x)) &&
+    max(x, na.rm = TRUE) > 1 &&
+    max(x, na.rm = TRUE) <= 100
+  ) {
+    x <- x / 100
+  }
+
+  x
+}
+
+
+
+
+
+de <- add_gene_column(as.data.frame(de_input))
+
+de_fdr_column <- find_column(
+  de,
+  c("FDR", "fdr", "padj", "adj.P.Val", "adjusted_pvalue"),
+  "ordinary DE FDR column"
+)
+
+de_logfc_column <- find_column(
+  de,
+  c("logFC", "log2FoldChange", "log2FC", "estimate"),
+  "ordinary DE logFC column"
+)
+
+de <- de %>%
+  mutate(
+    original_FDR = as.numeric(.data[[de_fdr_column]]),
+    original_logFC = as.numeric(.data[[de_logfc_column]])
+  )
+
+
+original_de <- de %>%
+  dplyr::filter(
+    !is.na(original_FDR),
+    original_FDR <= fdr_threshold
+  )
+
+
+
+
+
+bootstrap <- add_gene_column(as.data.frame(bootstrap_input))
+
+bootstrap_significance_column <- find_column(
+  bootstrap,
+  c(
+    "repeated_significance",
+    "significant_fraction",
+    "significance_fraction",
+    "significance_rate",
+    "prop_significant",
+    "proportion_significant",
+    "fdr_pass_rate"
+  ),
+  "bootstrap repeated-significance column"
+)
+
+bootstrap_sign_column <- find_column(
+  bootstrap,
+  c(
+    "sign_consistency",
+    "sign_consistency_rate",
+    "direction_consistency",
+    "direction_stability",
+    "prop_same_sign",
+    "proportion_same_sign"
+  ),
+  "bootstrap sign-consistency column"
+)
+
+bootstrap <- bootstrap %>%
+  mutate(
+    bootstrap_significant_fraction =
+      as_fraction(.data[[bootstrap_significance_column]]),
+
+    bootstrap_sign_consistency =
+      as_fraction(.data[[bootstrap_sign_column]])
+  )
+
+
+possible_group_columns <- c(
+  "cancer", "project", "analysis",
+  "comparison", "contrast"
+)
+
+group_columns <- possible_group_columns[
+  possible_group_columns %in% names(original_de) &
+    possible_group_columns %in% names(bootstrap)
+]
+
+join_columns <- c(group_columns, "gene")
+
+
+duplicate_bootstrap <- bootstrap %>%
+  count(across(all_of(join_columns)), name = "n") %>%
+  filter(n > 1)
+
+if (nrow(duplicate_bootstrap) > 0) {
+  stop(
+    "Bootstrap summary contains multiple rows for the same gene/comparison. ",
+    "It must contain one gene-level summary row per comparison."
+  )
+}
+
+bootstrap_for_join <- bootstrap %>%
+  select(
+    all_of(join_columns),
+    bootstrap_significant_fraction,
+    bootstrap_sign_consistency
+  )
+
+
+
+
+
+comparison_table <- original_de %>%
+  left_join(
+    bootstrap_for_join,
+    by = join_columns
+  ) %>%
+  mutate(
+    bootstrap_pass = case_when(
+      is.na(bootstrap_significant_fraction) |
+        is.na(bootstrap_sign_consistency) ~ FALSE,
+
+      bootstrap_significant_fraction >=
+        repeated_significance_threshold &
+        bootstrap_sign_consistency >=
+        sign_consistency_threshold ~ TRUE,
+
+      TRUE ~ FALSE
+    ),
+
+    bootstrap_failure_reason = case_when(
+      bootstrap_pass ~ "Passed bootstrap",
+
+      is.na(bootstrap_significant_fraction) |
+        is.na(bootstrap_sign_consistency) ~
+        "Missing from bootstrap summary",
+
+      bootstrap_significant_fraction <
+        repeated_significance_threshold &
+        bootstrap_sign_consistency <
+        sign_consistency_threshold ~
+        "Low repeated significance and unstable direction",
+
+      bootstrap_significant_fraction <
+        repeated_significance_threshold ~
+        "Low repeated significance",
+
+      bootstrap_sign_consistency <
+        sign_consistency_threshold ~
+        "Unstable effect direction",
+
+      TRUE ~ "Did not pass"
+    )
+  ) %>%
+  arrange(
+    across(any_of(group_columns)),
+    bootstrap_pass,
+    original_FDR
+  )
+
+
+
+
+
+count_summary <- comparison_table %>%
+  group_by(across(any_of(group_columns))) %>%
+  summarise(
+    ordinary_DE_genes = n(),
+
+    bootstrap_pass_genes =
+      sum(bootstrap_pass, na.rm = TRUE),
+
+    bootstrap_fail_genes =
+      sum(!bootstrap_pass, na.rm = TRUE),
+
+    percent_retained = round(
+      100 * bootstrap_pass_genes / ordinary_DE_genes,
+      2
+    ),
+
+    .groups = "drop"
+  )
+
+
+genes_not_passing <- comparison_table %>%
+  filter(!bootstrap_pass) %>%
+  select(
+    any_of(group_columns),
+    gene,
+    original_logFC,
+    original_FDR,
+    bootstrap_significant_fraction,
+    bootstrap_sign_consistency,
+    bootstrap_failure_reason,
+    everything()
+  )
+
+
+genes_passing <- comparison_table %>%
+  filter(bootstrap_pass)
+
+
+print(count_summary)
+print(genes_not_passing)
+
+
+
+
+
+dir.create(
+  dirname(output_file),
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+openxlsx::write.xlsx(
+  list(
+    Count_summary = count_summary,
+    Genes_not_passing = genes_not_passing,
+    Genes_passing = genes_passing,
+    All_original_DE_genes = comparison_table
+  ),
+  file = output_file,
+  overwrite = TRUE
+)
+
+message("Saved comparison to: ", output_file)
+```

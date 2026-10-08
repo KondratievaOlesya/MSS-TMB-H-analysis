@@ -1,0 +1,754 @@
+```{r}
+library(edgeR)
+library(dplyr)
+library(readr)
+library(tibble)
+library(ggplot2)
+library(ggrepel)
+library(ggVennDiagram)
+library(svglite)
+```
+
+```{r}
+crc_res_dir  <- "data/DE_results"
+ucec_res_dir <- "data/DE_results/ucec_gene_DE"
+plot_dir     <- "results/figures/DEG"
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+
+fdr_cutoff <- 0.05
+logfc_cutoff <- 1
+
+
+read_deg <- function(file, contrast_name, flip_logfc = FALSE) {
+  df <- read.csv(file, row.names = 1, check.names = FALSE) %>%
+    rownames_to_column("Gene") %>%
+    as_tibble()
+  
+  if (flip_logfc) df$logFC <- -df$logFC
+  
+  df %>%
+    mutate(
+      contrast = contrast_name,
+      sig = FDR <= fdr_cutoff & abs(logFC) >= logfc_cutoff,
+      direction = case_when(
+        sig & logFC > 0 ~ "Up in MSS/TMB-H",
+        sig & logFC < 0 ~ "Down in MSS/TMB-H",
+        TRUE ~ "Not significant"
+      ),
+      neglog10FDR = -log10(pmax(FDR, 1e-300))
+    )
+}
+
+
+crc_mssh_vs_msih <- read_deg(
+  file.path(crc_res_dir, "MSI_H_vs_MSS_TMB_H.csv"),
+  "MSS/TMB-H vs MSI-H",
+  flip_logfc = TRUE
+)
+
+crc_mssh_vs_mssl <- read_deg(
+  file.path(crc_res_dir, "MSS_TMB_H_vs_MSS_TMB_L.csv"),
+  "MSS/TMB-H vs MSS/TMB-L",
+  flip_logfc = FALSE
+)
+
+
+plot_volcano <- function(df, title, out_file, label_n = 12) {
+  label_df <- df %>%
+    filter(sig) %>%
+    arrange(FDR, desc(abs(logFC))) %>%
+    slice_head(n = label_n)
+  
+  p <- ggplot(df, aes(x = logFC, y = neglog10FDR)) +
+    geom_point(aes(color = direction), alpha = 0.75, size = 1.4) +
+    geom_vline(xintercept = c(-logfc_cutoff, logfc_cutoff),
+               linetype = "dashed", linewidth = 0.35) +
+    geom_hline(yintercept = -log10(fdr_cutoff),
+               linetype = "dashed", linewidth = 0.35) +
+    geom_text_repel(
+      data = label_df,
+      aes(label = Gene),
+      size = 3,
+      max.overlaps = Inf,
+      box.padding = 0.35,
+      point.padding = 0.2
+    ) +
+    scale_color_manual(values = c(
+      "Up in MSS/TMB-H" = "#D55E00",
+      "Down in MSS/TMB-H" = "#0072B2",
+      "Not significant" = "grey75"
+    )) +
+    labs(
+      title = title,
+      x = "log2 fold-change",
+      y = expression(-log[10]("FDR")),
+      color = NULL
+    ) +
+    theme_classic(base_size = 13) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      legend.position = "top"
+    )
+  
+  ggsave(out_file, p, width = 6.5, height = 5.2, device = "svg")
+  p
+}
+
+plot_volcano(
+  crc_mssh_vs_msih,
+  "CRC: MSS/TMB-H vs MSI-H",
+  file.path(plot_dir, "volcano_CRC_MSS_TMB_H_vs_MSI_H.svg")
+)
+
+plot_volcano(
+  crc_mssh_vs_mssl,
+  "CRC: MSS/TMB-H vs MSS/TMB-L",
+  file.path(plot_dir, "volcano_CRC_MSS_TMB_H_vs_MSS_TMB_L.svg")
+)
+
+
+crc_sets <- list(
+  "CRC: MSS/TMB-H vs MSI-H" =
+    crc_mssh_vs_msih %>% filter(sig) %>% pull(Gene),
+  "CRC: MSS/TMB-H vs MSS/TMB-L" =
+    crc_mssh_vs_mssl %>% filter(sig) %>% pull(Gene)
+)
+
+p_crc_venn <- ggVennDiagram(crc_sets, label_alpha = 0) +
+  scale_fill_gradient(low = "white", high = "#56B4E9") +
+  labs(title = "Overlap of significant DEGs in CRC") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+ggsave(
+  file.path(plot_dir, "venn_CRC_significant_DEGs.svg"),
+  p_crc_venn,
+  width = 6,
+  height = 5,
+  device = "svg"
+)
+
+p_crc_venn
+```
+
+```{r}
+dir.create(ucec_res_dir, recursive = TRUE, showWarnings = FALSE)
+
+ucec_expected <- file.path(ucec_res_dir, c(
+  "MSI_H_vs_MSS_TMB_H.csv",
+  "MSI_H_vs_MSS_TMB_L.csv",
+  "MSS_TMB_H_vs_MSS_TMB_L.csv"
+))
+
+if (!all(file.exists(ucec_expected))) {
+  clinical_data <- read.csv(
+    "data/ucec_clinical.csv",
+    header = TRUE,
+    stringsAsFactors = FALSE,
+    fileEncoding = "UTF-8",
+    na.strings = c("NA", "")
+  )
+  rownames(clinical_data) <- clinical_data$sample_submitter_id
+  clinical_data <- clinical_data[!is.na(clinical_data$MSI_TMB), ]
+  
+  counts <- as.matrix(read.csv(
+    "data/UCEC/count_gene_name.csv",
+    row.names = 1,
+    check.names = FALSE
+  ))
+  
+  clinical_data$MSI_TMB <- factor(
+    clinical_data$MSI_TMB,
+    levels = c("MSI-H", "MSS/TMB-H", "MSS/TMB-L"),
+    labels = c("MSI_H", "MSS_TMB_H", "MSS_TMB_L")
+  )
+  
+  common_samples <- intersect(colnames(counts), rownames(clinical_data))
+  counts <- counts[, common_samples, drop = FALSE]
+  clinical_data <- clinical_data[common_samples, , drop = FALSE]
+  
+  y <- DGEList(counts = counts, group = clinical_data$MSI_TMB)
+  keep <- filterByExpr(y, group = clinical_data$MSI_TMB, min.count = 10)
+  y <- y[keep, , keep.lib.sizes = FALSE]
+  y <- calcNormFactors(y, method = "TMM")
+  
+  design <- model.matrix(~0 + clinical_data$MSI_TMB)
+  colnames(design) <- levels(clinical_data$MSI_TMB)
+  
+  y <- estimateDisp(y, design, robust = TRUE)
+  fit <- glmQLFit(y, design, robust = TRUE)
+  
+  ucec_contrasts <- list(
+    MSI_H_vs_MSS_TMB_H = makeContrasts(MSI_H - MSS_TMB_H, levels = design),
+    MSI_H_vs_MSS_TMB_L = makeContrasts(MSI_H - MSS_TMB_L, levels = design),
+    MSS_TMB_H_vs_MSS_TMB_L = makeContrasts(MSS_TMB_H - MSS_TMB_L, levels = design)
+  )
+  
+  for (nm in names(ucec_contrasts)) {
+    qlf <- glmQLFTest(fit, contrast = ucec_contrasts[[nm]])
+    res <- topTags(qlf, n = Inf)$table
+    write.csv(res, file.path(ucec_res_dir, paste0(nm, ".csv")))
+  }
+}
+```
+
+```{r}
+ucec_mssh_vs_msih <- read_deg(
+  file.path(ucec_res_dir, "MSI_H_vs_MSS_TMB_H.csv"),
+  "UCEC: MSS/TMB-H vs MSI-H",
+  flip_logfc = TRUE
+)
+
+ucec_mssh_vs_mssl <- read_deg(
+  file.path(ucec_res_dir, "MSS_TMB_H_vs_MSS_TMB_L.csv"),
+  "UCEC: MSS/TMB-H vs MSS/TMB-L",
+  flip_logfc = FALSE
+)
+
+combined_sets <- list(
+  "CRC\nMSS/TMB-H vs MSI-H" =
+    crc_mssh_vs_msih %>% filter(sig) %>% pull(Gene),
+  "CRC\nMSS/TMB-H vs MSS/TMB-L" =
+    crc_mssh_vs_mssl %>% filter(sig) %>% pull(Gene),
+  "UCEC\nMSS/TMB-H vs MSI-H" =
+    ucec_mssh_vs_msih %>% filter(sig) %>% pull(Gene),
+  "UCEC\nMSS/TMB-H vs MSS/TMB-L" =
+    ucec_mssh_vs_mssl %>% filter(sig) %>% pull(Gene)
+)
+
+p_combined_venn <- ggVennDiagram(combined_sets, label_alpha = 0) +
+  scale_fill_gradient(low = "white", high = "#CC79A7") +
+  labs(title = "Overlap of significant DEGs in CRC and UCEC") +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "right"
+  )
+
+ggsave(
+  file.path(plot_dir, "venn_CRC_UCEC_significant_DEGs.svg"),
+  p_combined_venn,
+  width = 7,
+  height = 6,
+  device = "svg"
+)
+
+p_combined_venn
+```
+
+```{r}
+ucec_mssh_vs_msih <- read_deg(
+  file.path(ucec_res_dir, "MSI_H_vs_MSS_TMB_H.csv"),
+  "UCEC: MSS/TMB-H vs MSI-H",
+  flip_logfc = TRUE
+)
+
+ucec_mssh_vs_mssl <- read_deg(
+  file.path(ucec_res_dir, "MSS_TMB_H_vs_MSS_TMB_L.csv"),
+  "UCEC: MSS/TMB-H vs MSS/TMB-L",
+  flip_logfc = FALSE
+)
+
+plot_volcano(
+  ucec_mssh_vs_msih,
+  "UCEC: MSS/TMB-H vs MSI-H",
+  file.path(plot_dir, "volcano_UCEC_MSS_TMB_H_vs_MSI_H.svg")
+)
+
+plot_volcano(
+  ucec_mssh_vs_mssl,
+  "UCEC: MSS/TMB-H vs MSS/TMB-L",
+  file.path(plot_dir, "volcano_UCEC_MSS_TMB_H_vs_MSS_TMB_L.svg")
+)
+```
+
+```{r}
+crc_mssh_vs_msih <- read_deg(
+  file.path(crc_res_dir, "MSI_H_vs_MSS_TMB_H.csv"),
+  "CRC_MSS/TMB-H_vs_MSI-H",
+  flip_logfc = TRUE
+)
+
+crc_mssh_vs_mssl <- read_deg(
+  file.path(crc_res_dir, "MSS_TMB_H_vs_MSS_TMB_L.csv"),
+  "CRC_MSS/TMB-H_vs_MSS/TMB-L"
+)
+
+
+ucec_mssh_vs_msih <- read_deg(
+  file.path(ucec_res_dir, "MSI_H_vs_MSS_TMB_H.csv"),
+  "UCEC_MSS/TMB-H_vs_MSI-H",
+  flip_logfc = TRUE
+)
+
+ucec_mssh_vs_mssl <- read_deg(
+  file.path(ucec_res_dir, "MSS_TMB_H_vs_MSS_TMB_L.csv"),
+  "UCEC_MSS/TMB-H_vs_MSS/TMB-L"
+)
+```
+
+```{r}
+library(tidyr)
+
+crc_df <- bind_rows(
+  crc_mssh_vs_msih,
+  crc_mssh_vs_mssl
+) %>% mutate(dataset = "CRC")
+
+ucec_df <- bind_rows(
+  ucec_mssh_vs_msih,
+  ucec_mssh_vs_mssl
+) %>% mutate(dataset = "UCEC")
+
+all_df <- bind_rows(crc_df, ucec_df)
+df <- all_df %>%
+  mutate(
+    comparison = str_replace(contrast, "^(CRC_|UCEC_)", "")
+  )
+
+shared_msih <- df %>%
+  filter(comparison == "MSS/TMB-H_vs_MSI-H", sig) %>%
+  group_by(Gene) %>%
+  filter(n_distinct(dataset) == 2) %>%
+  summarise(
+    CRC = logFC[dataset == "CRC"],
+    UCEC = logFC[dataset == "UCEC"],
+    .groups = "drop"
+  )
+shared_msih <- shared_msih %>%
+  mutate(
+    direction_crc  = sign(CRC),
+    direction_ucec = sign(UCEC),
+    consistent = direction_crc == direction_ucec
+  )
+shared_mssl <- df %>%
+  filter(comparison == "MSS/TMB-H_vs_MSS/TMB-L", sig) %>%
+  select(Gene, dataset, logFC) %>%
+  pivot_wider(names_from = dataset, values_from = logFC) %>%
+  filter(!is.na(CRC) & !is.na(UCEC))
+shared_mssl <- shared_mssl %>%
+  mutate(
+    direction_crc  = sign(CRC),
+    direction_ucec = sign(UCEC),
+    consistent = direction_crc == direction_ucec
+  )
+```
+
+```{r}
+msih_up_genes <- shared_msih %>%
+  filter(consistent, CRC > 0, UCEC > 0) %>%
+  pull(Gene)
+
+msih_down_genes <- shared_msih %>%
+  filter(consistent, CRC < 0, UCEC < 0) %>%
+  pull(Gene)
+```
+
+```{r}
+mssl_up_genes <- shared_mssl %>%
+  filter(consistent, CRC > 0, UCEC > 0) %>%
+  pull(Gene)
+
+mssl_down_genes <- shared_mssl %>%
+  filter(consistent, CRC < 0, UCEC < 0) %>%
+  pull(Gene)
+```
+
+```{r}
+library(gprofiler2)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+
+sources_use <- c("GO:BP", "REAC", "CORUM")
+
+
+run_gost <- function(genes) {
+  genes <- unique(genes)
+  genes <- genes[!is.na(genes)]
+  
+  if (length(genes) < 3) return(NULL)
+  
+  gost(
+    query = genes,
+    organism = "hsapiens",
+    sources = sources_use,
+    significant = TRUE,
+    correction_method = "g_SCS"
+  )
+}
+
+gost_msih_up   <- run_gost(msih_up_genes)
+gost_msih_down <- run_gost(msih_down_genes)
+
+gost_mssl_up   <- run_gost(mssl_up_genes)
+gost_mssl_down <- run_gost(mssl_down_genes)
+```
+
+```{r}
+extract_gost <- function(gost_res, comparison, direction, top_n_per_source = 6) {
+  if (is.null(gost_res) || is.null(gost_res$result)) return(NULL)
+  
+  df <- gost_res$result %>%
+    filter(!is.na(p_value)) %>%
+    filter(!grepl(
+      "gene expression|transcription|RNA metabolic|cellular process|biological regulation|metabolic process",
+      term_name,
+      ignore.case = TRUE
+    ))
+  
+  
+  if (nrow(df) == 0) {
+    df <- gost_res$result %>%
+      filter(!is.na(p_value))
+  }
+  
+  df %>%
+    group_by(source) %>%
+    arrange(p_value, .by_group = TRUE) %>%
+    slice_head(n = top_n_per_source) %>%
+    ungroup() %>%
+    mutate(
+      comparison = comparison,
+      direction = direction,
+      neglog10_p = -log10(p_value),
+      term_label = paste0(source, ": ", stringr::str_trunc(term_name, 70))
+    ) %>%
+    select(
+      comparison,
+      direction,
+      source,
+      term_id,
+      term_name,
+      term_label,
+      p_value,
+      neglog10_p,
+      term_size,
+      intersection_size,
+      precision,
+      recall
+    )
+}
+```
+
+```{r}
+enrich_df <- bind_rows(
+  extract_gost(gost_msih_up,   "MSS/TMB-H vs MSI-H",     "Up in MSS/TMB-H"),
+  extract_gost(gost_msih_down, "MSS/TMB-H vs MSI-H",     "Down in MSS/TMB-H"),
+  extract_gost(gost_mssl_up,   "MSS/TMB-H vs MSS/TMB-L", "Up in MSS/TMB-H"),
+  extract_gost(gost_mssl_down, "MSS/TMB-H vs MSS/TMB-L", "Down in MSS/TMB-H")
+)
+
+enrich_df %>%
+  count(comparison, direction)
+
+sapply(
+  list(
+    msih_up = gost_msih_up,
+    msih_down = gost_msih_down,
+    mssl_up = gost_mssl_up,
+    mssl_down = gost_mssl_down
+  ),
+  function(x) {
+    if (is.null(x) || is.null(x$result)) return(0)
+    nrow(x$result)
+  }
+)
+
+enrich_df <- enrich_df %>%
+  arrange(comparison, direction, p_value) %>%
+  mutate(
+    direction = factor(direction, levels = c("Up in MSS/TMB-H", "Down in MSS/TMB-H")),
+    comparison = factor(
+      comparison,
+      levels = c("MSS/TMB-H vs MSI-H", "MSS/TMB-H vs MSS/TMB-L")
+    ),
+    term_label = factor(term_label, levels = rev(unique(term_label)))
+  )
+
+plot_one_comparison <- function(enrich_df, comparison_name, out_file) {
+  df_plot <- enrich_df %>%
+    filter(comparison == comparison_name) %>%
+    arrange(direction, p_value) %>%
+    mutate(
+      direction = factor(direction, levels = c("Up in MSS/TMB-H", "Down in MSS/TMB-H")),
+      term_label = factor(term_label, levels = rev(unique(term_label)))
+    )
+  
+  p <- ggplot(df_plot, aes(x = direction, y = term_label)) +
+    geom_point(aes(size = intersection_size, color = neglog10_p), alpha = 0.9) +
+    scale_color_gradient(low = "#56B4E9", high = "#D55E00") +
+    labs(
+      title = comparison_name,
+      subtitle = "Functional enrichment of shared CRC and UCEC DEGs",
+      x = NULL,
+      y = NULL,
+      size = "Gene count",
+      color = expression(-log[10](p))
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5),
+      axis.text.x = element_text(face = "bold"),
+      legend.position = "right"
+    )
+  
+  ggsave(out_file, p, width = 8, height = 6, device = "svg")
+  p
+}
+
+p_go_msih <- plot_one_comparison(
+  enrich_df,
+  "MSS/TMB-H vs MSI-H",
+  "results/figures/directional_enrichment_MSS_TMB_H_vs_MSI_H.svg"
+)
+
+p_go_mssl <- plot_one_comparison(
+  enrich_df,
+  "MSS/TMB-H vs MSS/TMB-L",
+  "results/figures/directional_enrichment_MSS_TMB_H_vs_MSS_TMB_L.svg"
+)
+
+p_go_msih
+p_go_mssl
+```
+
+```{r}
+crc_msih  <- crc_mssh_vs_msih %>% filter(sig) %>% pull(Gene)
+crc_mssl  <- crc_mssh_vs_mssl %>% filter(sig) %>% pull(Gene)
+
+ucec_msih <- ucec_mssh_vs_msih %>% filter(sig) %>% pull(Gene)
+ucec_mssl <- ucec_mssh_vs_mssl %>% filter(sig) %>% pull(Gene)
+```
+
+```{r}
+overlap_msih <- intersect(crc_msih, ucec_msih)
+
+
+overlap_mssl <- intersect(crc_mssl, ucec_mssl)
+```
+
+```{r}
+write.csv(
+  data.frame(Gene = overlap_msih),
+  file.path(plot_dir, "shared_genes_MSS_TMB_H_vs_MSI_H_CRC_UCEC.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  data.frame(Gene = overlap_mssl),
+  file.path(plot_dir, "shared_genes_MSS_TMB_H_vs_MSS_TMB_L_CRC_UCEC.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+library(gprofiler2)
+
+
+gost_msih <- gost(
+  query = overlap_msih,
+  organism = "hsapiens"
+)
+
+gost_mssl <- gost(
+  query = overlap_mssl,
+  organism = "hsapiens"
+)
+```
+
+```{r}
+msih_up_genes <- overlap_msih %>%
+  filter(consistent, logFC_crc > 0, logFC_ucec > 0) %>%
+  pull(Gene)
+
+msih_down_genes <- overlap_msih %>%
+  filter(consistent, logFC_crc < 0, logFC_ucec < 0) %>%
+  pull(Gene)
+```
+
+```{r}
+mssl_up_genes <- overlap_mssl %>%
+  filter(consistent, logFC_crc > 0, logFC_ucec > 0) %>%
+  pull(Gene)
+
+mssl_down_genes <- overlap_mssl %>%
+  filter(consistent, logFC_crc < 0, logFC_ucec < 0) %>%
+  pull(Gene)
+```
+
+```{r}
+library(gprofiler2)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+make_clean_enrichment_dotplot <- function(
+    gost_res,
+    title,
+    sources_to_keep =  c("GO:BP", "REAC", "CORUM"),
+    top_n_per_source = 10,
+    min_term_size = 1,
+    max_term_size = 500
+) {
+  df <- gost_res$result %>%
+    filter(source %in% sources_to_keep) %>%
+    filter(term_size >= min_term_size, term_size <= max_term_size) %>%
+    filter(!grepl("gene expression|transcription|RNA metabolic|cellular process|biological regulation|metabolic process",
+                  term_name,
+                  ignore.case = TRUE)) %>%
+    group_by(source) %>%
+    arrange(p_value, .by_group = TRUE) %>%
+    slice_head(n = top_n_per_source) %>%
+    ungroup() %>%
+    mutate(
+      neglog10_p = -log10(p_value),
+      term_label = paste0(source, ": ", stringr::str_trunc(term_name, 65)),
+      term_label = factor(term_label, levels = rev(term_label))
+    )
+
+  ggplot(df, aes(x = neglog10_p, y = term_label)) +
+    geom_point(aes(size = intersection_size, color = source), alpha = 0.85) +
+    labs(
+      title = title,
+      x = expression(-log[10](p)),
+      y = NULL,
+      size = "Gene count",
+      color = "Source"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      legend.position = "right"
+    )
+}
+```
+
+```{r}
+make_go_dotplot <- function(gost_res, title) {
+  library(dplyr)
+  library(ggplot2)
+  
+  df <- gost_res$result %>%
+    filter(source == "GO:BP") %>%   
+    arrange(p_value) %>%
+    slice_head(n = 20) %>%          
+    mutate(
+      neglog10_p = -log10(p_value),
+      term_name = factor(term_name, levels = rev(term_name))
+    )
+  
+  ggplot(df, aes(x = neglog10_p, y = term_name)) +
+    geom_point(aes(size = intersection_size, color = neglog10_p)) +
+    scale_color_gradient(low = "#56B4E9", high = "#D55E00") +
+    labs(
+      title = title,
+      x = expression(-log[10](p)),
+      y = NULL,
+      size = "Gene count",
+      color = expression(-log[10](p))
+    ) +
+    theme_classic(base_size = 13) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5)
+    )
+}
+```
+
+```{r}
+generic_terms <- c(
+  "gene expression",
+  "regulation of gene expression",
+  "positive regulation of gene expression",
+  "negative regulation of gene expression",
+  "regulation of transcription",
+  "transcription by RNA polymerase II",
+  "RNA metabolic process",
+  "cellular process",
+  "biological regulation",
+  "metabolic process",
+  "macromolecule metabolic process"
+)
+
+clean_enrichment <- function(gost_res) {
+  gost_res$result %>%
+    filter(!tolower(term_name) %in% tolower(generic_terms)) %>%
+    filter(term_size >= 10 & term_size <= 500)   
+}
+```
+
+```{r}
+gost_msih <- gost(
+  query = overlap_msih,
+  organism = "hsapiens",
+  sources = c("GO:BP", "REAC", "CORUM"),
+  significant = TRUE,
+  correction_method = "g_SCS"
+)
+
+gost_mssl <- gost(
+  query = overlap_mssl,
+  organism = "hsapiens",
+  sources = c("GO:BP", "REAC", "CORUM"),
+  significant = TRUE,
+  correction_method = "g_SCS"
+)
+```
+
+```{r}
+p_annot_msih <- make_clean_enrichment_dotplot(
+  gost_msih,
+  "Shared DEGs: MSS/TMB-H vs MSI-H (CRC + UCEC)"
+)
+
+p_annot_mssl <- make_clean_enrichment_dotplot(
+  gost_mssl,
+  "Shared DEGs: MSS/TMB-H vs MSS/TMB-L (CRC + UCEC)"
+)
+
+ggsave(
+  "results/figures/enrichment_dotplot_MSS_TMB_H_vs_MSI_H.svg",
+  p_annot_msih,
+  width = 8.5,
+  height = 7,
+  device = "svg"
+)
+
+ggsave(
+  "results/figures/enrichment_dotplot_MSS_TMB_H_vs_MSS_TMB_L.svg",
+  p_annot_mssl,
+  width = 8.5,
+  height = 7,
+  device = "svg"
+)
+```
+
+```{r}
+p_go_msih <- make_go_dotplot(
+  gost_msih,
+  "Shared DEGs: MSS/TMB-H vs MSI-H (CRC + UCEC)"
+)
+
+p_go_mssl <- make_go_dotplot(
+  gost_mssl,
+  "Shared DEGs: MSS/TMB-H vs MSS/TMB-L (CRC + UCEC)"
+)
+```
+
+```{r}
+ggsave(
+  "results/figures/GO_dotplot_MSS_TMB_H_vs_MSI_H.svg",
+  p_go_msih,
+  width = 7,
+  height = 5
+)
+
+ggsave(
+  "results/figures/GO_dotplot_MSS_TMB_H_vs_MSS_TMB_L.svg",
+  p_go_mssl,
+  width = 7,
+  height = 5
+)
+```
+
+```{r}
+gostplot(gost_res, interactive = FALSE)
+```

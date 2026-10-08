@@ -1,0 +1,1382 @@
+```{r}
+required_packages <- c(
+  "dplyr",
+  "tibble",
+  "stringr",
+  "ggplot2",
+  "gprofiler2",
+  "svglite",
+  "patchwork",
+  "openxlsx",
+  "knitr"
+)
+
+missing_packages <- required_packages[
+  !vapply(
+    required_packages,
+    requireNamespace,
+    logical(1),
+    quietly = TRUE
+  )
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing packages: ",
+    paste(
+      missing_packages,
+      collapse = ", "
+    )
+  )
+}
+
+library(dplyr)
+library(tibble)
+library(stringr)
+library(ggplot2)
+library(gprofiler2)
+library(svglite)
+library(patchwork)
+library(openxlsx)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 8.5,
+  fig.height = 7
+)
+```
+
+```{r}
+params <- list(
+  
+  
+  
+  crc_de_dir =
+    "data/DE_results",
+
+  ucec_de_dir =
+    "data/DE_results/ucec_gene_DE",
+
+  
+  
+  
+  crc_stability_file =
+    "data/DE_results/stability_analysis/combined_primary_bootstrap_LOO_stability.csv",
+
+  ucec_stability_file =
+    "data/DE_results/ucec_gene_DE/stability_analysis/combined_primary_bootstrap_LOO_stability.csv",
+
+  stability_flag_column =
+    "bootstrap_robust_effect",
+
+  
+  
+  
+  fdr_cutoff =
+    0.05,
+
+  
+  
+  
+  sources =
+    c(
+      "GO:BP",
+      "REAC",
+      "CORUM"
+    ),
+
+  
+  
+  top_n_per_source =
+    6L,
+
+  
+  term_label_width =
+    62L,
+
+  
+  
+  
+  output_root =
+    "bootstrap_validated_downstream_analysis/gSCS_shared_enrichment"
+)
+
+plot_dir <- file.path(
+  params$output_root,
+  "plots"
+)
+
+table_dir <- file.path(
+  params$output_root,
+  "tables"
+)
+
+dir.create(
+  plot_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+dir.create(
+  table_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+```
+
+```{r}
+as_flag <- function(x) {
+  if (
+    is.logical(x)
+  ) {
+    return(
+      replace(
+        x,
+        is.na(x),
+        FALSE
+      )
+    )
+  }
+
+  if (
+    is.numeric(x)
+  ) {
+    return(
+      !is.na(x) &
+        x != 0
+    )
+  }
+
+  tolower(
+    trimws(
+      as.character(x)
+    )
+  ) %in%
+    c(
+      "true",
+      "t",
+      "1",
+      "yes",
+      "y"
+    )
+}
+
+
+check_file <- function(
+    file,
+    description
+) {
+  if (
+    !file.exists(
+      file
+    )
+  ) {
+    stop(
+      description,
+      " not found:\n",
+      file
+    )
+  }
+}
+
+
+read_stability <- function(
+    file,
+    dataset
+) {
+  check_file(
+    file,
+    paste0(
+      dataset,
+      " stability file"
+    )
+  )
+
+  x <- read.csv(
+    file,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  ) %>%
+    tibble::as_tibble()
+
+  required <- c(
+    "Contrast",
+    "Gene",
+    params$
+      stability_flag_column
+  )
+
+  missing <- setdiff(
+    required,
+    names(
+      x
+    )
+  )
+
+  if (
+    length(
+      missing
+    ) > 0
+  ) {
+    stop(
+      dataset,
+      " stability file is missing: ",
+      paste(
+        missing,
+        collapse = ", "
+      )
+    )
+  }
+
+  x %>%
+    dplyr::transmute(
+      Contrast =
+        as.character(
+          Contrast
+        ),
+
+      Gene =
+        trimws(
+          as.character(
+            Gene
+          )
+        ),
+
+      bootstrap_stable =
+        as_flag(
+          .data[[
+            params$
+              stability_flag_column
+          ]]
+        )
+    ) %>%
+    dplyr::distinct(
+      Contrast,
+      Gene,
+      .keep_all = TRUE
+    )
+}
+
+
+read_de_with_stability <- function(
+    de_dir,
+    stability,
+    source_contrast,
+    flip_logfc = FALSE
+) {
+  file <- file.path(
+    de_dir,
+    paste0(
+      source_contrast,
+      ".csv"
+    )
+  )
+
+  check_file(
+    file,
+    paste0(
+      "DE result for ",
+      source_contrast
+    )
+  )
+
+  de <- read.csv(
+    file,
+    row.names = 1,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  ) %>%
+    tibble::rownames_to_column(
+      "Gene"
+    ) %>%
+    tibble::as_tibble()
+
+  required <- c(
+    "Gene",
+    "logFC",
+    "FDR"
+  )
+
+  missing <- setdiff(
+    required,
+    names(
+      de
+    )
+  )
+
+  if (
+    length(
+      missing
+    ) > 0
+  ) {
+    stop(
+      basename(
+        file
+      ),
+      " is missing: ",
+      paste(
+        missing,
+        collapse = ", "
+      )
+    )
+  }
+
+  stability_sub <- stability %>%
+    dplyr::filter(
+      Contrast ==
+        source_contrast
+    ) %>%
+    dplyr::select(
+      Gene,
+      bootstrap_stable
+    )
+
+  if (
+    nrow(
+      stability_sub
+    ) == 0
+  ) {
+    stop(
+      "No bootstrap-stability entries found for contrast ",
+      source_contrast
+    )
+  }
+
+  de <- de %>%
+    dplyr::mutate(
+      Gene =
+        trimws(
+          as.character(
+            Gene
+          )
+        ),
+
+      logFC =
+        as.numeric(
+          logFC
+        ),
+
+      FDR =
+        as.numeric(
+          FDR
+        )
+    )
+
+  if (
+    flip_logfc
+  ) {
+    de <- de %>%
+      dplyr::mutate(
+        logFC =
+          -logFC
+      )
+  }
+
+  de %>%
+    dplyr::left_join(
+      stability_sub,
+      by =
+        "Gene"
+    ) %>%
+    dplyr::mutate(
+      bootstrap_stable =
+        dplyr::coalesce(
+          bootstrap_stable,
+          FALSE
+        ),
+
+      FDR_significant =
+        !is.na(
+          FDR
+        ) &
+        FDR <=
+        params$
+          fdr_cutoff,
+
+      stable_significant =
+        FDR_significant &
+        bootstrap_stable
+    )
+}
+```
+
+```{r}
+crc_stability <- read_stability(
+  params$
+    crc_stability_file,
+  "CRC"
+)
+
+ucec_stability <- read_stability(
+  params$
+    ucec_stability_file,
+  "UCEC"
+)
+```
+
+```{r}
+build_shared_stable <- function(
+    source_contrast,
+    display_comparison,
+    flip_logfc = FALSE
+) {
+  crc <- read_de_with_stability(
+    de_dir =
+      params$
+        crc_de_dir,
+
+    stability =
+      crc_stability,
+
+    source_contrast =
+      source_contrast,
+
+    flip_logfc =
+      flip_logfc
+  ) %>%
+    dplyr::filter(
+      stable_significant
+    ) %>%
+    dplyr::select(
+      Gene,
+      CRC_logFC =
+        logFC,
+      CRC_FDR =
+        FDR
+    )
+
+  ucec <- read_de_with_stability(
+    de_dir =
+      params$
+        ucec_de_dir,
+
+    stability =
+      ucec_stability,
+
+    source_contrast =
+      source_contrast,
+
+    flip_logfc =
+      flip_logfc
+  ) %>%
+    dplyr::filter(
+      stable_significant
+    ) %>%
+    dplyr::select(
+      Gene,
+      UCEC_logFC =
+        logFC,
+      UCEC_FDR =
+        FDR
+    )
+
+  dplyr::inner_join(
+    crc,
+    ucec,
+    by =
+      "Gene"
+  ) %>%
+    dplyr::mutate(
+      consistent =
+        (
+          CRC_logFC >
+            0 &
+          UCEC_logFC >
+            0
+        ) |
+        (
+          CRC_logFC <
+            0 &
+          UCEC_logFC <
+            0
+        ),
+
+      direction =
+        dplyr::case_when(
+          CRC_logFC >
+            0 &
+          UCEC_logFC >
+            0 ~
+            "Up in MSS/TMB-H",
+
+          CRC_logFC <
+            0 &
+          UCEC_logFC <
+            0 ~
+            "Down in MSS/TMB-H",
+
+          TRUE ~
+            "Inconsistent"
+        ),
+
+      comparison =
+        display_comparison
+    )
+}
+
+
+shared_mssl <- build_shared_stable(
+  source_contrast =
+    "MSS_TMB_H_vs_MSS_TMB_L",
+
+  display_comparison =
+    "MSS/TMB-H vs MSS/TMB-L",
+
+  flip_logfc =
+    FALSE
+)
+
+
+shared_msih <- build_shared_stable(
+  source_contrast =
+    "MSI_H_vs_MSS_TMB_H",
+
+  display_comparison =
+    "MSS/TMB-H vs MSI-H",
+
+  flip_logfc =
+    TRUE
+)
+
+
+shared_mssl_consistent <- shared_mssl %>%
+  dplyr::filter(
+    consistent
+  )
+
+
+shared_msih_consistent <- shared_msih %>%
+  dplyr::filter(
+    consistent
+  )
+
+
+cat(
+  "MSS/TMB-H vs MSS/TMB-L:\n"
+)
+
+print(
+  table(
+    shared_mssl$
+      direction
+  )
+)
+
+
+cat(
+  "\nMSS/TMB-H vs MSI-H:\n"
+)
+
+print(
+  table(
+    shared_msih$
+      direction
+  )
+)
+```
+
+```{r}
+write.csv(
+  shared_mssl,
+  file.path(
+    table_dir,
+    "shared_stable_genes_MSS_TMB_H_vs_MSS_TMB_L.csv"
+  ),
+  row.names =
+    FALSE
+)
+
+
+write.csv(
+  shared_msih,
+  file.path(
+    table_dir,
+    "shared_stable_genes_MSS_TMB_H_vs_MSI_H.csv"
+  ),
+  row.names =
+    FALSE
+)
+```
+
+```{r}
+safe_gost_gscs <- function(
+    genes,
+    direction,
+    comparison
+) {
+  genes <- unique(
+    na.omit(
+      trimws(
+        as.character(
+          genes
+        )
+      )
+    )
+  )
+
+  genes <- genes[
+    nzchar(
+      genes
+    )
+  ]
+
+  if (
+    length(
+      genes
+    ) <
+      3
+  ) {
+    warning(
+      comparison,
+      " / ",
+      direction,
+      ": fewer than 3 genes; enrichment skipped."
+    )
+
+    return(
+      tibble::tibble()
+    )
+  }
+
+  message(
+    "g:Profiler: ",
+    comparison,
+    " | ",
+    direction,
+    " | n = ",
+    length(
+      genes
+    )
+  )
+
+  result <- tryCatch(
+    gprofiler2::gost(
+      query =
+        genes,
+
+      organism =
+        "hsapiens",
+
+      sources =
+        params$
+          sources,
+
+      significant =
+        TRUE,
+
+      correction_method =
+        "g_SCS",
+
+      evcodes =
+        TRUE
+    ),
+
+    error =
+      function(e) {
+        warning(
+          "g:Profiler failed: ",
+          conditionMessage(
+            e
+          )
+        )
+
+        NULL
+      }
+  )
+
+  if (
+    is.null(
+      result
+    ) ||
+    is.null(
+      result$
+        result
+    ) ||
+    nrow(
+      result$
+        result
+    ) ==
+      0
+  ) {
+    return(
+      tibble::tibble()
+    )
+  }
+
+  result$
+    result %>%
+    tibble::as_tibble() %>%
+    dplyr::filter(
+      !is.na(
+        p_value
+      )
+    ) %>%
+    dplyr::mutate(
+      comparison =
+        comparison,
+
+      direction =
+        direction,
+
+      query_size =
+        length(
+          genes
+        ),
+
+      neglog10_p =
+        -log10(
+          pmax(
+            p_value,
+            1e-300
+          )
+        )
+    )
+}
+
+
+run_directional_gscs <- function(
+    shared_df,
+    comparison
+) {
+  consistent <- shared_df %>%
+    dplyr::filter(
+      consistent
+    )
+
+  up_genes <- consistent %>%
+    dplyr::filter(
+      direction ==
+        "Up in MSS/TMB-H"
+    ) %>%
+    dplyr::pull(
+      Gene
+    ) %>%
+    unique()
+
+  down_genes <- consistent %>%
+    dplyr::filter(
+      direction ==
+        "Down in MSS/TMB-H"
+    ) %>%
+    dplyr::pull(
+      Gene
+    ) %>%
+    unique()
+
+  up_result <- safe_gost_gscs(
+    genes =
+      up_genes,
+
+    direction =
+      "Up in MSS/TMB-H",
+
+    comparison =
+      comparison
+  )
+
+  down_result <- safe_gost_gscs(
+    genes =
+      down_genes,
+
+    direction =
+      "Down in MSS/TMB-H",
+
+    comparison =
+      comparison
+  )
+
+  dplyr::bind_rows(
+    up_result,
+    down_result
+  )
+}
+```
+
+```{r}
+enrichment_mssl_all <- run_directional_gscs(
+  shared_df =
+    shared_mssl,
+
+  comparison =
+    "MSS/TMB-H vs MSS/TMB-L"
+)
+
+
+enrichment_msih_all <- run_directional_gscs(
+  shared_df =
+    shared_msih,
+
+  comparison =
+    "MSS/TMB-H vs MSI-H"
+)
+
+flatten_list_columns <- function(df) {
+  df %>%
+    dplyr::mutate(
+      dplyr::across(
+        where(is.list),
+        ~ vapply(
+          .x,
+          function(z) {
+            if (
+              is.null(z) ||
+              length(z) == 0
+            ) {
+              return("")
+            }
+
+            paste(
+              as.character(z),
+              collapse = "; "
+            )
+          },
+          character(1)
+        )
+      )
+    )
+}
+
+enrichment_mssl_export <- flatten_list_columns(
+  enrichment_mssl_all
+)
+
+enrichment_msih_export <- flatten_list_columns(
+  enrichment_msih_all
+)
+
+
+write.csv(
+  enrichment_mssl_export,
+  file.path(
+    table_dir,
+    "gSCS_all_significant_enrichment_MSS_TMB_H_vs_MSS_TMB_L.csv"
+  ),
+  row.names = FALSE
+)
+
+
+write.csv(
+  enrichment_msih_export,
+  file.path(
+    table_dir,
+    "gSCS_all_significant_enrichment_MSS_TMB_H_vs_MSI_H.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+```{r}
+select_plot_terms <- function(
+    enrichment_df
+) {
+  if (
+    nrow(
+      enrichment_df
+    ) ==
+      0
+  ) {
+    return(
+      tibble::tibble()
+    )
+  }
+
+  enrichment_df %>%
+    dplyr::group_by(
+      direction,
+      source
+    ) %>%
+    dplyr::arrange(
+      p_value,
+      .by_group =
+        TRUE
+    ) %>%
+    dplyr::slice_head(
+      n =
+        params$
+          top_n_per_source
+    ) %>%
+    dplyr::ungroup() %>%
+
+    
+    
+    dplyr::mutate(
+      term_label =
+        paste0(
+          source,
+          ": ",
+          stringr::str_trunc(
+            term_name,
+            width =
+              params$
+                term_label_width
+          )
+        )
+    )
+}
+
+
+enrichment_mssl_plot <- select_plot_terms(
+  enrichment_mssl_all
+)
+
+
+enrichment_msih_plot <- select_plot_terms(
+  enrichment_msih_all
+)
+
+write.csv(
+  flatten_list_columns(
+    enrichment_mssl_plot
+  ),
+  file.path(
+    table_dir,
+    "gSCS_plotted_terms_MSS_TMB_H_vs_MSS_TMB_L.csv"
+  ),
+  row.names = FALSE
+)
+
+
+write.csv(
+  flatten_list_columns(
+    enrichment_msih_plot
+  ),
+  file.path(
+    table_dir,
+    "gSCS_plotted_terms_MSS_TMB_H_vs_MSI_H.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+```{r}
+plot_directional_enrichment <- function(
+    df,
+    title,
+    subtitle,
+    output_stub
+) {
+  if (
+    nrow(
+      df
+    ) ==
+      0
+  ) {
+    warning(
+      title,
+      ": no significant g:SCS enrichment to plot."
+    )
+
+    return(
+      NULL
+    )
+  }
+
+  direction_levels <- c(
+    "Up in MSS/TMB-H",
+    "Down in MSS/TMB-H"
+  )
+
+  
+  
+  
+  term_order <- df %>%
+    dplyr::mutate(
+      direction =
+        factor(
+          direction,
+          levels =
+            direction_levels
+        )
+    ) %>%
+    dplyr::arrange(
+      direction,
+      p_value
+    ) %>%
+    dplyr::pull(
+      term_label
+    ) %>%
+    unique()
+
+  plot_df <- df %>%
+    dplyr::mutate(
+      direction =
+        factor(
+          direction,
+          levels =
+            direction_levels
+        ),
+
+      term_label =
+        factor(
+          term_label,
+          levels =
+            rev(
+              term_order
+            )
+        )
+    )
+
+  p <- ggplot2::ggplot(
+    plot_df,
+    ggplot2::aes(
+      x =
+        direction,
+      y =
+        term_label
+    )
+  ) +
+
+    ggplot2::geom_point(
+      ggplot2::aes(
+        size =
+          intersection_size,
+
+        color =
+          neglog10_p
+      ),
+      alpha =
+        0.95
+    ) +
+
+    ggplot2::scale_color_gradient(
+      low =
+        "#56B4E9",
+
+      high =
+        "#E66101"
+    ) +
+
+    ggplot2::scale_size_continuous(
+      range =
+        c(
+          2.5,
+          8.5
+        ),
+
+      breaks =
+        scales::pretty_breaks(
+          n =
+            5
+        ),
+
+      name =
+        "Gene count"
+    ) +
+
+    ggplot2::labs(
+      title =
+        title,
+
+      subtitle =
+        subtitle,
+
+      x =
+        NULL,
+
+      y =
+        NULL,
+
+      color =
+        expression(
+          -log[10](
+            "g:SCS p"
+          )
+        )
+    ) +
+
+    ggplot2::theme_classic(
+      base_size =
+        12
+    ) +
+
+    ggplot2::theme(
+      plot.title =
+        ggplot2::element_text(
+          face =
+            "bold",
+          hjust =
+            0.5,
+          size =
+            14
+        ),
+
+      plot.subtitle =
+        ggplot2::element_text(
+          hjust =
+            0.5,
+          size =
+            11
+        ),
+
+      axis.text.x =
+        ggplot2::element_text(
+          face =
+            "bold",
+          size =
+            11
+        ),
+
+      axis.text.y =
+        ggplot2::element_text(
+          size =
+            10
+        ),
+
+      axis.title =
+        ggplot2::element_blank(),
+
+      legend.position =
+        "right",
+
+      legend.box =
+        "vertical",
+
+      plot.margin =
+        ggplot2::margin(
+          10,
+          15,
+          10,
+          10
+        )
+    )
+
+  ggplot2::ggsave(
+    filename =
+      file.path(
+        plot_dir,
+        paste0(
+          output_stub,
+          ".svg"
+        )
+      ),
+
+    plot =
+      p,
+
+    width =
+      8.5,
+
+    height =
+      max(
+        6,
+        0.31 *
+          nlevels(
+            plot_df$
+              term_label
+          ) +
+          2.5
+      ),
+
+    device =
+      "svg"
+  )
+
+  ggplot2::ggsave(
+    filename =
+      file.path(
+        plot_dir,
+        paste0(
+          output_stub,
+          ".pdf"
+        )
+      ),
+
+    plot =
+      p,
+
+    width =
+      8.5,
+
+    height =
+      max(
+        6,
+        0.31 *
+          nlevels(
+            plot_df$
+              term_label
+          ) +
+          2.5
+      ),
+
+    device =
+      grDevices::
+        cairo_pdf
+  )
+
+  p
+}
+```
+
+```{r}
+p_mssl <- plot_directional_enrichment(
+  df =
+    enrichment_mssl_plot,
+
+  title =
+    "MSS/TMB-H vs MSS/TMB-L",
+
+  subtitle =
+    "Functional enrichment of shared CRC and UCEC stable DEGs",
+
+  output_stub =
+    "gSCS_directional_enrichment_MSS_TMB_H_vs_MSS_TMB_L"
+)
+
+p_mssl
+```
+
+```{r}
+p_msih <- plot_directional_enrichment(
+  df =
+    enrichment_msih_plot,
+
+  title =
+    "MSS/TMB-H vs MSI-H",
+
+  subtitle =
+    "Functional enrichment of shared CRC and UCEC stable DEGs",
+
+  output_stub =
+    "gSCS_directional_enrichment_MSS_TMB_H_vs_MSI_H"
+)
+
+p_msih
+```
+
+```{r}
+if (
+  !is.null(
+    p_mssl
+  ) &&
+  !is.null(
+    p_msih
+  )
+) {
+  combined_plot <- (
+    p_mssl +
+      p_msih
+  ) +
+    patchwork::plot_layout(
+      guides =
+        "collect"
+    ) &
+
+    ggplot2::theme(
+      legend.position =
+        "right"
+    )
+
+  combined_plot
+
+  ggplot2::ggsave(
+    filename =
+      file.path(
+        plot_dir,
+        "gSCS_directional_enrichment_both_comparisons.svg"
+      ),
+
+    plot =
+      combined_plot,
+
+    width =
+      17,
+
+    height =
+      8,
+
+    device =
+      "svg"
+  )
+
+  ggplot2::ggsave(
+    filename =
+      file.path(
+        plot_dir,
+        "gSCS_directional_enrichment_both_comparisons.pdf"
+      ),
+
+    plot =
+      combined_plot,
+
+    width =
+      17,
+
+    height =
+      8,
+
+    device =
+      grDevices::
+        cairo_pdf
+  )
+}
+```
+
+```{r}
+enrichment_summary <- dplyr::bind_rows(
+  enrichment_mssl_all,
+  enrichment_msih_all
+) %>%
+  dplyr::count(
+    comparison,
+    direction,
+    source,
+    name =
+      "n_significant_gSCS_terms"
+  )
+
+
+enrichment_summary
+
+
+write.csv(
+  enrichment_summary,
+  file.path(
+    table_dir,
+    "gSCS_enrichment_summary.csv"
+  ),
+  row.names =
+    FALSE
+)
+```
+
+```{r}
+openxlsx::write.xlsx(
+  list(
+    Shared_MSSH_vs_MSSL =
+      shared_mssl,
+
+    Shared_MSSH_vs_MSIH =
+      shared_msih,
+
+    All_gSCS_MSSH_vs_MSSL =
+      enrichment_mssl_all,
+
+    Plotted_MSSH_vs_MSSL =
+      enrichment_mssl_plot,
+
+    All_gSCS_MSSH_vs_MSIH =
+      enrichment_msih_all,
+
+    Plotted_MSSH_vs_MSIH =
+      enrichment_msih_plot,
+
+    Summary =
+      enrichment_summary
+  ),
+
+  file =
+    file.path(
+      params$output_root,
+      "shared_CRC_UCEC_gSCS_enrichment.xlsx"
+    ),
+
+  overwrite =
+    TRUE
+)
+```
+
+```{r}
+sessionInfo()
+```

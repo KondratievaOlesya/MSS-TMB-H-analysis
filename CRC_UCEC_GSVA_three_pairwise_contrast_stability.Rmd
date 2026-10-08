@@ -1,0 +1,1326 @@
+```{r}
+required_packages <- c(
+  "dplyr",
+  "tidyr",
+  "tibble",
+  "stringr",
+  "ggplot2",
+  "patchwork",
+  "svglite",
+  "openxlsx",
+  "knitr"
+)
+
+missing_packages <- required_packages[
+  !vapply(
+    required_packages,
+    requireNamespace,
+    logical(1),
+    quietly = TRUE
+  )
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing packages: ",
+    paste(
+      missing_packages,
+      collapse = ", "
+    )
+  )
+}
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(ggplot2)
+library(patchwork)
+library(svglite)
+library(openxlsx)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 10,
+  fig.height = 8
+)
+```
+
+```{r}
+params <- list(
+  
+  
+  
+  crc_stability_file =
+    "bootstrap_validated_downstream_analysis/results/GSEA_bootstrap/CRC/CRC_GSVA_bootstrap_stability_summary.csv",
+
+  ucec_stability_file =
+    "bootstrap_validated_downstream_analysis/results/GSEA_bootstrap/UCEC/UCEC_GSVA_bootstrap_stability_summary.csv",
+
+  
+  
+  
+  primary_fdr_cutoff =
+    0.05,
+
+  tested_rate_cutoff =
+    0.90,
+
+  bootstrap_sign_consistency_cutoff =
+    0.80,
+
+  
+  
+  
+  contrasts =
+    c(
+      "MSI_H_vs_MSS_TMB_L",
+      "MSI_H_vs_MSS_TMB_H",
+      "MSS_TMB_H_vs_MSS_TMB_L"
+    ),
+
+  
+  
+  
+  contrast_colors =
+    c(
+      "MSI-H vs MSS/TMB-L" = "#4C8FC0",
+      "MSI-H vs MSS/TMB-H" = "#C62828",
+      "MSS/TMB-H vs MSS/TMB-L" = "#009E73"
+    ),
+
+  stable_alpha =
+    1.00,
+
+  unstable_alpha =
+    0.25,
+
+  
+  
+  
+  effect_column =
+    "primary_logFC",
+
+  
+  
+  
+  key_pathways =
+    c(
+      "HALLMARK_MTORC1_SIGNALING",
+      "HALLMARK_E2F_TARGETS",
+      "HALLMARK_G2M_CHECKPOINT"
+    ),
+
+  
+  
+  
+  output_root =
+    "bootstrap_validated_downstream_analysis/Hallmark_GSVA_three_contrast_stability"
+)
+
+plot_dir <- file.path(
+  params$output_root,
+  "plots"
+)
+
+table_dir <- file.path(
+  params$output_root,
+  "tables"
+)
+
+dir.create(
+  plot_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+dir.create(
+  table_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+```
+
+```{r}
+check_file <- function(
+    file,
+    description
+) {
+  if (!file.exists(file)) {
+    stop(
+      description,
+      " not found:\n",
+      file
+    )
+  }
+}
+
+
+clean_pathway_name <- function(x) {
+  x %>%
+    stringr::str_remove(
+      "^HALLMARK_"
+    ) %>%
+    stringr::str_replace_all(
+      "_",
+      " "
+    )
+}
+
+
+contrast_label_lookup <- c(
+  "MSI_H_vs_MSS_TMB_L" =
+    "MSI-H vs MSS/TMB-L",
+
+  "MSI_H_vs_MSS_TMB_H" =
+    "MSI-H vs MSS/TMB-H",
+
+  "MSS_TMB_H_vs_MSS_TMB_L" =
+    "MSS/TMB-H vs MSS/TMB-L"
+)
+```
+
+```{r}
+read_gsva_stability <- function(
+    file,
+    dataset
+) {
+  check_file(
+    file,
+    paste0(
+      dataset,
+      " GSVA bootstrap-stability file"
+    )
+  )
+
+  x <- read.csv(
+    file,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  ) %>%
+    tibble::as_tibble()
+
+  required_columns <- c(
+    "Contrast",
+    "pathway",
+    "primary_logFC",
+    "primary_FDR",
+    "tested_rate",
+    "bootstrap_sign_consistency"
+  )
+
+  missing_columns <- setdiff(
+    required_columns,
+    names(x)
+  )
+
+  if (length(missing_columns) > 0) {
+    stop(
+      dataset,
+      " GSVA stability table is missing columns: ",
+      paste(
+        missing_columns,
+        collapse = ", "
+      )
+    )
+  }
+
+  if (!params$effect_column %in% names(x)) {
+    stop(
+      "Requested effect column '",
+      params$effect_column,
+      "' is not present in ",
+      file
+    )
+  }
+
+  x %>%
+    dplyr::mutate(
+      Dataset =
+        dataset,
+
+      primary_logFC =
+        as.numeric(
+          primary_logFC
+        ),
+
+      primary_FDR =
+        as.numeric(
+          primary_FDR
+        ),
+
+      tested_rate =
+        as.numeric(
+          tested_rate
+        ),
+
+      bootstrap_sign_consistency =
+        as.numeric(
+          bootstrap_sign_consistency
+        ),
+
+      effect =
+        as.numeric(
+          .data[[
+            params$effect_column
+          ]]
+        )
+    )
+}
+
+
+crc_raw <- read_gsva_stability(
+  params$crc_stability_file,
+  "CRC"
+)
+
+
+ucec_raw <- read_gsva_stability(
+  params$ucec_stability_file,
+  "UCEC"
+)
+```
+
+```{r}
+apply_stability_definition <- function(x) {
+  x %>%
+    dplyr::mutate(
+      primary_significant_relaxed =
+        !is.na(
+          primary_FDR
+        ) &
+        primary_FDR <=
+        params$primary_fdr_cutoff,
+
+      tested_rate_pass =
+        !is.na(
+          tested_rate
+        ) &
+        tested_rate >=
+        params$tested_rate_cutoff,
+
+      sign_consistency_pass =
+        !is.na(
+          bootstrap_sign_consistency
+        ) &
+        bootstrap_sign_consistency >=
+        params$bootstrap_sign_consistency_cutoff,
+
+      bootstrap_stable_relaxed =
+        tested_rate_pass &
+        sign_consistency_pass,
+
+      stable_relaxed =
+        primary_significant_relaxed &
+        bootstrap_stable_relaxed
+    )
+}
+
+
+crc <- apply_stability_definition(
+  crc_raw
+)
+
+
+ucec <- apply_stability_definition(
+  ucec_raw
+)
+```
+
+```{r}
+stability_counts <- dplyr::bind_rows(
+  crc,
+  ucec
+) %>%
+  dplyr::filter(
+    Contrast %in%
+      params$contrasts
+  ) %>%
+  dplyr::group_by(
+    Dataset,
+    Contrast
+  ) %>%
+  dplyr::summarise(
+    n_pathways =
+      dplyr::n(),
+
+    primary_FDR_significant =
+      sum(
+        primary_significant_relaxed,
+        na.rm = TRUE
+      ),
+
+    bootstrap_direction_stable =
+      sum(
+        bootstrap_stable_relaxed,
+        na.rm = TRUE
+      ),
+
+    primary_and_bootstrap_stable =
+      sum(
+        stable_relaxed,
+        na.rm = TRUE
+      ),
+
+    .groups =
+      "drop"
+  ) %>%
+  dplyr::mutate(
+    Contrast_label =
+      unname(
+        contrast_label_lookup[
+          Contrast
+        ]
+      )
+  )
+
+
+stability_counts
+
+
+write.csv(
+  stability_counts,
+  file.path(
+    table_dir,
+    "three_contrast_GSVA_stability_counts.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+```{r}
+prepare_three_contrast_plot <- function(
+    x
+) {
+  three <- x %>%
+    dplyr::filter(
+      Contrast %in%
+        params$contrasts
+    )
+
+  selected_pathways <- three %>%
+    dplyr::group_by(
+      pathway
+    ) %>%
+    dplyr::summarise(
+      stable_in_any_contrast =
+        any(
+          stable_relaxed,
+          na.rm = TRUE
+        ),
+
+      .groups =
+        "drop"
+    ) %>%
+    dplyr::filter(
+      stable_in_any_contrast
+    ) %>%
+    dplyr::pull(
+      pathway
+    )
+
+  plot_df <- three %>%
+    dplyr::filter(
+      pathway %in%
+        selected_pathways
+    ) %>%
+    dplyr::mutate(
+      Contrast_label =
+        unname(
+          contrast_label_lookup[
+            Contrast
+          ]
+        ),
+
+      Contrast_label =
+        factor(
+          Contrast_label,
+          levels = c(
+            "MSI-H vs MSS/TMB-L",
+            "MSI-H vs MSS/TMB-H",
+            "MSS/TMB-H vs MSS/TMB-L"
+          )
+        ),
+
+      Stability =
+        ifelse(
+          stable_relaxed,
+          "Stable",
+          "Not stable"
+        ),
+
+      Stability =
+        factor(
+          Stability,
+          levels = c(
+            "Stable",
+            "Not stable"
+          )
+        ),
+
+      significance_label =
+        ifelse(
+          primary_significant_relaxed,
+          "*",
+          ""
+        )
+    )
+
+  
+  
+  
+  
+  
+  
+  pathway_order <- plot_df %>%
+    dplyr::group_by(
+      pathway
+    ) %>%
+    dplyr::summarise(
+      ordering_effect =
+        if (
+          any(
+            Contrast ==
+              "MSI_H_vs_MSS_TMB_L"
+          )
+        ) {
+          effect[
+            which(
+              Contrast ==
+                "MSI_H_vs_MSS_TMB_L"
+            )[1]
+          ]
+        } else {
+          effect[
+            which.max(
+              abs(
+                effect
+              )
+            )
+          ]
+        },
+
+      .groups =
+        "drop"
+    ) %>%
+    dplyr::arrange(
+      dplyr::desc(
+        ordering_effect
+      )
+    ) %>%
+    dplyr::pull(
+      pathway
+    )
+
+  plot_df %>%
+    dplyr::mutate(
+      Pathway =
+        clean_pathway_name(
+          pathway
+        ),
+
+      Pathway =
+        factor(
+          Pathway,
+          levels =
+            rev(
+              clean_pathway_name(
+                pathway_order
+              )
+            )
+        )
+    )
+}
+
+
+crc_plot_df <- prepare_three_contrast_plot(
+  crc
+)
+
+
+ucec_plot_df <- prepare_three_contrast_plot(
+  ucec
+)
+```
+
+```{r}
+write.csv(
+  crc_plot_df,
+  file.path(
+    table_dir,
+    "CRC_three_contrast_GSVA_plotted_values.csv"
+  ),
+  row.names = FALSE
+)
+
+
+write.csv(
+  ucec_plot_df,
+  file.path(
+    table_dir,
+    "UCEC_three_contrast_GSVA_plotted_values.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+```{r}
+plot_three_contrast_gsva <- function(
+    df,
+    dataset,
+    output_stub,
+    title =
+      "Hallmark pathway expression across MSI/TMB subtypes"
+) {
+  if (nrow(df) == 0) {
+    warning(
+      dataset,
+      ": no pathways were stable in any of the three contrasts."
+    )
+
+    return(
+      NULL
+    )
+  }
+
+  
+  effect_range <- range(
+    df$effect,
+    na.rm = TRUE
+  )
+
+  star_offset <- max(
+    diff(
+      effect_range
+    ) * 0.025,
+    0.002
+  )
+
+  df <- df %>%
+    dplyr::mutate(
+      star_x =
+        effect +
+        ifelse(
+          effect >= 0,
+          star_offset,
+          -star_offset
+        ),
+
+      star_hjust =
+        ifelse(
+          effect >= 0,
+          0,
+          1
+        )
+    )
+
+  p <- ggplot2::ggplot(
+    df,
+    ggplot2::aes(
+      x =
+        effect,
+
+      y =
+        Pathway,
+
+      fill =
+        Contrast_label,
+
+      alpha =
+        Stability
+    )
+  ) +
+
+    ggplot2::geom_col(
+      position =
+        ggplot2::position_dodge(
+          width =
+            0.78,
+          preserve =
+            "single"
+        ),
+
+      width =
+        0.68,
+
+      color =
+        "grey25",
+
+      linewidth =
+        0.18
+    ) +
+
+    ggplot2::geom_text(
+      data =
+        df %>%
+        dplyr::filter(
+          primary_significant_relaxed
+        ),
+
+      ggplot2::aes(
+        x =
+          star_x,
+
+        label =
+          significance_label,
+
+        group =
+          Contrast_label
+      ),
+
+      position =
+        ggplot2::position_dodge(
+          width =
+            0.78
+        ),
+
+      hjust =
+        df %>%
+        dplyr::filter(
+          primary_significant_relaxed
+        ) %>%
+        dplyr::pull(
+          star_hjust
+        ),
+
+      vjust =
+        0.40,
+
+      size =
+        4.2,
+
+      fontface =
+        "bold",
+
+      inherit.aes =
+        TRUE,
+
+      show.legend =
+        FALSE
+    ) +
+
+    ggplot2::geom_vline(
+      xintercept =
+        0,
+
+      linewidth =
+        0.50,
+
+      color =
+        "grey45"
+    ) +
+
+    ggplot2::scale_fill_manual(
+      values =
+        params$contrast_colors,
+
+      breaks = c(
+        "MSI-H vs MSS/TMB-L",
+        "MSI-H vs MSS/TMB-H",
+        "MSS/TMB-H vs MSS/TMB-L"
+      ),
+
+      drop =
+        FALSE,
+
+      name =
+        "Contrast"
+    ) +
+
+    ggplot2::scale_alpha_manual(
+      values =
+        c(
+          "Stable" =
+            params$stable_alpha,
+
+          "Not stable" =
+            params$unstable_alpha
+        ),
+
+      breaks = c(
+        "Stable",
+        "Not stable"
+      ),
+
+      drop =
+        FALSE,
+
+      name =
+        "Bootstrap stability"
+    ) +
+
+    ggplot2::labs(
+      title =
+        title,
+
+      subtitle =
+        paste0(
+          dataset,
+          ": pathways stable in at least one pairwise contrast"
+        ),
+
+      x =
+        "Pathway logFC",
+
+      y =
+        "Pathway",
+
+      caption =
+        paste0(
+          "* primary FDR \u2264 ",
+          params$primary_fdr_cutoff,
+          "; stable = FDR \u2264 ",
+          params$primary_fdr_cutoff,
+          ", tested rate \u2265 ",
+          params$tested_rate_cutoff,
+          ", sign consistency \u2265 ",
+          params$bootstrap_sign_consistency_cutoff
+        )
+    ) +
+
+    ggplot2::theme_minimal(
+      base_size =
+        11
+    ) +
+
+    ggplot2::theme(
+      plot.title =
+        ggplot2::element_text(
+          hjust =
+            0.5,
+          size =
+            12
+        ),
+
+      plot.subtitle =
+        ggplot2::element_text(
+          hjust =
+            0.5,
+          size =
+            9,
+          color =
+            "grey35"
+        ),
+
+      axis.title.x =
+        ggplot2::element_text(
+          size =
+            13
+        ),
+
+      axis.title.y =
+        ggplot2::element_text(
+          size =
+            16
+        ),
+
+      axis.text.y =
+        ggplot2::element_text(
+          size =
+            8.5,
+          color =
+            "grey25"
+        ),
+
+      axis.text.x =
+        ggplot2::element_text(
+          size =
+            9,
+          color =
+            "grey35"
+        ),
+
+      panel.grid.major.y =
+        ggplot2::element_line(
+          color =
+            "grey90",
+          linewidth =
+            0.35
+        ),
+
+      panel.grid.major.x =
+        ggplot2::element_line(
+          color =
+            "grey92",
+          linewidth =
+            0.35
+        ),
+
+      panel.grid.minor =
+        ggplot2::element_blank(),
+
+      legend.position =
+        "bottom",
+
+      legend.box =
+        "vertical",
+
+      plot.caption =
+        ggplot2::element_text(
+          size =
+            8,
+          hjust =
+            0,
+          color =
+            "grey35"
+        ),
+
+      plot.margin =
+        ggplot2::margin(
+          8,
+          12,
+          8,
+          8
+        )
+    )
+
+  n_pathways <- dplyr::n_distinct(
+    df$Pathway
+  )
+
+  plot_height <- max(
+    6,
+    0.33 *
+      n_pathways +
+      2.4
+  )
+
+  ggplot2::ggsave(
+    filename =
+      file.path(
+        plot_dir,
+        paste0(
+          output_stub,
+          ".svg"
+        )
+      ),
+
+    plot =
+      p,
+
+    width =
+      10,
+
+    height =
+      plot_height,
+
+    device =
+      "svg"
+  )
+
+  ggplot2::ggsave(
+    filename =
+      file.path(
+        plot_dir,
+        paste0(
+          output_stub,
+          ".pdf"
+        )
+      ),
+
+    plot =
+      p,
+
+    width =
+      10,
+
+    height =
+      plot_height,
+
+    device =
+      grDevices::cairo_pdf
+  )
+
+  p
+}
+```
+
+```{r}
+p_crc <- plot_three_contrast_gsva(
+  df =
+    crc_plot_df,
+
+  dataset =
+    "CRC",
+
+  output_stub =
+    "CRC_Hallmark_GSVA_three_pairwise_contrasts_stability"
+)
+
+p_crc
+```
+
+```{r}
+p_ucec <- plot_three_contrast_gsva(
+  df =
+    ucec_plot_df,
+
+  dataset =
+    "UCEC",
+
+  output_stub =
+    "UCEC_Hallmark_GSVA_three_pairwise_contrasts_stability"
+)
+
+p_ucec
+```
+
+```{r}
+if (
+  !is.null(
+    p_crc
+  ) &&
+  !is.null(
+    p_ucec
+  )
+) {
+  combined_plot <- (
+    p_crc +
+      p_ucec
+  ) +
+
+    patchwork::plot_layout(
+      guides =
+        "collect"
+    ) +
+
+    patchwork::plot_annotation(
+      tag_levels =
+        "A"
+    ) &
+
+    ggplot2::theme(
+      legend.position =
+        "bottom",
+
+      plot.tag =
+        ggplot2::element_text(
+          size =
+            24
+        )
+    )
+
+  combined_plot
+
+
+  ggplot2::ggsave(
+    filename =
+      file.path(
+        plot_dir,
+        "CRC_UCEC_Hallmark_GSVA_three_pairwise_contrasts_stability_AB.svg"
+      ),
+
+    plot =
+      combined_plot,
+
+    width =
+      18,
+
+    height =
+      10,
+
+    device =
+      "svg"
+  )
+
+
+  ggplot2::ggsave(
+    filename =
+      file.path(
+        plot_dir,
+        "CRC_UCEC_Hallmark_GSVA_three_pairwise_contrasts_stability_AB.pdf"
+      ),
+
+    plot =
+      combined_plot,
+
+    width =
+      18,
+
+    height =
+      10,
+
+    device =
+      grDevices::cairo_pdf
+  )
+}
+```
+
+```{r}
+make_key_pathway_df <- function(
+    x
+) {
+  x %>%
+    dplyr::filter(
+      Contrast %in%
+        params$contrasts,
+
+      pathway %in%
+        params$key_pathways
+    ) %>%
+    dplyr::mutate(
+      Contrast_label =
+        unname(
+          contrast_label_lookup[
+            Contrast
+          ]
+        ),
+
+      Contrast_label =
+        factor(
+          Contrast_label,
+          levels = c(
+            "MSI-H vs MSS/TMB-L",
+            "MSI-H vs MSS/TMB-H",
+            "MSS/TMB-H vs MSS/TMB-L"
+          )
+        ),
+
+      Stability =
+        ifelse(
+          stable_relaxed,
+          "Stable",
+          "Not stable"
+        ),
+
+      Stability =
+        factor(
+          Stability,
+          levels = c(
+            "Stable",
+            "Not stable"
+          )
+        ),
+
+      significance_label =
+        ifelse(
+          primary_significant_relaxed,
+          "*",
+          ""
+        ),
+
+      Pathway =
+        clean_pathway_name(
+          pathway
+        ),
+
+      Pathway =
+        factor(
+          Pathway,
+          levels =
+            rev(
+              clean_pathway_name(
+                params$key_pathways
+              )
+            )
+        )
+    )
+}
+
+
+crc_key_df <- make_key_pathway_df(
+  crc
+)
+
+
+ucec_key_df <- make_key_pathway_df(
+  ucec
+)
+
+
+p_crc_key <- plot_three_contrast_gsva(
+  df =
+    crc_key_df,
+
+  dataset =
+    "CRC",
+
+  output_stub =
+    "CRC_MTORC1_E2F_G2M_three_pairwise_contrasts",
+
+  title =
+    "mTORC1, E2F and G2M pathway expression"
+)
+
+
+p_ucec_key <- plot_three_contrast_gsva(
+  df =
+    ucec_key_df,
+
+  dataset =
+    "UCEC",
+
+  output_stub =
+    "UCEC_MTORC1_E2F_G2M_three_pairwise_contrasts",
+
+  title =
+    "mTORC1, E2F and G2M pathway expression"
+)
+
+
+p_crc_key
+p_ucec_key
+```
+
+```{r}
+key_pathway_table <- dplyr::bind_rows(
+  crc,
+  ucec
+) %>%
+  dplyr::filter(
+    Contrast %in%
+      params$contrasts,
+
+    pathway %in%
+      params$key_pathways
+  ) %>%
+  dplyr::select(
+    Dataset,
+    Contrast,
+    pathway,
+    primary_logFC,
+    primary_FDR,
+    tested_rate,
+    bootstrap_sign_consistency,
+    dplyr::any_of(
+      c(
+        "bootstrap_median_logFC",
+        "bootstrap_logFC_q025",
+        "bootstrap_logFC_q975",
+        "bootstrap_FDR_same_direction_rate",
+        "bootstrap_direction_stable",
+        "bootstrap_robust_effect",
+        "primary_and_bootstrap_stable"
+      )
+    ),
+    primary_significant_relaxed,
+    tested_rate_pass,
+    sign_consistency_pass,
+    stable_relaxed
+  ) %>%
+  dplyr::arrange(
+    Dataset,
+    pathway,
+    factor(
+      Contrast,
+      levels =
+        params$contrasts
+    )
+  )
+
+
+key_pathway_table
+
+
+write.csv(
+  key_pathway_table,
+  file.path(
+    table_dir,
+    "MTORC1_E2F_G2M_all_three_pairwise_contrasts.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+```{r}
+make_pattern_summary <- function(
+    x
+) {
+  x %>%
+    dplyr::filter(
+      Contrast %in%
+        params$contrasts
+    ) %>%
+    dplyr::mutate(
+      Contrast_short =
+        dplyr::case_when(
+          Contrast ==
+            "MSI_H_vs_MSS_TMB_L" ~
+            "MSIH_vs_MSSL",
+
+          Contrast ==
+            "MSI_H_vs_MSS_TMB_H" ~
+            "MSIH_vs_MSSH",
+
+          Contrast ==
+            "MSS_TMB_H_vs_MSS_TMB_L" ~
+            "MSSH_vs_MSSL"
+        )
+    ) %>%
+    dplyr::select(
+      Dataset,
+      pathway,
+      Contrast_short,
+      stable_relaxed,
+      primary_logFC,
+      primary_FDR
+    ) %>%
+    tidyr::pivot_wider(
+      names_from =
+        Contrast_short,
+
+      values_from =
+        c(
+          stable_relaxed,
+          primary_logFC,
+          primary_FDR
+        )
+    )
+}
+
+
+pattern_summary <- dplyr::bind_rows(
+  make_pattern_summary(
+    crc
+  ),
+  make_pattern_summary(
+    ucec
+  )
+)
+
+
+write.csv(
+  pattern_summary,
+  file.path(
+    table_dir,
+    "GSVA_three_contrast_pathway_pattern_summary.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+```{r}
+openxlsx::write.xlsx(
+  list(
+    Stability_counts =
+      stability_counts,
+
+    CRC_plotted =
+      crc_plot_df,
+
+    UCEC_plotted =
+      ucec_plot_df,
+
+    Key_pathways =
+      key_pathway_table,
+
+    Pattern_summary =
+      pattern_summary
+  ),
+
+  file =
+    file.path(
+      params$output_root,
+      "CRC_UCEC_GSVA_three_pairwise_contrast_stability.xlsx"
+    ),
+
+  overwrite =
+    TRUE
+)
+```
+
+```{r}
+sessionInfo()
+```

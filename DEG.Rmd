@@ -1,0 +1,145 @@
+```{r}
+library(edgeR)
+library(dplyr)
+```
+
+```{r}
+clinical_data <- read.csv("data/clinical_data.csv", header = TRUE, stringsAsFactors = FALSE, fileEncoding = "UTF-8", na.strings = c("NA", ""))
+
+
+rownames(clinical_data) <- clinical_data$sample_submitter_id
+clinical_data
+```
+
+```{r}
+counts <- as.matrix(read.csv("data/prepared/counts_coad_read_HUGO_shortbarcodes.csv",
+                             row.names = 1, check.names = FALSE))
+```
+
+```{r}
+clinical_data$MSI_TMB <- factor(clinical_data$MSI_TMB,
+                                levels = c("MSI-H", "MSS/TMB-H", "MSS/TMB-L"),
+                                labels = c("MSI_H", "MSS_TMB_H", "MSS_TMB_L"))
+
+
+common_samples <- intersect(colnames(counts), rownames(clinical_data))
+counts <- counts[, common_samples, drop = FALSE]
+clinical_data <- clinical_data[common_samples, , drop = FALSE]
+```
+
+```{r}
+clinical_data
+```
+
+```{r}
+y <- edgeR::DGEList(counts = counts, group = clinical_data$MSI_TMB)
+
+
+
+keep <- edgeR::filterByExpr(y, group = clinical_data$MSI_TMB, min.count = 10)
+y <- y[keep, , keep.lib.sizes = FALSE]
+```
+
+```{r}
+y <- edgeR::calcNormFactors(y, method = "TMM")
+
+
+design <- stats::model.matrix(~0 + clinical_data$MSI_TMB)
+colnames(design) <- levels(clinical_data$MSI_TMB)
+
+
+y <- edgeR::estimateDisp(y, design, robust = TRUE)
+
+
+fit <- edgeR::glmQLFit(y, design, robust = TRUE)
+
+
+contrasts <- list(
+  MSI_H_vs_MSS_TMB_H  = makeContrasts(MSI_H - MSS_TMB_H, levels = design),
+  MSI_H_vs_MSS_TMB_L  = makeContrasts(MSI_H - MSS_TMB_L, levels = design),
+  MSS_TMB_H_vs_MSS_TMB_L = makeContrasts(MSS_TMB_H - MSS_TMB_L, levels = design)
+)
+
+
+results <- lapply(contrasts, function(ct) {
+  qlf <- edgeR::glmQLFTest(fit, contrast = ct)
+  top <- edgeR::topTags(qlf, n = Inf)
+  return(top$table)
+})
+```
+
+```{r}
+for (name in names(results)) {
+  safe_name <- gsub("[^A-Za-z0-9_-]", "_", name)
+  write.csv(results[[name]],
+            file = paste0("data/DE_results/", safe_name, ".csv"))
+}
+```
+
+```{r}
+res_dir <- "data/DE_results"
+res_files <- list.files(res_dir, pattern = "\\.csv$", full.names = TRUE)
+
+for (file in res_files) {
+  df <- read.csv(file, row.names = 1, check.names = FALSE)
+  
+  
+  df <- tibble::rownames_to_column(df, var = "Gene")
+  
+  
+  df_filtered <- df %>%
+    filter(FDR <= 0.05) %>%
+    arrange(desc(abs(logFC))) %>%
+    select(Gene, logFC)
+  
+  
+  base <- gsub("\\.csv$", "", basename(file))
+  out_file <- file.path(res_dir, paste0(base, "_sig_genes.csv"))
+  write.csv(df_filtered, out_file, row.names = FALSE)
+}
+```
+
+```{r}
+library(tibble)
+library(fs) 
+
+res_dir <- "data/DE_results"
+res_files <- list.files(res_dir, pattern = "_sig_genes\\.csv$", full.names = TRUE)
+
+for (file in res_files) {
+  df <- read.csv(file, row.names = 1, check.names = FALSE)
+  df <- tibble::rownames_to_column(df, var = "Gene")
+  
+  
+  base <- gsub("_sig_genes\\.csv$", "", basename(file))
+  
+  
+  parts <- unlist(strsplit(base, "_vs_"))
+  if (length(parts) != 2) next
+  
+  group1 <- parts[1]
+  group2 <- parts[2]
+  
+  
+  df_up <- df %>% filter(logFC > 0) %>% arrange(desc(logFC)) %>% select(Gene, logFC)
+  df_down <- df %>% filter(logFC < 0) %>% arrange(logFC) %>% select(Gene, logFC)
+  
+  
+  up_dir_g1 <- file.path(res_dir, group1, "upregulated")
+  down_dir_g1 <- file.path(res_dir, group1, "downregulated")
+  up_dir_g2 <- file.path(res_dir, group2, "upregulated")
+  down_dir_g2 <- file.path(res_dir, group2, "downregulated")
+  fs::dir_create(c(up_dir_g1, down_dir_g1, up_dir_g2, down_dir_g2))
+  
+  
+  write.csv(df_up,   file.path(up_dir_g1,   paste0("compared_to_", group2, ".csv")), row.names = FALSE)
+  write.csv(df_down, file.path(down_dir_g1, paste0("compared_to_", group2, ".csv")), row.names = FALSE)
+  
+  
+  df_up_g2   <- df %>% filter(logFC < 0) %>% arrange(desc(abs(logFC))) %>% select(Gene, logFC = -logFC)
+  df_down_g2 <- df %>% filter(logFC > 0) %>% arrange(abs(logFC)) %>% select(Gene, logFC = -logFC)
+  
+  write.csv(df_up_g2,   file.path(up_dir_g2,   paste0("compared_to_", group1, ".csv")), row.names = FALSE)
+  write.csv(df_down_g2, file.path(down_dir_g2, paste0("compared_to_", group1, ".csv")), row.names = FALSE)
+}
+```

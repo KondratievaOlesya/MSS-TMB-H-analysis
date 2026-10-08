@@ -1,0 +1,1638 @@
+```{r}
+required_packages <- c(
+  "edgeR",
+  "limma",
+  "dplyr",
+  "tidyr",
+  "tibble",
+  "ggplot2",
+  "ggrepel",
+  "ggpubr",
+  "fs",
+  "openxlsx",
+  "knitr"
+)
+
+missing_packages <- required_packages[
+  !vapply(
+    required_packages,
+    requireNamespace,
+    logical(1),
+    quietly = TRUE
+  )
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "The following packages are required but not installed: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+library(edgeR)
+library(limma)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(ggrepel)
+library(ggpubr)
+library(fs)
+library(openxlsx)
+library(knitr)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 10,
+  fig.height = 6
+)
+```
+
+```{r}
+params <- list(
+  crc_clinical_file =
+    "data/clinical_data.csv",
+
+  crc_mirna_file =
+    "data/coad/miRNA_counts_matrix.csv",
+
+  ucec_clinical_file =
+    "data/ucec_clinical.csv",
+
+  ucec_mirna_file =
+    "data/ucec/miRNA_counts_matrix.csv",
+
+  output_root =
+    "data/DE_results/pre_miRNA/separate_analysis",
+
+  figure_root =
+    "results/figures/pre_miRNA/separate_analysis",
+
+  fdr_cutoff = 0.05,
+  logfc_cutoff = 1,
+  min_count = 5,
+  volcano_label_n = 10
+)
+
+fs::dir_create(params$output_root)
+fs::dir_create(params$figure_root)
+
+group_colors <- c(
+  "MSI-H" = "#7AA6DC",
+  "MSS/TMB-H" = "#A73030",
+  "MSS/TMB-L" = "#868686"
+)
+```
+
+```{r}
+standardize_msi_tmb <- function(x) {
+  mapping <- c(
+    "MSI-H" = "MSI-H",
+    "MSI_H" = "MSI-H",
+    "MSS/TMB-H" = "MSS/TMB-H",
+    "MSS_TMB_H" = "MSS/TMB-H",
+    "MSS/TMB-L" = "MSS/TMB-L",
+    "MSS_TMB_L" = "MSS/TMB-L"
+  )
+
+  factor(
+    unname(mapping[as.character(x)]),
+    levels = c(
+      "MSI-H",
+      "MSS/TMB-H",
+      "MSS/TMB-L"
+    )
+  )
+}
+```
+
+```{r}
+fdr_to_significance <- function(fdr) {
+  dplyr::case_when(
+    is.na(fdr) ~ NA_character_,
+    fdr <= 0.001 ~ "***",
+    fdr <= 0.01 ~ "**",
+    fdr <= 0.05 ~ "*",
+    TRUE ~ "ns"
+  )
+}
+```
+
+```{r}
+plot_mirna_volcano <- function(
+    result_table,
+    dataset_name,
+    contrast_title,
+    output_file,
+    flip_logfc = FALSE,
+    label_n = 10
+) {
+  plot_df <- result_table %>%
+    tibble::rownames_to_column(
+      "pre_miRNA"
+    ) %>%
+    tibble::as_tibble()
+
+  if (flip_logfc) {
+    plot_df$logFC <- -plot_df$logFC
+  }
+
+  plot_df <- plot_df %>%
+    mutate(
+      significant =
+        !is.na(FDR) &
+        FDR <= params$fdr_cutoff &
+        abs(logFC) >= params$logfc_cutoff,
+
+      direction = case_when(
+        significant & logFC > 0 ~
+          "Up in MSS/TMB-H",
+
+        significant & logFC < 0 ~
+          "Down in MSS/TMB-H",
+
+        TRUE ~
+          "Not significant"
+      ),
+
+      neglog10FDR = -log10(
+        pmax(FDR, 1e-300)
+      )
+    )
+
+  label_df <- plot_df %>%
+    filter(significant) %>%
+    arrange(
+      FDR,
+      desc(abs(logFC))
+    ) %>%
+    slice_head(
+      n = label_n
+    )
+
+  p <- ggplot(
+    plot_df,
+    aes(
+      x = logFC,
+      y = neglog10FDR
+    )
+  ) +
+    geom_point(
+      aes(color = direction),
+      alpha = 0.75,
+      size = 1.6
+    ) +
+    geom_vline(
+      xintercept = c(
+        -params$logfc_cutoff,
+        params$logfc_cutoff
+      ),
+      linetype = "dashed",
+      linewidth = 0.35
+    ) +
+    geom_hline(
+      yintercept =
+        -log10(params$fdr_cutoff),
+      linetype = "dashed",
+      linewidth = 0.35
+    ) +
+    ggrepel::geom_text_repel(
+      data = label_df,
+      aes(label = pre_miRNA),
+      size = 3,
+      max.overlaps = Inf,
+      box.padding = 0.35,
+      point.padding = 0.2
+    ) +
+    scale_color_manual(
+      values = c(
+        "Up in MSS/TMB-H" =
+          group_colors[["MSS/TMB-H"]],
+
+        "Down in MSS/TMB-H" =
+          group_colors[["MSI-H"]],
+
+        "Not significant" =
+          "grey80"
+      ),
+      drop = FALSE
+    ) +
+    labs(
+      title = paste0(
+        dataset_name,
+        " pre-miRNA: ",
+        contrast_title
+      ),
+      x = "log2 fold-change in MSS/TMB-H",
+      y = expression(-log[10]("FDR")),
+      color = NULL
+    ) +
+    theme_classic(
+      base_size = 13
+    ) +
+    theme(
+      plot.title = element_text(
+        face = "bold",
+        hjust = 0.5
+      ),
+      legend.position = "top"
+    )
+
+  ggsave(
+    output_file,
+    p,
+    width = 6.5,
+    height = 5.2,
+    device = "svg"
+  )
+
+  invisible(p)
+}
+```
+
+```{r}
+run_mirna_analysis <- function(
+    clinical_file,
+    mirna_file,
+    dataset_name,
+    output_dir,
+    figure_dir
+) {
+  fs::dir_create(output_dir)
+  fs::dir_create(figure_dir)
+
+  if (!file.exists(clinical_file)) {
+    stop(
+      dataset_name,
+      " clinical file does not exist: ",
+      clinical_file
+    )
+  }
+
+  if (!file.exists(mirna_file)) {
+    stop(
+      dataset_name,
+      " pre-miRNA count file does not exist: ",
+      mirna_file
+    )
+  }
+
+  
+  
+  
+
+  clinical_data <- read.csv(
+    clinical_file,
+    header = TRUE,
+    stringsAsFactors = FALSE,
+    fileEncoding = "UTF-8",
+    na.strings = c("NA", "")
+  )
+
+  required_columns <- c(
+    "sample_submitter_id",
+    "MSI_TMB"
+  )
+
+  missing_columns <- setdiff(
+    required_columns,
+    colnames(clinical_data)
+  )
+
+  if (length(missing_columns) > 0) {
+    stop(
+      dataset_name,
+      " clinical file is missing columns: ",
+      paste(missing_columns, collapse = ", ")
+    )
+  }
+
+  if (anyDuplicated(
+    clinical_data$sample_submitter_id
+  )) {
+    stop(
+      dataset_name,
+      " clinical data contain duplicated sample_submitter_id values."
+    )
+  }
+
+  rownames(clinical_data) <-
+    clinical_data$sample_submitter_id
+
+  clinical_data$MSI_TMB <-
+    standardize_msi_tmb(
+      clinical_data$MSI_TMB
+    )
+
+  clinical_data <- clinical_data[
+    !is.na(clinical_data$MSI_TMB),
+    ,
+    drop = FALSE
+  ]
+
+  
+  
+  
+
+  mirna_counts <- as.matrix(
+    read.csv(
+      mirna_file,
+      row.names = 1,
+      check.names = FALSE
+    )
+  )
+
+  storage.mode(mirna_counts) <-
+    "numeric"
+
+  if (anyNA(mirna_counts)) {
+    stop(
+      dataset_name,
+      " pre-miRNA count matrix contains missing or non-numeric values."
+    )
+  }
+
+  if (any(mirna_counts < 0)) {
+    stop(
+      dataset_name,
+      " pre-miRNA count matrix contains negative values."
+    )
+  }
+
+  if (anyDuplicated(rownames(mirna_counts))) {
+    stop(
+      dataset_name,
+      " pre-miRNA count matrix contains duplicated row names."
+    )
+  }
+
+  
+  
+  
+
+  
+  original_barcodes <- colnames(mirna_counts)
+
+  
+  sample_barcodes <- substr(
+    original_barcodes,
+    1,
+    16
+  )
+
+  colnames(mirna_counts) <- sample_barcodes
+
+  
+  
+  
+  clinically_matched_columns <- colnames(mirna_counts) %in%
+    rownames(clinical_data)
+
+  mirna_counts <- mirna_counts[
+    ,
+    clinically_matched_columns,
+    drop = FALSE
+  ]
+
+  original_barcodes <- original_barcodes[
+    clinically_matched_columns
+  ]
+
+  if (ncol(mirna_counts) == 0) {
+    stop(
+      "No common samples were found for ",
+      dataset_name,
+      "."
+    )
+  }
+
+  
+  
+  sample_ids <- colnames(mirna_counts)
+  library_sizes <- colSums(
+    mirna_counts,
+    na.rm = TRUE
+  )
+
+  candidate_table <- tibble::tibble(
+    sample_submitter_id = sample_ids,
+    original_aliquot_barcode = original_barcodes,
+    library_size = as.numeric(library_sizes)
+  ) %>%
+    dplyr::group_by(sample_submitter_id) %>%
+    dplyr::mutate(
+      number_of_available_aliquots = dplyr::n(),
+      selected = library_size == max(
+        library_size,
+        na.rm = TRUE
+      ),
+      
+      selected = selected &
+        dplyr::row_number() ==
+        min(dplyr::row_number()[selected])
+    ) %>%
+    dplyr::ungroup()
+
+  selected_columns <- which(candidate_table$selected)
+
+  if (anyDuplicated(sample_ids)) {
+    message(
+      dataset_name,
+      ": duplicated aliquots remained after clinical matching. ",
+      "Keeping one aliquot per sample using the largest library size."
+    )
+  }
+
+  write.csv(
+    candidate_table,
+    file.path(
+      output_dir,
+      "pre_miRNA_aliquot_selection_audit.csv"
+    ),
+    row.names = FALSE
+  )
+
+  mirna_counts <- mirna_counts[
+    ,
+    selected_columns,
+    drop = FALSE
+  ]
+
+  original_barcodes <- original_barcodes[
+    selected_columns
+  ]
+
+  if (anyDuplicated(colnames(mirna_counts))) {
+    stop(
+      dataset_name,
+      ": duplicate sample barcodes remain after aliquot selection."
+    )
+  }
+
+  
+  
+  
+
+  common_samples <- intersect(
+    colnames(mirna_counts),
+    rownames(clinical_data)
+  )
+
+  if (length(common_samples) == 0) {
+    stop(
+      "No common samples were found for ",
+      dataset_name,
+      "."
+    )
+  }
+
+  mirna_counts <- mirna_counts[
+    ,
+    common_samples,
+    drop = FALSE
+  ]
+
+  clinical_data <- clinical_data[
+    common_samples,
+    ,
+    drop = FALSE
+  ]
+
+  stopifnot(
+    identical(
+      colnames(mirna_counts),
+      rownames(clinical_data)
+    ),
+    !anyDuplicated(
+      colnames(mirna_counts)
+    )
+  )
+
+  group_sizes <- table(
+    clinical_data$MSI_TMB
+  )
+
+  if (any(group_sizes == 0)) {
+    stop(
+      dataset_name,
+      " is missing at least one required MSI/TMB group."
+    )
+  }
+
+  write.csv(
+    data.frame(
+      Dataset = dataset_name,
+      Group = names(group_sizes),
+      Number_of_samples =
+        as.integer(group_sizes)
+    ),
+    file.path(
+      output_dir,
+      "sample_group_sizes.csv"
+    ),
+    row.names = FALSE
+  )
+
+  
+  
+  
+
+  y <- edgeR::DGEList(
+    counts = mirna_counts,
+    group = clinical_data$MSI_TMB
+  )
+
+  keep <- edgeR::filterByExpr(
+    y,
+    group = clinical_data$MSI_TMB,
+    min.count = params$min_count
+  )
+
+  y <- y[
+    keep,
+    ,
+    keep.lib.sizes = FALSE
+  ]
+
+  if (nrow(y) == 0) {
+    stop(
+      "No pre-miRNAs passed expression filtering for ",
+      dataset_name,
+      "."
+    )
+  }
+
+  y <- edgeR::calcNormFactors(
+    y,
+    method = "TMM"
+  )
+
+  design <- model.matrix(
+    ~ 0 + clinical_data$MSI_TMB
+  )
+
+  colnames(design) <- c(
+    "MSI_H",
+    "MSS_TMB_H",
+    "MSS_TMB_L"
+  )
+
+  y <- edgeR::estimateDisp(
+    y,
+    design,
+    robust = TRUE
+  )
+
+  fit <- edgeR::glmQLFit(
+    y,
+    design,
+    robust = TRUE
+  )
+
+  contrasts <- list(
+    MSI_H_vs_MSS_TMB_H =
+      limma::makeContrasts(
+        MSI_H - MSS_TMB_H,
+        levels = design
+      ),
+
+    MSI_H_vs_MSS_TMB_L =
+      limma::makeContrasts(
+        MSI_H - MSS_TMB_L,
+        levels = design
+      ),
+
+    MSS_TMB_H_vs_MSS_TMB_L =
+      limma::makeContrasts(
+        MSS_TMB_H - MSS_TMB_L,
+        levels = design
+      )
+  )
+
+  mirna_results <- lapply(
+    contrasts,
+    function(contrast_vector) {
+      qlf <- edgeR::glmQLFTest(
+        fit,
+        contrast = contrast_vector
+      )
+
+      edgeR::topTags(
+        qlf,
+        n = Inf
+      )$table
+    }
+  )
+
+  
+  
+  
+
+  significant_results <- list()
+
+  for (contrast_name in names(mirna_results)) {
+    full_table <- mirna_results[[
+      contrast_name
+    ]]
+
+    write.csv(
+      full_table,
+      file.path(
+        output_dir,
+        paste0(
+          contrast_name,
+          ".csv"
+        )
+      )
+    )
+
+    significant_table <- full_table %>%
+      tibble::rownames_to_column(
+        "pre_miRNA"
+      ) %>%
+      filter(
+        !is.na(FDR),
+        FDR <= params$fdr_cutoff,
+        abs(logFC) >=
+          params$logfc_cutoff
+      ) %>%
+      arrange(
+        FDR,
+        desc(abs(logFC))
+      )
+
+    significant_results[[
+      contrast_name
+    ]] <- significant_table
+
+    write.csv(
+      significant_table,
+      file.path(
+        output_dir,
+        paste0(
+          contrast_name,
+          "_significant.csv"
+        )
+      ),
+      row.names = FALSE
+    )
+  }
+
+  
+  
+  
+
+  volcano_mssh_vs_msih <-
+    plot_mirna_volcano(
+      result_table =
+        mirna_results$MSI_H_vs_MSS_TMB_H,
+
+      dataset_name =
+        dataset_name,
+
+      contrast_title =
+        "MSS/TMB-H vs MSI-H",
+
+      output_file =
+        file.path(
+          figure_dir,
+          paste0(
+            "volcano_",
+            dataset_name,
+            "_pre_miRNA_MSS_TMB_H_vs_MSI_H.svg"
+          )
+        ),
+
+      flip_logfc = TRUE,
+
+      label_n =
+        params$volcano_label_n
+    )
+
+  volcano_mssh_vs_mssl <-
+    plot_mirna_volcano(
+      result_table =
+        mirna_results$MSS_TMB_H_vs_MSS_TMB_L,
+
+      dataset_name =
+        dataset_name,
+
+      contrast_title =
+        "MSS/TMB-H vs MSS/TMB-L",
+
+      output_file =
+        file.path(
+          figure_dir,
+          paste0(
+            "volcano_",
+            dataset_name,
+            "_pre_miRNA_MSS_TMB_H_vs_MSS_TMB_L.svg"
+          )
+        ),
+
+      flip_logfc = FALSE,
+
+      label_n =
+        params$volcano_label_n
+    )
+
+  
+  
+  
+
+  logcpm <- edgeR::cpm(
+    y,
+    log = TRUE,
+    prior.count = 1
+  )
+
+  write.csv(
+    logcpm,
+    file.path(
+      output_dir,
+      "TMM_logCPM_matrix.csv"
+    )
+  )
+
+  
+  significant_mirnas <- unique(
+    c(
+      significant_results$
+        MSI_H_vs_MSS_TMB_H$
+        pre_miRNA,
+
+      significant_results$
+        MSS_TMB_H_vs_MSS_TMB_L$
+        pre_miRNA
+    )
+  )
+
+  significant_mirnas <- intersect(
+    significant_mirnas,
+    rownames(logcpm)
+  )
+
+  if (length(significant_mirnas) == 0) {
+    warning(
+      "No significant pre-miRNAs were found for ",
+      dataset_name,
+      " at FDR <= ",
+      params$fdr_cutoff,
+      " and |logFC| >= ",
+      params$logfc_cutoff,
+      ". Boxplots were not generated."
+    )
+
+    return(
+      list(
+        dataset = dataset_name,
+        clinical_data = clinical_data,
+        counts = mirna_counts,
+        y = y,
+        fit = fit,
+        results = mirna_results,
+        significant_results =
+          significant_results,
+        significant_mirnas =
+          character(0),
+        expression = tibble(),
+        annotations = tibble(),
+        boxplot = NULL,
+        volcano_mssh_vs_msih =
+          volcano_mssh_vs_msih,
+        volcano_mssh_vs_mssl =
+          volcano_mssh_vs_mssl
+      )
+    )
+  }
+
+  
+  
+  
+
+  expression_df <- as.data.frame(
+    logcpm[
+      significant_mirnas,
+      ,
+      drop = FALSE
+    ]
+  ) %>%
+    rownames_to_column(
+      "pre_miRNA"
+    ) %>%
+    pivot_longer(
+      cols = -pre_miRNA,
+      names_to = "sample",
+      values_to = "logCPM"
+    ) %>%
+    left_join(
+      clinical_data %>%
+        rownames_to_column(
+          "sample"
+        ) %>%
+        select(
+          sample,
+          MSI_TMB
+        ),
+      by = "sample"
+    )
+
+  write.csv(
+    expression_df,
+    file.path(
+      output_dir,
+      "significant_pre_miRNA_expression_long.csv"
+    ),
+    row.names = FALSE
+  )
+
+  
+  
+  
+
+  make_annotation <- function(
+      result_table,
+      group1,
+      group2,
+      contrast_label
+  ) {
+    result_table %>%
+      rownames_to_column(
+        "pre_miRNA"
+      ) %>%
+      filter(
+        pre_miRNA %in%
+          significant_mirnas
+      ) %>%
+      transmute(
+        pre_miRNA,
+        group1 = group1,
+        group2 = group2,
+        contrast = contrast_label,
+        logFC,
+        FDR,
+        significance =
+          fdr_to_significance(FDR)
+      )
+  }
+
+  annotation_df <- bind_rows(
+    make_annotation(
+      result_table =
+        mirna_results$
+        MSI_H_vs_MSS_TMB_H,
+
+      group1 =
+        "MSI-H",
+
+      group2 =
+        "MSS/TMB-H",
+
+      contrast_label =
+        "MSI-H vs MSS/TMB-H"
+    ),
+
+    make_annotation(
+      result_table =
+        mirna_results$
+        MSS_TMB_H_vs_MSS_TMB_L,
+
+      group1 =
+        "MSS/TMB-H",
+
+      group2 =
+        "MSS/TMB-L",
+
+      contrast_label =
+        "MSS/TMB-H vs MSS/TMB-L"
+    )
+  )
+
+  panel_ranges <- expression_df %>%
+    group_by(
+      pre_miRNA
+    ) %>%
+    summarise(
+      panel_max = max(
+        logCPM,
+        na.rm = TRUE
+      ),
+      panel_min = min(
+        logCPM,
+        na.rm = TRUE
+      ),
+      panel_range = max(
+        panel_max - panel_min,
+        1
+      ),
+      .groups = "drop"
+    )
+
+  annotation_df <- annotation_df %>%
+    left_join(
+      panel_ranges,
+      by = "pre_miRNA"
+    ) %>%
+    mutate(
+      comparison_number = case_when(
+        group1 == "MSI-H" ~ 1,
+        TRUE ~ 2
+      ),
+
+      y.position =
+        panel_max +
+        panel_range *
+        (
+          0.08 +
+          0.16 * comparison_number
+        )
+    )
+
+  write.csv(
+    annotation_df,
+    file.path(
+      output_dir,
+      paste0(
+        dataset_name,
+        "_pre_miRNA_significance_annotations.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+
+  
+  
+  
+
+  boxplot_object <- ggplot(
+    expression_df,
+    aes(
+      x = MSI_TMB,
+      y = logCPM,
+      fill = MSI_TMB
+    )
+  ) +
+    geom_boxplot(
+      width = 0.68,
+      outlier.shape = NA,
+      linewidth = 0.35
+    ) +
+    geom_jitter(
+      width = 0.13,
+      size = 0.75,
+      alpha = 0.45
+    ) +
+    ggpubr::stat_pvalue_manual(
+      annotation_df,
+      label = "significance",
+      xmin = "group1",
+      xmax = "group2",
+      y.position = "y.position",
+      tip.length = 0.01,
+      bracket.size = 0.3,
+      size = 3,
+      hide.ns = TRUE
+    ) +
+    facet_wrap(
+      ~ pre_miRNA,
+      scales = "free_y",
+      nrow = 1
+    ) +
+    scale_fill_manual(
+      values = group_colors,
+      drop = FALSE
+    ) +
+    scale_x_discrete(
+      drop = FALSE
+    ) +
+    scale_y_continuous(
+      expand = expansion(
+        mult = c(
+          0.05,
+          0.30
+        )
+      )
+    ) +
+    coord_cartesian(
+      clip = "off"
+    ) +
+    labs(
+      title = paste0(
+        dataset_name,
+        " pre-miRNA expression"
+      ),
+      subtitle = paste0(
+        "Significant in at least one MSS/TMB-H contrast; ",
+        "brackets show edgeR FDR"
+      ),
+      x = NULL,
+      y = "TMM-normalized logCPM",
+      fill = NULL
+    ) +
+    theme_classic(
+      base_size = 11
+    ) +
+    theme(
+      plot.title = element_text(
+        face = "bold",
+        hjust = 0.5
+      ),
+      plot.subtitle = element_text(
+        hjust = 0.5
+      ),
+      strip.background = element_rect(
+        fill = "white",
+        color = "black",
+        linewidth = 0.4
+      ),
+      strip.text = element_text(
+        face = "bold"
+      ),
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      legend.position = "bottom",
+      panel.spacing.x = grid::unit(
+        0.15,
+        "lines"
+      )
+    )
+
+  boxplot_file <- file.path(
+    figure_dir,
+    paste0(
+      "pre_miRNA_expression_boxplots_",
+      dataset_name,
+      ".svg"
+    )
+  )
+
+  ggsave(
+    boxplot_file,
+    boxplot_object,
+    width = max(
+      8,
+      length(significant_mirnas) *
+        1.9
+    ),
+    height = 5,
+    device = "svg",
+    limitsize = FALSE
+  )
+
+  
+  
+  
+
+  export_full <- bind_rows(
+    lapply(
+      names(mirna_results),
+      function(contrast_name) {
+        mirna_results[[contrast_name]] %>%
+          rownames_to_column(
+            "pre_miRNA"
+          ) %>%
+          mutate(
+            Dataset = dataset_name,
+            Contrast = contrast_name,
+            .before = 1
+          )
+      }
+    )
+  )
+
+  export_significant <- export_full %>%
+    filter(
+      !is.na(FDR),
+      FDR <= params$fdr_cutoff,
+      abs(logFC) >=
+        params$logfc_cutoff
+    ) %>%
+    arrange(
+      Contrast,
+      FDR,
+      desc(abs(logFC))
+    )
+
+  summary_counts <- export_significant %>%
+    mutate(
+      Direction = case_when(
+        logFC > 0 ~
+          "Up in first contrast group",
+
+        logFC < 0 ~
+          "Down in first contrast group",
+
+        TRUE ~
+          "No change"
+      )
+    ) %>%
+    count(
+      Contrast,
+      Direction,
+      name = "Number_of_pre_miRNAs"
+    )
+
+  workbook_file <- file.path(
+    output_dir,
+    paste0(
+      dataset_name,
+      "_pre_miRNA_DE_results.xlsx"
+    )
+  )
+
+  workbook <- openxlsx::createWorkbook()
+
+  openxlsx::addWorksheet(
+    workbook,
+    "All_DE_results"
+  )
+
+  openxlsx::writeData(
+    workbook,
+    "All_DE_results",
+    export_full
+  )
+
+  openxlsx::addWorksheet(
+    workbook,
+    "Significant_DE"
+  )
+
+  openxlsx::writeData(
+    workbook,
+    "Significant_DE",
+    export_significant
+  )
+
+  openxlsx::addWorksheet(
+    workbook,
+    "Significance_annotations"
+  )
+
+  openxlsx::writeData(
+    workbook,
+    "Significance_annotations",
+    annotation_df
+  )
+
+  openxlsx::addWorksheet(
+    workbook,
+    "Summary_counts"
+  )
+
+  openxlsx::writeData(
+    workbook,
+    "Summary_counts",
+    summary_counts
+  )
+
+  for (sheet_name in names(workbook)) {
+    openxlsx::freezePane(
+      workbook,
+      sheet_name,
+      firstRow = TRUE
+    )
+
+    openxlsx::setColWidths(
+      workbook,
+      sheet_name,
+      cols = 1:30,
+      widths = "auto"
+    )
+  }
+
+  openxlsx::saveWorkbook(
+    workbook,
+    workbook_file,
+    overwrite = TRUE
+  )
+
+  list(
+    dataset = dataset_name,
+    clinical_data = clinical_data,
+    counts = mirna_counts,
+    y = y,
+    fit = fit,
+    results = mirna_results,
+    significant_results =
+      significant_results,
+    significant_mirnas =
+      significant_mirnas,
+    expression = expression_df,
+    annotations = annotation_df,
+    boxplot = boxplot_object,
+    volcano_mssh_vs_msih =
+      volcano_mssh_vs_msih,
+    volcano_mssh_vs_mssl =
+      volcano_mssh_vs_mssl,
+    workbook = workbook_file
+  )
+}
+```
+
+```{r}
+crc_output_dir <- file.path(
+  params$output_root,
+  "CRC"
+)
+
+crc_figure_dir <- file.path(
+  params$figure_root,
+  "CRC"
+)
+
+crc_analysis <- run_mirna_analysis(
+  clinical_file =
+    params$crc_clinical_file,
+
+  mirna_file =
+    params$crc_mirna_file,
+
+  dataset_name =
+    "CRC",
+
+  output_dir =
+    crc_output_dir,
+
+  figure_dir =
+    crc_figure_dir
+)
+```
+
+```{r}
+crc_group_sizes <- table(
+  crc_analysis$clinical_data$MSI_TMB
+)
+
+knitr::kable(
+  data.frame(
+    Group = names(crc_group_sizes),
+    Number_of_samples =
+      as.integer(crc_group_sizes)
+  ),
+  caption = "CRC sample sizes."
+)
+```
+
+```{r}
+crc_significant_counts <- tibble(
+  Contrast =
+    names(
+      crc_analysis$significant_results
+    ),
+
+  Number_of_significant_pre_miRNAs =
+    vapply(
+      crc_analysis$significant_results,
+      nrow,
+      integer(1)
+    )
+)
+
+knitr::kable(
+  crc_significant_counts,
+  caption = paste0(
+    "CRC significant pre-miRNAs at FDR <= ",
+    params$fdr_cutoff,
+    " and |logFC| >= ",
+    params$logfc_cutoff,
+    "."
+  )
+)
+```
+
+```{r}
+crc_analysis$volcano_mssh_vs_msih
+crc_analysis$volcano_mssh_vs_mssl
+crc_analysis$boxplot
+```
+
+```{r}
+ucec_output_dir <- file.path(
+  params$output_root,
+  "UCEC"
+)
+
+ucec_figure_dir <- file.path(
+  params$figure_root,
+  "UCEC"
+)
+
+ucec_analysis <- run_mirna_analysis(
+  clinical_file =
+    params$ucec_clinical_file,
+
+  mirna_file =
+    params$ucec_mirna_file,
+
+  dataset_name =
+    "UCEC",
+
+  output_dir =
+    ucec_output_dir,
+
+  figure_dir =
+    ucec_figure_dir
+)
+```
+
+```{r}
+ucec_group_sizes <- table(
+  ucec_analysis$clinical_data$MSI_TMB
+)
+
+knitr::kable(
+  data.frame(
+    Group = names(ucec_group_sizes),
+    Number_of_samples =
+      as.integer(ucec_group_sizes)
+  ),
+  caption = "UCEC sample sizes."
+)
+```
+
+```{r}
+ucec_significant_counts <- tibble(
+  Contrast =
+    names(
+      ucec_analysis$significant_results
+    ),
+
+  Number_of_significant_pre_miRNAs =
+    vapply(
+      ucec_analysis$significant_results,
+      nrow,
+      integer(1)
+    )
+)
+
+knitr::kable(
+  ucec_significant_counts,
+  caption = paste0(
+    "UCEC significant pre-miRNAs at FDR <= ",
+    params$fdr_cutoff,
+    " and |logFC| >= ",
+    params$logfc_cutoff,
+    "."
+  )
+)
+```
+
+```{r}
+ucec_analysis$volcano_mssh_vs_msih
+ucec_analysis$volcano_mssh_vs_mssl
+ucec_analysis$boxplot
+```
+
+```{r}
+extract_mssh_direction <- function(
+    result_table,
+    comparison
+) {
+  result_table %>%
+    rownames_to_column(
+      "pre_miRNA"
+    ) %>%
+    mutate(
+      MSS_TMB_H_logFC = case_when(
+        comparison ==
+          "MSS/TMB-H vs MSI-H" ~
+          -logFC,
+
+        comparison ==
+          "MSS/TMB-H vs MSS/TMB-L" ~
+          logFC,
+
+        TRUE ~
+          NA_real_
+      ),
+
+      significant =
+        !is.na(FDR) &
+        FDR <= params$fdr_cutoff &
+        abs(MSS_TMB_H_logFC) >=
+          params$logfc_cutoff,
+
+      direction = case_when(
+        significant &
+        MSS_TMB_H_logFC > 0 ~
+          "Up in MSS/TMB-H",
+
+        significant &
+        MSS_TMB_H_logFC < 0 ~
+          "Down in MSS/TMB-H",
+
+        TRUE ~
+          "Not significant"
+      ),
+
+      Comparison = comparison
+    )
+}
+
+crc_mssh_vs_msih <-
+  extract_mssh_direction(
+    crc_analysis$results$
+      MSI_H_vs_MSS_TMB_H,
+    "MSS/TMB-H vs MSI-H"
+  )
+
+crc_mssh_vs_mssl <-
+  extract_mssh_direction(
+    crc_analysis$results$
+      MSS_TMB_H_vs_MSS_TMB_L,
+    "MSS/TMB-H vs MSS/TMB-L"
+  )
+
+ucec_mssh_vs_msih <-
+  extract_mssh_direction(
+    ucec_analysis$results$
+      MSI_H_vs_MSS_TMB_H,
+    "MSS/TMB-H vs MSI-H"
+  )
+
+ucec_mssh_vs_mssl <-
+  extract_mssh_direction(
+    ucec_analysis$results$
+      MSS_TMB_H_vs_MSS_TMB_L,
+    "MSS/TMB-H vs MSS/TMB-L"
+  )
+
+overlap_summary <- tibble(
+  Comparison = c(
+    "MSS/TMB-H vs MSI-H",
+    "MSS/TMB-H vs MSS/TMB-L"
+  ),
+
+  CRC_significant = c(
+    sum(
+      crc_mssh_vs_msih$significant
+    ),
+    sum(
+      crc_mssh_vs_mssl$significant
+    )
+  ),
+
+  UCEC_significant = c(
+    sum(
+      ucec_mssh_vs_msih$significant
+    ),
+    sum(
+      ucec_mssh_vs_mssl$significant
+    )
+  ),
+
+  Shared_significant = c(
+    length(
+      intersect(
+        crc_mssh_vs_msih$
+          pre_miRNA[
+            crc_mssh_vs_msih$
+              significant
+          ],
+
+        ucec_mssh_vs_msih$
+          pre_miRNA[
+            ucec_mssh_vs_msih$
+              significant
+          ]
+      )
+    ),
+
+    length(
+      intersect(
+        crc_mssh_vs_mssl$
+          pre_miRNA[
+            crc_mssh_vs_mssl$
+              significant
+          ],
+
+        ucec_mssh_vs_mssl$
+          pre_miRNA[
+            ucec_mssh_vs_mssl$
+              significant
+          ]
+      )
+    )
+  )
+)
+
+write.csv(
+  overlap_summary,
+  file.path(
+    params$output_root,
+    "CRC_UCEC_significant_pre_miRNA_overlap_summary.csv"
+  ),
+  row.names = FALSE
+)
+
+knitr::kable(
+  overlap_summary,
+  caption = "Overlap of significant pre-miRNAs between CRC and UCEC."
+)
+```
+
+```{r}
+create_shared_table <- function(
+    crc_table,
+    ucec_table,
+    comparison_name
+) {
+  crc_sig <- crc_table %>%
+    filter(significant) %>%
+    select(
+      pre_miRNA,
+      CRC_logFC =
+        MSS_TMB_H_logFC,
+      CRC_FDR = FDR,
+      CRC_direction =
+        direction
+    )
+
+  ucec_sig <- ucec_table %>%
+    filter(significant) %>%
+    select(
+      pre_miRNA,
+      UCEC_logFC =
+        MSS_TMB_H_logFC,
+      UCEC_FDR = FDR,
+      UCEC_direction =
+        direction
+    )
+
+  inner_join(
+    crc_sig,
+    ucec_sig,
+    by = "pre_miRNA"
+  ) %>%
+    mutate(
+      Comparison =
+        comparison_name,
+
+      Direction_consistent =
+        CRC_direction ==
+        UCEC_direction,
+
+      .before = 1
+    ) %>%
+    arrange(
+      desc(Direction_consistent),
+      CRC_FDR,
+      UCEC_FDR
+    )
+}
+
+shared_msih <- create_shared_table(
+  crc_mssh_vs_msih,
+  ucec_mssh_vs_msih,
+  "MSS/TMB-H vs MSI-H"
+)
+
+shared_mssl <- create_shared_table(
+  crc_mssh_vs_mssl,
+  ucec_mssh_vs_mssl,
+  "MSS/TMB-H vs MSS/TMB-L"
+)
+
+write.csv(
+  shared_msih,
+  file.path(
+    params$output_root,
+    "shared_pre_miRNAs_MSS_TMB_H_vs_MSI_H_CRC_UCEC.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  shared_mssl,
+  file.path(
+    params$output_root,
+    "shared_pre_miRNAs_MSS_TMB_H_vs_MSS_TMB_L_CRC_UCEC.csv"
+  ),
+  row.names = FALSE
+)
+```
+
+```{r}
+generated_files <- list.files(
+  c(
+    params$output_root,
+    params$figure_root
+  ),
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+cat(
+  paste(
+    generated_files,
+    collapse = "\n"
+  )
+)
+```
+
+```{r}
+sessionInfo()
+```

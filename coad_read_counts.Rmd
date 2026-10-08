@@ -1,0 +1,102 @@
+```{r}
+library(data.table)
+library(dplyr)
+library(stringr)
+library(tibble)
+library(AnnotationDbi)
+library(org.Hs.eg.db)   
+```
+
+```{r}
+short_barcode <- function(x) {
+  
+  sapply(strsplit(x, "-"), function(v) paste(v[seq_len(min(4, length(v)))], collapse="-"))
+}
+
+is_tcga_colnames <- function(nms) any(startsWith(nms, "TCGA-"))
+
+read_counts_generic <- function(path) {
+  mat <- fread(path) |> as.data.frame()
+  
+  if(!any(duplicated(mat[[1]]))) {
+    rownames(mat) <- mat[[1]]
+    mat[[1]] <- NULL
+  }
+  as.matrix(mat)
+}
+
+
+coad <- read_counts_generic("data/coad/count.csv")
+if(!is_tcga_colnames(colnames(coad)) && is_tcga_colnames(rownames(coad))) {
+  coad <- t(coad)
+}
+
+colnames(coad) <- short_barcode(colnames(coad))
+coad <- as.matrix(coad)
+storage.mode(coad) <- "integer"
+
+
+read_mat <- read_counts_generic("data/read/count.csv")
+
+colnames(read_mat) <- short_barcode(colnames(read_mat))
+
+
+ens_ids <- sub("\\.\\d+$", "", rownames(read_mat))
+
+
+map <- AnnotationDbi::select(org.Hs.eg.db,
+                              keys = unique(ens_ids),
+                              keytype = "ENSEMBL",
+                              columns = "SYMBOL")
+
+
+map <- map[!duplicated(map$ENSEMBL), ]
+
+
+sym <- map$SYMBOL[match(ens_ids, map$ENSEMBL)]
+
+keep <- !is.na(sym) & sym != ""
+read_with_sym <- read_mat[keep, , drop = FALSE]
+sym_keep <- sym[keep]
+
+
+
+storage.mode(read_with_sym) <- "numeric"
+
+read_sym_sum <- rowsum(read_with_sym, group = sym_keep, reorder = FALSE)
+storage.mode(read_sym_sum) <- "integer"
+
+
+
+pad_rows_to <- function(mat, all_genes) {
+  out <- matrix(0L, nrow = length(all_genes), ncol = ncol(mat),
+                dimnames = list(all_genes, colnames(mat)))
+  common <- intersect(all_genes, rownames(mat))
+  out[common, ] <- mat[common, , drop = FALSE]
+  storage.mode(out) <- "integer"
+  out
+}
+
+
+all_genes <- union(rownames(coad), rownames(read_sym_sum))
+
+coad_full <- pad_rows_to(coad, all_genes)          
+read_full <- pad_rows_to(read_sym_sum, all_genes)
+
+counts_merged <- cbind(coad_full, read_full)
+storage.mode(counts_merged) <- "integer"
+
+
+nz <- rowSums(counts_merged) > 0
+counts_merged <- counts_merged[nz, , drop = FALSE]
+
+
+dir.create("data/prepared", showWarnings = FALSE)
+write.csv(counts_merged, file = "data/prepared/counts_coad_read_HUGO_shortbarcodes.csv", quote = FALSE)
+message("Saved: data/prepared/counts_coad_read_HUGO_shortbarcodes.csv  | ",
+        nrow(counts_merged), " genes × ", ncol(counts_merged), " samples")
+```
+
+```{r}
+as.data.frame(counts_merged)
+```

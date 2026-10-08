@@ -1,0 +1,1058 @@
+```{r}
+required_packages <- c(
+  "dplyr", "tidyr", "tibble", "stringr", "ggplot2",
+  "gprofiler2", "multiMiR", "openxlsx", "svglite", "knitr"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop("Missing packages: ", paste(missing_packages, collapse = ", "))
+}
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(ggplot2)
+library(gprofiler2)
+library(multiMiR)
+library(openxlsx)
+library(svglite)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 10,
+  fig.height = 7
+)
+```
+
+```{r}
+params <- list(
+  original_crc_de_dir =
+    "data/DE_results",
+
+  original_ucec_de_dir =
+    "data/DE_results/ucec_gene_DE",
+
+  crc_mrna_stability_file =
+    "data/DE_results/stability_analysis/combined_primary_bootstrap_LOO_stability.csv",
+
+  ucec_mrna_stability_file =
+    "data/DE_results/ucec_gene_DE/stability_analysis/combined_primary_bootstrap_LOO_stability.csv",
+
+  mrna_stability_flag_column =
+    "bootstrap_robust_effect",
+
+  crc_mirna_primary_dir =
+    "data/DE_results/pre_miRNA/bootstrap_stability/CRC/primary_DE",
+
+  ucec_mirna_primary_dir =
+    "data/DE_results/pre_miRNA/bootstrap_stability/UCEC/primary_DE",
+
+  crc_mirna_stability_file =
+    "data/DE_results/pre_miRNA/bootstrap_stability/CRC/stability_analysis/combined_primary_bootstrap_LOO_pre_miRNA_stability.csv",
+
+  ucec_mirna_stability_file =
+    "data/DE_results/pre_miRNA/bootstrap_stability/UCEC/stability_analysis/combined_primary_bootstrap_LOO_pre_miRNA_stability.csv",
+
+  mirna_stability_flag_column =
+    "bootstrap_stable",
+
+  output_root =
+    "bootstrap_validated_downstream_analysis/shared_6_miRNA_pathway_analysis",
+
+  contrast =
+    "MSS_TMB_H_vs_MSS_TMB_L",
+
+  expected_shared_mirna_count = 6L,
+  fdr_cutoff = 0.05,
+  logfc_cutoff = 1,
+
+  run_multimir = TRUE,
+  force_multimir_query = FALSE,
+  run_gprofiler = TRUE,
+
+  organism = "hsapiens",
+  enrichment_sources = c("GO:BP", "REAC", "WP", "CORUM"),
+  domain_scope = "custom_annotated",
+  minimum_query_size = 3L,
+  top_terms_per_source = 10L
+)
+
+table_dir <- file.path(params$output_root, "tables")
+multimir_dir <- file.path(params$output_root, "multiMiR")
+enrichment_dir <- file.path(params$output_root, "enrichment")
+plot_dir <- file.path(params$output_root, "figures")
+
+for (d in c(params$output_root, table_dir, multimir_dir, enrichment_dir, plot_dir)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+```{r}
+as_flag <- function(x) {
+  if (is.logical(x)) return(replace(x, is.na(x), FALSE))
+  if (is.numeric(x)) return(!is.na(x) & x != 0)
+
+  tolower(trimws(as.character(x))) %in%
+    c("true", "t", "1", "yes", "y")
+}
+
+canonical_contrast <- function(x) {
+  x %>%
+    as.character() %>%
+    str_replace_all("[^A-Za-z0-9]+", "_") %>%
+    str_replace_all("_+", "_") %>%
+    str_remove_all("^_|_$")
+}
+
+find_column <- function(data, candidates, description) {
+  found <- candidates[candidates %in% names(data)]
+
+  if (length(found) == 0) {
+    stop(
+      "Could not identify ", description,
+      ". Available columns: ", paste(names(data), collapse = ", ")
+    )
+  }
+
+  found[1]
+}
+
+flatten_list_columns <- function(data) {
+  list_columns <- names(data)[vapply(data, is.list, logical(1))]
+
+  if (length(list_columns) == 0) return(data)
+
+  data %>%
+    mutate(
+      across(
+        all_of(list_columns),
+        ~ vapply(
+          .x,
+          function(value) {
+            if (is.null(value) || length(value) == 0) return("")
+            paste(unlist(value, recursive = TRUE, use.names = FALSE), collapse = "; ")
+          },
+          character(1)
+        )
+      )
+    )
+}
+```
+
+```{r}
+read_primary_de <- function(file, molecule, dataset) {
+  identifier <- if (molecule == "mRNA") "Gene" else "pre_miRNA"
+
+  data <- read.csv(
+    file,
+    row.names = 1,
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  ) %>%
+    rownames_to_column(identifier) %>%
+    as_tibble()
+
+  required <- c("logFC", "PValue", "FDR")
+  missing <- setdiff(required, names(data))
+
+  if (length(missing) > 0) {
+    stop(file, " is missing: ", paste(missing, collapse = ", "))
+  }
+
+  data[[identifier]] <- trimws(as.character(data[[identifier]]))
+
+  data %>%
+    mutate(
+      Dataset = dataset,
+      Contrast = params$contrast,
+      logFC = as.numeric(logFC),
+      PValue = as.numeric(PValue),
+      FDR = as.numeric(FDR),
+      .before = 1
+    )
+}
+
+read_stability <- function(
+    file,
+    molecule,
+    flag_column
+) {
+  data <- read.csv(
+    file,
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  ) %>%
+    tibble::as_tibble()
+
+  identifier_candidates <- if (molecule == "mRNA") {
+    c(
+      "Gene",
+      "gene",
+      "gene_symbol",
+      "symbol",
+      "GeneSymbol",
+      "X",
+      "...1"
+    )
+  } else {
+    c(
+      "pre_miRNA",
+      "pre_mirna",
+      "miRNA",
+      "mirna",
+      "Gene",
+      "X",
+      "...1"
+    )
+  }
+
+  identifier <- if (molecule == "mRNA") {
+    "Gene"
+  } else {
+    "pre_miRNA"
+  }
+
+  identifier_column <- find_column(
+    data,
+    identifier_candidates,
+    "feature identifier"
+  )
+
+  names(data)[
+    names(data) == identifier_column
+  ] <- identifier
+
+  contrast_column <- find_column(
+    data,
+    c(
+      "Contrast",
+      "contrast",
+      "Comparison",
+      "comparison"
+    ),
+    "contrast column"
+  )
+
+  names(data)[
+    names(data) == contrast_column
+  ] <- "Contrast"
+
+  if (!flag_column %in% names(data)) {
+    stop(
+      "Stability flag ",
+      flag_column,
+      " not found in ",
+      file,
+      ". Available columns: ",
+      paste(
+        names(data),
+        collapse = ", "
+      )
+    )
+  }
+
+  data[[identifier]] <- trimws(
+    as.character(
+      data[[identifier]]
+    )
+  )
+
+  data %>%
+    dplyr::mutate(
+      Contrast = canonical_contrast(
+        Contrast
+      ),
+
+      selected_stability_flag = as_flag(
+        .data[[flag_column]]
+      )
+    ) %>%
+    dplyr::filter(
+      Contrast ==
+        canonical_contrast(
+          params$contrast
+        )
+    ) %>%
+    dplyr::select(
+      dplyr::all_of(identifier),
+      Contrast,
+      selected_stability_flag
+    ) %>%
+    dplyr::distinct()
+}
+
+build_validated_table <- function(
+    dataset,
+    molecule,
+    primary_file,
+    stability_file,
+    flag_column
+) {
+  identifier <- if (molecule == "mRNA") {
+    "Gene"
+  } else {
+    "pre_miRNA"
+  }
+
+  primary <- read_primary_de(
+    primary_file,
+    molecule,
+    dataset
+  )
+
+  stability <- read_stability(
+    stability_file,
+    molecule,
+    flag_column
+  )
+
+  joined <- primary %>%
+    dplyr::left_join(
+      stability,
+      by = c(
+        identifier,
+        "Contrast"
+      )
+    ) %>%
+    dplyr::mutate(
+      bootstrap_stable = dplyr::coalesce(
+        selected_stability_flag,
+        FALSE
+      ),
+
+      primary_significant =
+        !is.na(FDR) &
+        FDR <= params$fdr_cutoff &
+        !is.na(logFC) &
+        abs(logFC) >= params$logfc_cutoff,
+
+      validated_significant =
+        primary_significant &
+        bootstrap_stable,
+
+      Direction = dplyr::case_when(
+        logFC > 0 ~
+          "Up in MSS/TMB-H",
+
+        logFC < 0 ~
+          "Down in MSS/TMB-H",
+
+        TRUE ~
+          "No direction"
+      )
+    )
+
+  list(
+    all = joined,
+
+    validated = joined %>%
+      dplyr::filter(
+        validated_significant
+      )
+  )
+}
+```
+
+```{r}
+input_files <- list(
+  CRC = list(
+    mRNA_primary = file.path(
+      params$original_crc_de_dir,
+      paste0(params$contrast, ".csv")
+    ),
+    mRNA_stability = params$crc_mrna_stability_file,
+    pre_miRNA_primary = file.path(
+      params$crc_mirna_primary_dir,
+      paste0(params$contrast, ".csv")
+    ),
+    pre_miRNA_stability = params$crc_mirna_stability_file
+  ),
+
+  UCEC = list(
+    mRNA_primary = file.path(
+      params$original_ucec_de_dir,
+      paste0(params$contrast, ".csv")
+    ),
+    mRNA_stability = params$ucec_mrna_stability_file,
+    pre_miRNA_primary = file.path(
+      params$ucec_mirna_primary_dir,
+      paste0(params$contrast, ".csv")
+    ),
+    pre_miRNA_stability = params$ucec_mirna_stability_file
+  )
+)
+
+all_input_files <- unlist(input_files)
+missing_files <- all_input_files[!file.exists(all_input_files)]
+
+if (length(missing_files) > 0) {
+  stop("Missing files:\n", paste(missing_files, collapse = "\n"))
+}
+
+analysis_data <- list()
+
+for (dataset_name in c("CRC", "UCEC")) {
+  files <- input_files[[dataset_name]]
+
+  analysis_data[[dataset_name]] <- list(
+    mRNA = build_validated_table(
+      dataset_name,
+      "mRNA",
+      files$mRNA_primary,
+      files$mRNA_stability,
+      params$mrna_stability_flag_column
+    ),
+
+    pre_miRNA = build_validated_table(
+      dataset_name,
+      "pre_miRNA",
+      files$pre_miRNA_primary,
+      files$pre_miRNA_stability,
+      params$mirna_stability_flag_column
+    )
+  )
+}
+```
+
+```{r}
+shared_mirna <- inner_join(
+  analysis_data$CRC$pre_miRNA$validated %>%
+    dplyr::select(
+      pre_miRNA,
+      CRC_logFC = logFC,
+      CRC_FDR = FDR
+    ),
+
+  analysis_data$UCEC$pre_miRNA$validated %>%
+    dplyr::select(
+      pre_miRNA,
+      UCEC_logFC = logFC,
+      UCEC_FDR = FDR
+    ),
+
+  by = "pre_miRNA"
+) %>%
+  mutate(
+    Direction_consistent =
+      sign(CRC_logFC) == sign(UCEC_logFC),
+
+    mean_logFC =
+      rowMeans(cbind(CRC_logFC, UCEC_logFC)),
+
+    Direction = case_when(
+      mean_logFC > 0 ~ "Up in MSS/TMB-H",
+      mean_logFC < 0 ~ "Down in MSS/TMB-H",
+      TRUE ~ "No direction"
+    )
+  ) %>%
+  filter(Direction_consistent) %>%
+  distinct(pre_miRNA, .keep_all = TRUE) %>%
+  arrange(pre_miRNA)
+
+n_shared <- n_distinct(shared_mirna$pre_miRNA)
+
+if (n_shared != params$expected_shared_mirna_count) {
+  stop(
+    "Expected ", params$expected_shared_mirna_count,
+    " shared bootstrap-validated pre-miRNAs, but found ", n_shared, "."
+  )
+}
+
+write.csv(
+  shared_mirna,
+  file.path(table_dir, "six_shared_bootstrap_validated_pre_miRNAs.csv"),
+  row.names = FALSE
+)
+
+knitr::kable(
+  shared_mirna,
+  caption = "Six shared bootstrap-validated pre-miRNAs."
+)
+```
+
+```{r}
+shared_mrna <- inner_join(
+  analysis_data$CRC$mRNA$validated %>%
+    transmute(
+      gene_key = toupper(Gene),
+      CRC_Gene = Gene,
+      CRC_logFC = logFC,
+      CRC_FDR = FDR
+    ),
+
+  analysis_data$UCEC$mRNA$validated %>%
+    transmute(
+      gene_key = toupper(Gene),
+      UCEC_Gene = Gene,
+      UCEC_logFC = logFC,
+      UCEC_FDR = FDR
+    ),
+
+  by = "gene_key"
+) %>%
+  mutate(
+    Direction_consistent =
+      sign(CRC_logFC) == sign(UCEC_logFC),
+
+    Gene = coalesce(CRC_Gene, UCEC_Gene),
+
+    mean_logFC =
+      rowMeans(cbind(CRC_logFC, UCEC_logFC)),
+
+    Direction = case_when(
+      mean_logFC > 0 ~ "Up in MSS/TMB-H",
+      mean_logFC < 0 ~ "Down in MSS/TMB-H",
+      TRUE ~ "No direction"
+    )
+  ) %>%
+  filter(Direction_consistent) %>%
+  distinct(gene_key, .keep_all = TRUE)
+
+write.csv(
+  shared_mrna,
+  file.path(table_dir, "shared_bootstrap_validated_direction_consistent_DEGs.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+make_mature_candidates <- function(precursors) {
+  bind_rows(
+    lapply(
+      unique(precursors),
+      function(precursor) {
+        mature_base <- precursor %>%
+          trimws() %>%
+          str_replace("^hsa-mir", "hsa-miR")
+
+        mature <- if (str_detect(mature_base, "-(3p|5p)$")) {
+          mature_base
+        } else {
+          c(
+            paste0(mature_base, "-5p"),
+            paste0(mature_base, "-3p")
+          )
+        }
+
+        tibble(
+          pre_miRNA = precursor,
+          mature_query = mature
+        )
+      }
+    )
+  ) %>%
+    distinct()
+}
+
+mature_candidates <- make_mature_candidates(
+  shared_mirna$pre_miRNA
+)
+
+write.csv(
+  mature_candidates,
+  file.path(multimir_dir, "six_shared_pre_miRNA_mature_candidates.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+query_one_mirna <- function(pre_miRNA, mature_query) {
+  message("Querying multiMiR: ", mature_query)
+
+  result <- tryCatch(
+    multiMiR::get_multimir(
+      mirna = mature_query,
+      table = "validated",
+      summary = TRUE
+    ),
+    error = function(e) {
+      message("Failed: ", mature_query, " | ", conditionMessage(e))
+      NULL
+    }
+  )
+
+  if (
+    is.null(result) ||
+    is.null(result@data) ||
+    nrow(result@data) == 0
+  ) {
+    return(tibble())
+  }
+
+  result@data %>%
+    as_tibble() %>%
+    mutate(
+      pre_miRNA = pre_miRNA,
+      mature_query = mature_query,
+      .before = 1
+    )
+}
+
+multimir_cache <- file.path(
+  multimir_dir,
+  "validated_multiMiR_targets_of_six_shared_pre_miRNAs.csv"
+)
+
+if (file.exists(multimir_cache) && !params$force_multimir_query) {
+  multimir_raw <- read.csv(
+    multimir_cache,
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  ) %>%
+    as_tibble()
+} else {
+  if (!params$run_multimir) {
+    stop("multiMiR cache missing and run_multimir is FALSE.")
+  }
+
+  multimir_raw <- bind_rows(
+    lapply(
+      seq_len(nrow(mature_candidates)),
+      function(i) {
+        query_one_mirna(
+          mature_candidates$pre_miRNA[i],
+          mature_candidates$mature_query[i]
+        )
+      }
+    )
+  )
+
+  write.csv(
+    flatten_list_columns(multimir_raw),
+    multimir_cache,
+    row.names = FALSE
+  )
+}
+
+if (!"target_symbol" %in% names(multimir_raw)) {
+  stop("multiMiR output does not contain target_symbol.")
+}
+
+multimir_edges <- multimir_raw %>%
+  mutate(
+    pre_miRNA = trimws(as.character(pre_miRNA)),
+    target_symbol_multiMiR = trimws(as.character(target_symbol)),
+    gene_key = toupper(target_symbol_multiMiR)
+  ) %>%
+  filter(
+    pre_miRNA %in% shared_mirna$pre_miRNA,
+    !is.na(target_symbol_multiMiR),
+    nzchar(target_symbol_multiMiR)
+  ) %>%
+  distinct()
+```
+
+```{r}
+if ("target_symbol_multiMiR" %in% names(multimir_edges)) {
+  multimir_edges_clean <- multimir_edges %>%
+    dplyr::mutate(
+      target_symbol_multiMiR =
+        trimws(as.character(target_symbol_multiMiR)),
+      gene_key =
+        toupper(target_symbol_multiMiR)
+    )
+} else {
+  multimir_edges_clean <- multimir_edges %>%
+    dplyr::mutate(
+      target_symbol_multiMiR =
+        trimws(as.character(target_symbol)),
+      gene_key =
+        toupper(target_symbol_multiMiR)
+    )
+}
+
+multimir_edges_clean <- multimir_edges_clean %>%
+  dplyr::filter(
+    !is.na(target_symbol_multiMiR),
+    nzchar(target_symbol_multiMiR),
+    pre_miRNA %in% shared_mirna$pre_miRNA
+  ) %>%
+  dplyr::distinct()
+
+shared_target_interactions <- multimir_edges_clean %>%
+  dplyr::inner_join(
+    shared_mirna %>%
+      dplyr::transmute(
+        pre_miRNA,
+
+        miRNA_CRC_logFC =
+          CRC_miRNA_logFC,
+
+        miRNA_UCEC_logFC =
+          UCEC_miRNA_logFC,
+
+        miRNA_CRC_FDR =
+          CRC_miRNA_FDR,
+
+        miRNA_UCEC_FDR =
+          UCEC_miRNA_FDR,
+
+        miRNA_Direction
+      ),
+    by = "pre_miRNA"
+  ) %>%
+  dplyr::inner_join(
+    shared_mrna %>%
+      dplyr::transmute(
+        gene_key = target_key,
+
+        target_symbol_DE =
+          target_symbol,
+
+        gene_CRC_logFC =
+          CRC_gene_logFC,
+
+        gene_UCEC_logFC =
+          UCEC_gene_logFC,
+
+        gene_CRC_FDR =
+          CRC_gene_FDR,
+
+        gene_UCEC_FDR =
+          UCEC_gene_FDR,
+
+        gene_Direction
+      ),
+    by = "gene_key"
+  ) %>%
+  dplyr::mutate(
+    target_symbol = dplyr::coalesce(
+      target_symbol_DE,
+      target_symbol_multiMiR
+    ),
+
+    inverse_direction = dplyr::case_when(
+      miRNA_Direction == "Up in MSS/TMB-H" &
+        gene_Direction == "Down in MSS/TMB-H" ~ TRUE,
+
+      miRNA_Direction == "Down in MSS/TMB-H" &
+        gene_Direction == "Up in MSS/TMB-H" ~ TRUE,
+
+      TRUE ~ FALSE
+    )
+  ) %>%
+  dplyr::arrange(
+    target_symbol,
+    pre_miRNA,
+    mature_mirna_id,
+    database
+  )
+
+shared_target_genes <- shared_target_interactions %>%
+  dplyr::distinct(
+    target_symbol,
+    gene_Direction,
+    gene_CRC_logFC,
+    gene_UCEC_logFC,
+    gene_CRC_FDR,
+    gene_UCEC_FDR
+  ) %>%
+  dplyr::arrange(
+    gene_Direction,
+    target_symbol
+  )
+
+write.csv(
+  flatten_list_columns(shared_target_interactions),
+  file.path(
+    table_dir,
+    "validated_interactions_of_six_shared_pre_miRNAs_with_shared_DEGs.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  shared_target_genes,
+  file.path(
+    table_dir,
+    "genes_connected_to_six_shared_pre_miRNAs.csv"
+  ),
+  row.names = FALSE
+)
+
+count_summary <- tibble(
+  Shared_pre_miRNAs =
+    n_distinct(shared_mirna$pre_miRNA),
+
+  Validated_target_interactions =
+    nrow(shared_target_interactions),
+
+  Unique_shared_target_DEGs =
+    n_distinct(shared_target_genes$target_symbol),
+
+  Upregulated_target_DEGs =
+    sum(shared_target_genes$gene_Direction == "Up in MSS/TMB-H"),
+
+  Downregulated_target_DEGs =
+    sum(shared_target_genes$gene_Direction == "Down in MSS/TMB-H")
+)
+
+write.csv(
+  count_summary,
+  file.path(table_dir, "target_count_summary.csv"),
+  row.names = FALSE
+)
+
+knitr::kable(
+  count_summary,
+  caption = "Genes connected to the six shared pre-miRNAs."
+)
+```
+
+```{r}
+crc_tested <- analysis_data$CRC$mRNA$all %>%
+  transmute(
+    gene_key = toupper(Gene),
+    CRC_Gene = Gene
+  )
+
+ucec_tested <- analysis_data$UCEC$mRNA$all %>%
+  transmute(
+    gene_key = toupper(Gene),
+    UCEC_Gene = Gene
+  )
+
+shared_background <- inner_join(
+  crc_tested,
+  ucec_tested,
+  by = "gene_key"
+) %>%
+  transmute(
+    Gene = coalesce(CRC_Gene, UCEC_Gene)
+  ) %>%
+  pull(Gene) %>%
+  unique()
+
+enrichment_genes <- intersect(
+  unique(shared_target_genes$target_symbol),
+  shared_background
+)
+
+if (length(enrichment_genes) < params$minimum_query_size) {
+  stop(
+    "Only ", length(enrichment_genes),
+    " target genes were available for enrichment."
+  )
+}
+
+write.csv(
+  data.frame(Gene = enrichment_genes),
+  file.path(enrichment_dir, "enrichment_query_genes.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  data.frame(Gene = shared_background),
+  file.path(enrichment_dir, "shared_edgeR_background_genes.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+run_enrichment <- function(correction_method) {
+  if (!params$run_gprofiler) return(tibble())
+
+  result <- gprofiler2::gost(
+    query = enrichment_genes,
+    organism = params$organism,
+    ordered_query = FALSE,
+    multi_query = FALSE,
+    significant = FALSE,
+    exclude_iea = FALSE,
+    measure_underrepresentation = FALSE,
+    evcodes = TRUE,
+    user_threshold = 1,
+    correction_method = correction_method,
+    domain_scope = params$domain_scope,
+    custom_bg = shared_background,
+    sources = params$enrichment_sources,
+    highlight = FALSE
+  )
+
+  if (
+    is.null(result) ||
+    is.null(result$result) ||
+    nrow(result$result) == 0
+  ) {
+    return(tibble())
+  }
+
+  result$result %>%
+    as_tibble() %>%
+    mutate(
+      Query = "Genes connected to six shared pre-miRNAs",
+      Correction = correction_method,
+      Significant = p_value <= params$fdr_cutoff,
+      .before = 1
+    )
+}
+
+enrichment_gscs <- run_enrichment("g_SCS")
+enrichment_fdr <- run_enrichment("fdr")
+
+enrichment_results <- bind_rows(
+  enrichment_gscs,
+  enrichment_fdr
+)
+
+enrichment_export <- flatten_list_columns(
+  enrichment_results
+)
+
+write.csv(
+  enrichment_export,
+  file.path(enrichment_dir, "all_enrichment_results.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  enrichment_export %>% filter(Significant),
+  file.path(enrichment_dir, "significant_enrichment_results.csv"),
+  row.names = FALSE
+)
+```
+
+```{r}
+plot_enrichment <- function(
+    data,
+    correction,
+    title,
+    output_file
+) {
+  plot_data <- data %>%
+    filter(
+      Correction == correction,
+      Significant
+    ) %>%
+    group_by(source) %>%
+    arrange(p_value, .by_group = TRUE) %>%
+    slice_head(n = params$top_terms_per_source) %>%
+    ungroup() %>%
+    mutate(
+      neglog10_p = -log10(pmax(p_value, 1e-300)),
+      term_label = paste0(
+        source,
+        ": ",
+        str_trunc(term_name, 75)
+      )
+    ) %>%
+    arrange(p_value) %>%
+    mutate(
+      term_label = factor(
+        term_label,
+        levels = rev(unique(term_label))
+      )
+    )
+
+  if (nrow(plot_data) == 0) {
+    message("No significant ", correction, " enrichment terms.")
+    return(invisible(NULL))
+  }
+
+  p <- ggplot(
+    plot_data,
+    aes(neglog10_p, term_label)
+  ) +
+    geom_point(
+      aes(
+        size = intersection_size,
+        color = neglog10_p
+      ),
+      alpha = 0.9
+    ) +
+    labs(
+      title = title,
+      subtitle =
+        "Shared bootstrap-validated DEG targets of six shared pre-miRNAs",
+      x = expression(-log[10]("adjusted p-value")),
+      y = NULL,
+      size = "Target genes",
+      color = expression(-log[10]("adjusted p"))
+    ) +
+    theme_classic(base_size = 11) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5)
+    )
+
+  ggsave(
+    output_file,
+    p,
+    width = 10,
+    height = max(6, 0.28 * nrow(plot_data)),
+    device = "svg",
+    limitsize = FALSE
+  )
+
+  invisible(p)
+}
+```
+
+```{r}
+plot_enrichment(
+  enrichment_results,
+  "g_SCS",
+  "Functional enrichment of genes connected to six shared pre-miRNAs",
+  file.path(plot_dir, "enrichment_gSCS_six_shared_pre_miRNAs.svg")
+)
+
+plot_enrichment(
+  enrichment_results,
+  "fdr",
+  "Functional enrichment sensitivity analysis",
+  file.path(plot_dir, "enrichment_FDR_six_shared_pre_miRNAs.svg")
+)
+```
+
+```{r}
+workbook_file <- file.path(
+  params$output_root,
+  "six_shared_pre_miRNA_target_pathway_analysis.xlsx"
+)
+
+openxlsx::write.xlsx(
+  list(
+    Six_shared_pre_miRNAs =
+      shared_mirna,
+
+    Shared_bootstrap_DEGs =
+      shared_mrna,
+
+    Mature_candidates =
+      mature_candidates,
+
+    Validated_interactions =
+      flatten_list_columns(shared_target_interactions),
+
+    Unique_target_DEGs =
+      shared_target_genes,
+
+    Count_summary =
+      count_summary,
+
+    Enrichment_query =
+      data.frame(Gene = enrichment_genes),
+
+    Enrichment_gSCS =
+      flatten_list_columns(enrichment_gscs),
+
+    Enrichment_FDR =
+      flatten_list_columns(enrichment_fdr)
+  ),
+  file = workbook_file,
+  overwrite = TRUE
+)
+
+workbook_file
+```
+
+```{r}
+sessionInfo()
+```

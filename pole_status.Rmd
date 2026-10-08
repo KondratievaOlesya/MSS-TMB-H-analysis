@@ -1,0 +1,3080 @@
+```{r}
+suppressPackageStartupMessages({
+    library(TCGAbiolinks)
+    library(dplyr)
+    library(tidyr)
+    library(stringr)
+    library(purrr)
+    library(readr)
+    library(tibble)
+})
+
+
+
+
+
+projects <- c(
+    "TCGA-COAD",
+    "TCGA-READ",
+    "TCGA-UCEC"
+)
+
+data_dir <- "data"
+output_dir <- "pole_pold1_results"
+clinvar_dir <- "clinvar"
+
+dir.create(data_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(clinvar_dir, recursive = TRUE, showWarnings = FALSE)
+
+maf_cache <- file.path(
+    output_dir,
+    "tcga_coad_read_ucec_masked_maf.rds"
+)
+
+
+
+
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+    install.packages("BiocManager")
+}
+
+bioc_packages <- c(
+    "VariantAnnotation",
+    "GenomicRanges",
+    "GenomeInfoDb",
+    "Rsamtools"
+)
+
+missing_bioc_packages <- bioc_packages[
+    !vapply(
+        bioc_packages,
+        requireNamespace,
+        logical(1),
+        quietly = TRUE
+    )
+]
+
+if (length(missing_bioc_packages) > 0) {
+    BiocManager::install(
+        missing_bioc_packages,
+        ask = FALSE,
+        update = FALSE
+    )
+}
+
+suppressPackageStartupMessages({
+    library(VariantAnnotation)
+    library(GenomicRanges)
+    library(GenomeInfoDb)
+    library(Rsamtools)
+})
+
+
+
+
+
+download_tcga_maf <- function(project, data_dir = "data") {
+
+    message("Processing ", project)
+
+    project_dir <- file.path(data_dir, project)
+    dir.create(
+        project_dir,
+        recursive = TRUE,
+        showWarnings = FALSE
+    )
+
+    query <- GDCquery(
+        project = project,
+        data.category = "Simple Nucleotide Variation",
+        data.type = "Masked Somatic Mutation",
+        workflow.type =
+            "Aliquot Ensemble Somatic Variant Merging and Masking",
+        access = "open"
+    )
+
+    GDCdownload(
+        query,
+        method = "api",
+        directory = project_dir,
+        files.per.chunk = 10
+    )
+
+    maf <- GDCprepare(
+        query,
+        directory = project_dir
+    )
+
+    maf <- as.data.frame(maf)
+    maf$TCGA_project <- project
+
+    message(
+        project,
+        ": loaded ",
+        format(nrow(maf), big.mark = ","),
+        " mutation records"
+    )
+
+    maf
+}
+
+
+add_missing_column <- function(data, column, value = NA) {
+
+    if (!column %in% colnames(data)) {
+        data[[column]] <- value
+    }
+
+    data
+}
+
+
+safe_numeric <- function(x) {
+    suppressWarnings(as.numeric(as.character(x)))
+}
+
+
+extract_aa_position <- function(hgvsp_short, hgvsp) {
+
+    protein_change <- dplyr::coalesce(
+        as.character(hgvsp_short),
+        as.character(hgvsp)
+    )
+
+    position <- stringr::str_match(
+        protein_change,
+        "p\\.[A-Za-z*]+([0-9]+)"
+    )[, 2]
+
+    suppressWarnings(as.integer(position))
+}
+
+
+collapse_info_value <- function(x) {
+
+    if (length(x) == 0 || all(is.na(x))) {
+        return(NA_character_)
+    }
+
+    paste(
+        unique(as.character(x[!is.na(x)])),
+        collapse = ";"
+    )
+}
+
+
+
+
+
+if (file.exists(maf_cache) && file.info(maf_cache)$size > 0) {
+
+    message("Reading cached TCGA MAF object: ", maf_cache)
+    maf_all <- readRDS(maf_cache)
+
+} else {
+
+    maf_list <- setNames(
+        lapply(
+            projects,
+            download_tcga_maf,
+            data_dir = data_dir
+        ),
+        projects
+    )
+
+    maf_all <- bind_rows(maf_list)
+
+    saveRDS(
+        maf_all,
+        maf_cache
+    )
+}
+
+message(
+    "Combined MAF contains ",
+    format(nrow(maf_all), big.mark = ","),
+    " mutation records"
+)
+
+
+
+
+
+required_columns <- c(
+    "Hugo_Symbol",
+    "Chromosome",
+    "Start_Position",
+    "End_Position",
+    "Reference_Allele",
+    "Tumor_Seq_Allele2",
+    "Variant_Classification",
+    "Tumor_Sample_Barcode",
+    "TCGA_project"
+)
+
+missing_required <- setdiff(
+    required_columns,
+    colnames(maf_all)
+)
+
+if (length(missing_required) > 0) {
+    stop(
+        "Required MAF columns are missing: ",
+        paste(missing_required, collapse = ", ")
+    )
+}
+
+optional_columns <- c(
+    "Tumor_Seq_Allele1",
+    "Variant_Type",
+    "Matched_Norm_Sample_Barcode",
+    "HGVSc",
+    "HGVSp",
+    "HGVSp_Short",
+    "Transcript_ID",
+    "Consequence",
+    "IMPACT",
+    "FILTER",
+    "t_alt_count",
+    "t_ref_count",
+    "n_alt_count",
+    "n_ref_count",
+    "Existing_variation",
+    "CLIN_SIG",
+    "SIFT",
+    "PolyPhen"
+)
+
+for (column in optional_columns) {
+    maf_all <- add_missing_column(
+        maf_all,
+        column,
+        NA
+    )
+}
+
+
+
+
+
+all_patients <- maf_all %>%
+    transmute(
+        TCGA_project,
+        Tumor_Sample_Barcode =
+            as.character(Tumor_Sample_Barcode),
+        patient_id =
+            substr(as.character(Tumor_Sample_Barcode), 1, 12),
+        cancer_type = case_when(
+            TCGA_project %in% c("TCGA-COAD", "TCGA-READ") ~
+                "CRC",
+            TCGA_project == "TCGA-UCEC" ~
+                "UCEC",
+            TRUE ~ TCGA_project
+        )
+    ) %>%
+    distinct(
+        TCGA_project,
+        patient_id,
+        .keep_all = TRUE
+    )
+
+
+
+
+
+polymerase_variants <- maf_all %>%
+    filter(
+        Hugo_Symbol %in% c("POLE", "POLD1")
+    ) %>%
+    mutate(
+        Tumor_Sample_Barcode =
+            as.character(Tumor_Sample_Barcode),
+
+        patient_id =
+            substr(Tumor_Sample_Barcode, 1, 12),
+
+        cancer_type = case_when(
+            TCGA_project %in% c("TCGA-COAD", "TCGA-READ") ~
+                "CRC",
+            TCGA_project == "TCGA-UCEC" ~
+                "UCEC",
+            TRUE ~ TCGA_project
+        ),
+
+        Chromosome =
+            str_remove(as.character(Chromosome), "^chr"),
+
+        Start_Position =
+            safe_numeric(Start_Position),
+
+        End_Position =
+            safe_numeric(End_Position),
+
+        Reference_Allele =
+            as.character(Reference_Allele),
+
+        Tumor_Seq_Allele2 =
+            as.character(Tumor_Seq_Allele2),
+
+        t_ref_count =
+            safe_numeric(t_ref_count),
+
+        t_alt_count =
+            safe_numeric(t_alt_count),
+
+        n_ref_count =
+            safe_numeric(n_ref_count),
+
+        n_alt_count =
+            safe_numeric(n_alt_count)
+    ) %>%
+    distinct(
+        TCGA_project,
+        Tumor_Sample_Barcode,
+        Hugo_Symbol,
+        Chromosome,
+        Start_Position,
+        Reference_Allele,
+        Tumor_Seq_Allele2,
+        .keep_all = TRUE
+    )
+
+if (nrow(polymerase_variants) == 0) {
+    stop("No POLE or POLD1 variants were found.")
+}
+
+
+
+
+
+polymerase_variants <- polymerase_variants %>%
+    mutate(
+        tumor_depth = t_ref_count + t_alt_count,
+
+        tumor_vaf = if_else(
+            !is.na(t_alt_count) &
+                !is.na(t_ref_count) &
+                tumor_depth > 0,
+            t_alt_count / tumor_depth,
+            NA_real_
+        ),
+
+        normal_depth = n_ref_count + n_alt_count,
+
+        normal_vaf = if_else(
+            !is.na(n_alt_count) &
+                !is.na(n_ref_count) &
+                normal_depth > 0,
+            n_alt_count / normal_depth,
+            NA_real_
+        ),
+
+        amino_acid_position = extract_aa_position(
+            HGVSp_Short,
+            HGVSp
+        )
+    )
+
+
+
+
+
+
+
+
+polymerase_variants <- polymerase_variants %>%
+    mutate(
+        exonuclease_domain = case_when(
+            Hugo_Symbol == "POLE" &
+                amino_acid_position >= 268 &
+                amino_acid_position <= 471 ~ TRUE,
+
+            Hugo_Symbol == "POLD1" &
+                amino_acid_position >= 304 &
+                amino_acid_position <= 517 ~ TRUE,
+
+            !is.na(amino_acid_position) ~ FALSE,
+
+            TRUE ~ NA
+        ),
+
+        domain_annotation = case_when(
+            exonuclease_domain %in% TRUE ~
+                "Exonuclease domain",
+
+            exonuclease_domain %in% FALSE ~
+                "Outside exonuclease domain",
+
+            TRUE ~
+                "Protein position unavailable"
+        ),
+
+        coding_effect_group = case_when(
+            Variant_Classification %in% c(
+                "Nonsense_Mutation",
+                "Frame_Shift_Del",
+                "Frame_Shift_Ins",
+                "Splice_Site",
+                "Translation_Start_Site"
+            ) ~ "Protein-truncating/splice",
+
+            Variant_Classification %in% c(
+                "Missense_Mutation",
+                "In_Frame_Del",
+                "In_Frame_Ins"
+            ) ~ "Protein-altering",
+
+            Variant_Classification == "Silent" ~
+                "Synonymous",
+
+            TRUE ~
+                "Other"
+        )
+    )
+
+
+
+
+
+variant_recurrence <- polymerase_variants %>%
+    group_by(
+        Hugo_Symbol,
+        Chromosome,
+        Start_Position,
+        Reference_Allele,
+        Tumor_Seq_Allele2,
+        HGVSp_Short
+    ) %>%
+    summarise(
+        n_patients_all_projects =
+            n_distinct(patient_id),
+
+        projects_present =
+            paste(
+                sort(unique(TCGA_project)),
+                collapse = ";"
+            ),
+
+        patient_ids =
+            paste(
+                sort(unique(patient_id)),
+                collapse = ";"
+            ),
+
+        .groups = "drop"
+    )
+
+polymerase_variants <- polymerase_variants %>%
+    left_join(
+        variant_recurrence,
+        by = c(
+            "Hugo_Symbol",
+            "Chromosome",
+            "Start_Position",
+            "Reference_Allele",
+            "Tumor_Seq_Allele2",
+            "HGVSp_Short"
+        )
+    )
+
+
+
+
+
+
+
+
+known_pole_hotspots <- c(
+    "p.P286R",
+    "p.S297F",
+    "p.V411L",
+    "p.L424F",
+    "p.L424V"
+)
+
+polymerase_variants <- polymerase_variants %>%
+    mutate(
+        known_recurrent_pole_hotspot =
+            Hugo_Symbol == "POLE" &
+            HGVSp_Short %in% known_pole_hotspots
+    )
+
+
+
+
+
+clinvar_vcf_gz <- file.path(
+    clinvar_dir,
+    "clinvar_GRCh38.vcf.gz"
+)
+
+clinvar_tbi <- paste0(
+    clinvar_vcf_gz,
+    ".tbi"
+)
+
+clinvar_vcf_url <- paste0(
+    "https://ftp.ncbi.nlm.nih.gov/pub/clinvar/",
+    "vcf_GRCh38/clinvar.vcf.gz"
+)
+
+clinvar_tbi_url <- paste0(
+    "https://ftp.ncbi.nlm.nih.gov/pub/clinvar/",
+    "vcf_GRCh38/clinvar.vcf.gz.tbi"
+)
+
+if (
+    !file.exists(clinvar_vcf_gz) ||
+    file.info(clinvar_vcf_gz)$size == 0
+) {
+    message("Downloading ClinVar GRCh38 VCF")
+
+    download.file(
+        clinvar_vcf_url,
+        destfile = clinvar_vcf_gz,
+        mode = "wb"
+    )
+}
+
+if (
+    !file.exists(clinvar_tbi) ||
+    file.info(clinvar_tbi)$size == 0
+) {
+    message("Downloading ClinVar GRCh38 index")
+
+    download.file(
+        clinvar_tbi_url,
+        destfile = clinvar_tbi,
+        mode = "wb"
+    )
+}
+
+
+
+
+
+clinvar_tabix <- TabixFile(
+    clinvar_vcf_gz,
+    index = clinvar_tbi
+)
+
+clinvar_contigs <- seqnamesTabix(
+    clinvar_tabix
+)
+
+clinvar_uses_chr_prefix <- any(
+    str_detect(clinvar_contigs, "^chr")
+)
+
+regions <- polymerase_variants %>%
+    transmute(
+        chromosome =
+            str_remove(as.character(Chromosome), "^chr"),
+
+        Start_Position =
+            as.integer(Start_Position),
+
+        End_Position =
+            as.integer(End_Position)
+    ) %>%
+    mutate(
+        chromosome = if (clinvar_uses_chr_prefix) {
+            paste0("chr", chromosome)
+        } else {
+            chromosome
+        }
+    ) %>%
+    filter(
+        !is.na(chromosome),
+        !is.na(Start_Position),
+        !is.na(End_Position),
+        chromosome %in% clinvar_contigs
+    ) %>%
+    group_by(chromosome) %>%
+    summarise(
+        start = max(
+            1L,
+            min(Start_Position, na.rm = TRUE) - 1000L
+        ),
+
+        end =
+            max(End_Position, na.rm = TRUE) + 1000L,
+
+        .groups = "drop"
+    )
+
+if (nrow(regions) == 0) {
+    stop(
+        "No TCGA chromosome names matched the ClinVar index. ",
+        "ClinVar contigs begin with: ",
+        paste(head(clinvar_contigs), collapse = ", ")
+    )
+}
+
+regions_gr <- GRanges(
+    seqnames = regions$chromosome,
+    ranges = IRanges(
+        start = regions$start,
+        end = regions$end
+    )
+)
+
+message(
+    "Reading ClinVar regions: ",
+    paste(
+        paste0(
+            regions$chromosome,
+            ":",
+            regions$start,
+            "-",
+            regions$end
+        ),
+        collapse = ", "
+    )
+)
+
+
+
+
+
+clinvar_vcf <- readVcf(
+    clinvar_tabix,
+    genome = "GRCh38",
+    param = ScanVcfParam(
+        which = regions_gr,
+        info = c(
+            "CLNSIG",
+            "CLNREVSTAT",
+            "CLNDN",
+            "ALLELEID"
+        )
+    )
+)
+
+
+
+clinvar_expanded <- expand(
+    clinvar_vcf,
+    row.names = TRUE
+)
+
+clinvar_info <- info(clinvar_expanded)
+
+clinvar_table <- tibble(
+    Chromosome = str_remove(
+        as.character(
+            seqnames(rowRanges(clinvar_expanded))
+        ),
+        "^chr"
+    ),
+
+    Start_Position =
+        as.integer(start(rowRanges(clinvar_expanded))),
+
+    Reference_Allele =
+        as.character(ref(clinvar_expanded)),
+
+    Tumor_Seq_Allele2 =
+        as.character(unlist(alt(clinvar_expanded))),
+
+    ClinVar_significance =
+        vapply(
+            clinvar_info$CLNSIG,
+            collapse_info_value,
+            character(1)
+        ),
+
+    ClinVar_review_status =
+        vapply(
+            clinvar_info$CLNREVSTAT,
+            collapse_info_value,
+            character(1)
+        ),
+
+    ClinVar_condition =
+        vapply(
+            clinvar_info$CLNDN,
+            collapse_info_value,
+            character(1)
+        ),
+
+    ClinVar_allele_id =
+        vapply(
+            clinvar_info$ALLELEID,
+            collapse_info_value,
+            character(1)
+        )
+) %>%
+    distinct()
+
+
+
+
+
+polymerase_variants <- polymerase_variants %>%
+    left_join(
+        clinvar_table,
+        by = c(
+            "Chromosome",
+            "Start_Position",
+            "Reference_Allele",
+            "Tumor_Seq_Allele2"
+        )
+    )
+
+
+
+
+
+
+
+
+
+polymerase_variants <- polymerase_variants %>%
+    mutate(
+        gdc_clinical_significance =
+            as.character(CLIN_SIG),
+
+        clinvar_pathogenic = str_detect(
+            coalesce(ClinVar_significance, ""),
+            regex(
+                "pathogenic",
+                ignore_case = TRUE
+            )
+        ) &
+            !str_detect(
+                coalesce(ClinVar_significance, ""),
+                regex(
+                    "conflicting",
+                    ignore_case = TRUE
+                )
+            ),
+
+        clinvar_vus = str_detect(
+            coalesce(ClinVar_significance, ""),
+            regex(
+                "uncertain",
+                ignore_case = TRUE
+            )
+        ),
+
+        provisional_polymerase_class = case_when(
+            known_recurrent_pole_hotspot ~
+                "Known recurrent POLE proofreading hotspot",
+
+            clinvar_pathogenic &
+                exonuclease_domain %in% TRUE ~
+                paste0(
+                    "ClinVar pathogenic/likely pathogenic ",
+                    "exonuclease-domain variant"
+                ),
+
+            exonuclease_domain %in% TRUE &
+                coding_effect_group == "Protein-altering" ~
+                paste0(
+                    "Exonuclease-domain protein-altering ",
+                    "variant requiring manual review"
+                ),
+
+            clinvar_vus &
+                exonuclease_domain %in% TRUE ~
+                "Exonuclease-domain VUS",
+
+            clinvar_vus ~
+                "ClinVar VUS outside/unknown domain",
+
+            coding_effect_group ==
+                "Protein-truncating/splice" ~
+                "Truncating/splice variant requiring manual review",
+
+            TRUE ~
+                "Other POLE/POLD1 variant"
+        ),
+
+        likely_proofreading_relevant = case_when(
+            known_recurrent_pole_hotspot ~ TRUE,
+
+            clinvar_pathogenic &
+                exonuclease_domain %in% TRUE ~ TRUE,
+
+            TRUE ~ FALSE
+        ),
+
+        literature_evidence =
+            NA_character_,
+
+        mutational_signature_support =
+            NA_character_,
+
+        final_manual_classification =
+            NA_character_,
+
+        final_classification_reason =
+            NA_character_
+    )
+
+
+
+
+
+polymerase_variant_table <- polymerase_variants %>%
+     dplyr::select(
+        TCGA_project,
+        cancer_type,
+        patient_id,
+        Tumor_Sample_Barcode,
+        Matched_Norm_Sample_Barcode,
+
+        Hugo_Symbol,
+        Chromosome,
+        Start_Position,
+        End_Position,
+        Reference_Allele,
+        Tumor_Seq_Allele1,
+        Tumor_Seq_Allele2,
+
+        Variant_Classification,
+        Variant_Type,
+        coding_effect_group,
+        Consequence,
+        IMPACT,
+        FILTER,
+
+        HGVSc,
+        HGVSp,
+        HGVSp_Short,
+        Transcript_ID,
+        amino_acid_position,
+        exonuclease_domain,
+        domain_annotation,
+        known_recurrent_pole_hotspot,
+
+        t_ref_count,
+        t_alt_count,
+        tumor_depth,
+        tumor_vaf,
+        n_ref_count,
+        n_alt_count,
+        normal_depth,
+        normal_vaf,
+
+        Existing_variation,
+        SIFT,
+        PolyPhen,
+        gdc_clinical_significance,
+
+        ClinVar_significance,
+        ClinVar_review_status,
+        ClinVar_condition,
+        ClinVar_allele_id,
+
+        n_patients_all_projects,
+        projects_present,
+        patient_ids,
+
+        clinvar_pathogenic,
+        clinvar_vus,
+        likely_proofreading_relevant,
+        provisional_polymerase_class,
+
+        literature_evidence,
+        mutational_signature_support,
+        final_manual_classification,
+        final_classification_reason
+    ) %>%
+    arrange(
+        TCGA_project,
+        patient_id,
+        Hugo_Symbol,
+        amino_acid_position
+    )
+
+
+
+
+
+patient_polymerase_summary <- polymerase_variant_table %>%
+    group_by(
+        TCGA_project,
+        cancer_type,
+        patient_id
+    ) %>%
+    summarise(
+        n_pole_variants =
+            sum(Hugo_Symbol == "POLE"),
+
+        n_pold1_variants =
+            sum(Hugo_Symbol == "POLD1"),
+
+        n_total_polymerase_variants =
+            n(),
+
+        has_pole_mutation =
+            any(Hugo_Symbol == "POLE"),
+
+        has_pold1_mutation =
+            any(Hugo_Symbol == "POLD1"),
+
+        has_exonuclease_domain_variant =
+            any(
+                exonuclease_domain %in% TRUE,
+                na.rm = TRUE
+            ),
+
+        has_known_pole_hotspot =
+            any(
+                known_recurrent_pole_hotspot,
+                na.rm = TRUE
+            ),
+
+        has_clinvar_pathogenic_exonuclease_variant =
+            any(
+                clinvar_pathogenic &
+                    exonuclease_domain %in% TRUE,
+                na.rm = TRUE
+            ),
+
+        likely_proofreading_relevant =
+            any(
+                likely_proofreading_relevant,
+                na.rm = TRUE
+            ),
+
+        genes_mutated =
+            paste(
+                sort(unique(Hugo_Symbol)),
+                collapse = ";"
+            ),
+
+        protein_changes =
+            paste(
+                sort(
+                    unique(
+                        na.omit(HGVSp_Short)
+                    )
+                ),
+                collapse = ";"
+            ),
+
+        provisional_classes =
+            paste(
+                sort(
+                    unique(
+                        provisional_polymerase_class
+                    )
+                ),
+                collapse = ";"
+            ),
+
+        patient_polymerase_status = case_when(
+            any(
+                known_recurrent_pole_hotspot,
+                na.rm = TRUE
+            ) ~
+                "Known recurrent POLE proofreading hotspot",
+
+            any(
+                clinvar_pathogenic &
+                    exonuclease_domain %in% TRUE,
+                na.rm = TRUE
+            ) ~
+                paste0(
+                    "ClinVar pathogenic/likely pathogenic ",
+                    "exonuclease-domain variant"
+                ),
+
+            any(
+                exonuclease_domain %in% TRUE &
+                    coding_effect_group ==
+                    "Protein-altering",
+                na.rm = TRUE
+            ) ~
+                paste0(
+                    "Exonuclease-domain protein-altering ",
+                    "variant requiring manual review"
+                ),
+
+            TRUE ~
+                "Other POLE/POLD1 variant"
+        ),
+
+        .groups = "drop"
+    )
+
+
+patient_status_all <- all_patients %>%
+    left_join(
+        patient_polymerase_summary,
+        by = c(
+            "TCGA_project",
+            "cancer_type",
+            "patient_id"
+        )
+    ) %>%
+    mutate(
+        across(
+            c(
+                n_pole_variants,
+                n_pold1_variants,
+                n_total_polymerase_variants
+            ),
+            ~ replace_na(.x, 0L)
+        ),
+
+        across(
+            c(
+                has_pole_mutation,
+                has_pold1_mutation,
+                has_exonuclease_domain_variant,
+                has_known_pole_hotspot,
+                has_clinvar_pathogenic_exonuclease_variant,
+                likely_proofreading_relevant
+            ),
+            ~ replace_na(.x, FALSE)
+        ),
+
+        patient_polymerase_status = replace_na(
+            patient_polymerase_status,
+            "No POLE/POLD1 mutation"
+        ),
+
+        genes_mutated = replace_na(
+            genes_mutated,
+            ""
+        ),
+
+        protein_changes = replace_na(
+            protein_changes,
+            ""
+        ),
+
+        provisional_classes = replace_na(
+            provisional_classes,
+            ""
+        )
+    ) %>%
+    arrange(
+        TCGA_project,
+        patient_id
+    )
+
+
+
+
+
+cohort_status_summary <- patient_status_all %>%
+    dplyr::count(
+        TCGA_project,
+        cancer_type,
+        patient_polymerase_status,
+        name = "n_patients"
+    ) %>%
+    dplyr::group_by(
+        TCGA_project,
+        cancer_type
+    ) %>%
+    dplyr::mutate(
+        total_patients = sum(n_patients),
+        percentage = 100 * n_patients / total_patients
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::arrange(
+        TCGA_project,
+        desc(n_patients)
+    )
+
+
+
+
+
+clinvar_unmatched_variants <- polymerase_variant_table %>%
+    dplyr::filter(
+        is.na(ClinVar_significance)
+    ) %>%
+    dplyr::select(
+        TCGA_project,
+        patient_id,
+        Hugo_Symbol,
+        Chromosome,
+        Start_Position,
+        End_Position,
+        Reference_Allele,
+        Tumor_Seq_Allele2,
+        HGVSc,
+        HGVSp_Short,
+        Variant_Classification,
+        domain_annotation,
+        provisional_polymerase_class
+    )
+
+
+
+
+
+write_csv(
+    polymerase_variant_table,
+    file.path(
+        output_dir,
+        "TCGA_COAD_READ_UCEC_POLE_POLD1_variants.csv"
+    ),
+    na = ""
+)
+
+saveRDS(
+    polymerase_variant_table,
+    file.path(
+        output_dir,
+        "TCGA_COAD_READ_UCEC_POLE_POLD1_variants.rds"
+    )
+)
+
+write_csv(
+    patient_status_all,
+    file.path(
+        output_dir,
+        "TCGA_COAD_READ_UCEC_patient_polymerase_status.csv"
+    ),
+    na = ""
+)
+
+saveRDS(
+    patient_status_all,
+    file.path(
+        output_dir,
+        "TCGA_COAD_READ_UCEC_patient_polymerase_status.rds"
+    )
+)
+
+write_csv(
+    cohort_status_summary,
+    file.path(
+        output_dir,
+        "TCGA_COAD_READ_UCEC_polymerase_status_summary.csv"
+    ),
+    na = ""
+)
+
+write_csv(
+    clinvar_unmatched_variants,
+    file.path(
+        output_dir,
+        "TCGA_POLE_POLD1_variants_without_exact_ClinVar_match.csv"
+    ),
+    na = ""
+)
+
+writeLines(
+    sort(colnames(maf_all)),
+    file.path(
+        output_dir,
+        "available_MAF_columns.txt"
+    )
+)
+
+
+
+
+
+cat("\nPOLE/POLD1 mutation-level table:\n")
+print(
+    polymerase_variant_table %>%
+        dplyr::select(
+            TCGA_project,
+            patient_id,
+            Hugo_Symbol,
+            HGVSp_Short,
+            Variant_Classification,
+            domain_annotation,
+            ClinVar_significance,
+            provisional_polymerase_class
+        ) %>%
+        as_tibble(),
+    n = Inf
+)
+
+cat("\nPatient-level polymerase status summary:\n")
+print(
+    cohort_status_summary %>%
+        as_tibble(),
+    n = Inf
+)
+
+cat("\nFiles saved in:\n")
+cat(normalizePath(output_dir), "\n")
+```
+
+```{r}
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(tidyr)
+    library(stringr)
+    library(purrr)
+    library(readr)
+    library(tibble)
+    library(ggplot2)
+    library(svglite)
+    library(broom)
+})
+
+
+
+
+
+polymerase_dir <- "pole_pold1_results"
+analysis_dir <- "pole_pold1_pathway_analysis"
+
+figure_dir <- file.path(analysis_dir, "figures")
+table_dir <- file.path(analysis_dir, "tables")
+
+dir.create(
+    figure_dir,
+    recursive = TRUE,
+    showWarnings = FALSE
+)
+
+dir.create(
+    table_dir,
+    recursive = TRUE,
+    showWarnings = FALSE
+)
+
+
+
+
+
+maf_file <- file.path(
+    polymerase_dir,
+    "tcga_coad_read_ucec_masked_maf.rds"
+)
+
+variant_rds_file <- file.path(
+    polymerase_dir,
+    "TCGA_COAD_READ_UCEC_POLE_POLD1_variants.rds"
+)
+
+variant_csv_file <- file.path(
+    polymerase_dir,
+    "TCGA_COAD_READ_UCEC_POLE_POLD1_variants.csv"
+)
+
+patient_status_rds_file <- file.path(
+    polymerase_dir,
+    "TCGA_COAD_READ_UCEC_patient_polymerase_status.rds"
+)
+
+patient_status_csv_file <- file.path(
+    polymerase_dir,
+    "TCGA_COAD_READ_UCEC_patient_polymerase_status.csv"
+)
+
+cohort_summary_file <- file.path(
+    polymerase_dir,
+    "TCGA_COAD_READ_UCEC_polymerase_status_summary.csv"
+)
+
+unmatched_clinvar_file <- file.path(
+    polymerase_dir,
+    "TCGA_POLE_POLD1_variants_without_exact_ClinVar_match.csv"
+)
+
+maf_columns_file <- file.path(
+    polymerase_dir,
+    "available_MAF_columns.txt"
+)
+
+
+
+
+
+read_saved_table <- function(
+    rds_file,
+    csv_file,
+    object_name
+) {
+    if (
+        file.exists(rds_file) &&
+        file.info(rds_file)$size > 0
+    ) {
+        message(
+            "Reading ",
+            object_name,
+            " from ",
+            rds_file
+        )
+
+        return(readRDS(rds_file))
+    }
+
+    if (
+        file.exists(csv_file) &&
+        file.info(csv_file)$size > 0
+    ) {
+        message(
+            "Reading ",
+            object_name,
+            " from ",
+            csv_file
+        )
+
+        return(
+            readr::read_csv(
+                csv_file,
+                show_col_types = FALSE
+            )
+        )
+    }
+
+    stop(
+        "Could not find the saved ",
+        object_name,
+        ". Expected either:\n",
+        rds_file,
+        "\n",
+        csv_file
+    )
+}
+
+
+
+
+
+polymerase_variant_table <- read_saved_table(
+    rds_file = variant_rds_file,
+    csv_file = variant_csv_file,
+    object_name = "POLE/POLD1 mutation-level table"
+) %>%
+    as.data.frame()
+
+
+polymerase_variants <- polymerase_variant_table
+
+
+
+
+
+patient_status_all <- read_saved_table(
+    rds_file = patient_status_rds_file,
+    csv_file = patient_status_csv_file,
+    object_name = "patient-level polymerase status table"
+) %>%
+    as.data.frame()
+
+
+
+
+
+if (
+    file.exists(cohort_summary_file) &&
+    file.info(cohort_summary_file)$size > 0
+) {
+    cohort_status_summary <- readr::read_csv(
+        cohort_summary_file,
+        show_col_types = FALSE
+    ) %>%
+        as.data.frame()
+} else {
+    warning(
+        "Cohort summary was not found: ",
+        cohort_summary_file
+    )
+
+    cohort_status_summary <- NULL
+}
+
+
+
+
+
+if (
+    file.exists(unmatched_clinvar_file) &&
+    file.info(unmatched_clinvar_file)$size > 0
+) {
+    clinvar_unmatched_variants <- readr::read_csv(
+        unmatched_clinvar_file,
+        show_col_types = FALSE
+    ) %>%
+        as.data.frame()
+} else {
+    warning(
+        "ClinVar-unmatched table was not found: ",
+        unmatched_clinvar_file
+    )
+
+    clinvar_unmatched_variants <- NULL
+}
+
+
+
+
+
+if (
+    file.exists(maf_file) &&
+    file.info(maf_file)$size > 0
+) {
+    maf_all <- readRDS(maf_file)
+    maf_all <- as.data.frame(maf_all)
+} else {
+    warning(
+        paste0(
+            "Combined MAF was not found at:\n",
+            maf_file,
+            "\nThis is not required for the pathway figures ",
+            "if the saved polymerase tables are available."
+        )
+    )
+
+    maf_all <- NULL
+}
+
+
+
+
+
+if (
+    file.exists(maf_columns_file) &&
+    file.info(maf_columns_file)$size > 0
+) {
+    available_maf_columns <- readLines(
+        maf_columns_file
+    )
+} else {
+    available_maf_columns <- character()
+}
+
+
+
+
+
+logical_columns <- c(
+    "has_pole_mutation",
+    "has_pold1_mutation",
+    "has_exonuclease_domain_variant",
+    "has_known_pole_hotspot",
+    "has_clinvar_pathogenic_exonuclease_variant",
+    "likely_proofreading_relevant"
+)
+
+for (column in intersect(
+    logical_columns,
+    colnames(patient_status_all)
+)) {
+    patient_status_all[[column]] <- as.logical(
+        patient_status_all[[column]]
+    )
+}
+
+variant_logical_columns <- c(
+    "exonuclease_domain",
+    "known_recurrent_pole_hotspot",
+    "clinvar_pathogenic",
+    "clinvar_vus",
+    "likely_proofreading_relevant"
+)
+
+for (column in intersect(
+    variant_logical_columns,
+    colnames(polymerase_variant_table)
+)) {
+    polymerase_variant_table[[column]] <- as.logical(
+        polymerase_variant_table[[column]]
+    )
+}
+
+numeric_variant_columns <- c(
+    "Start_Position",
+    "End_Position",
+    "amino_acid_position",
+    "t_ref_count",
+    "t_alt_count",
+    "tumor_depth",
+    "tumor_vaf",
+    "n_ref_count",
+    "n_alt_count",
+    "normal_depth",
+    "normal_vaf",
+    "n_patients_all_projects"
+)
+
+for (column in intersect(
+    numeric_variant_columns,
+    colnames(polymerase_variant_table)
+)) {
+    polymerase_variant_table[[column]] <-
+        suppressWarnings(
+            as.numeric(
+                polymerase_variant_table[[column]]
+            )
+        )
+}
+
+
+polymerase_variants <- polymerase_variant_table
+
+
+
+
+
+required_variant_columns <- c(
+    "TCGA_project",
+    "cancer_type",
+    "patient_id",
+    "Hugo_Symbol",
+    "HGVSp_Short",
+    "Variant_Classification",
+    "ClinVar_significance",
+    "provisional_polymerase_class"
+)
+
+missing_variant_columns <- setdiff(
+    required_variant_columns,
+    colnames(polymerase_variant_table)
+)
+
+if (length(missing_variant_columns) > 0) {
+    stop(
+        "The mutation-level table is missing columns: ",
+        paste(
+            missing_variant_columns,
+            collapse = ", "
+        )
+    )
+}
+
+required_patient_columns <- c(
+    "TCGA_project",
+    "cancer_type",
+    "patient_id",
+    "has_pole_mutation",
+    "has_pold1_mutation",
+    "patient_polymerase_status"
+)
+
+missing_patient_columns <- setdiff(
+    required_patient_columns,
+    colnames(patient_status_all)
+)
+
+if (length(missing_patient_columns) > 0) {
+    stop(
+        "The patient-level table is missing columns: ",
+        paste(
+            missing_patient_columns,
+            collapse = ", "
+        )
+    )
+}
+
+
+
+
+
+loaded_objects_summary <- tibble::tibble(
+    object = c(
+        "polymerase_variant_table",
+        "patient_status_all",
+        "cohort_status_summary",
+        "clinvar_unmatched_variants",
+        "maf_all"
+    ),
+    available = c(
+        !is.null(polymerase_variant_table),
+        !is.null(patient_status_all),
+        !is.null(cohort_status_summary),
+        !is.null(clinvar_unmatched_variants),
+        !is.null(maf_all)
+    ),
+    rows = c(
+        nrow(polymerase_variant_table),
+        nrow(patient_status_all),
+        if (is.null(cohort_status_summary)) {
+            NA_integer_
+        } else {
+            nrow(cohort_status_summary)
+        },
+        if (is.null(clinvar_unmatched_variants)) {
+            NA_integer_
+        } else {
+            nrow(clinvar_unmatched_variants)
+        },
+        if (is.null(maf_all)) {
+            NA_integer_
+        } else {
+            nrow(maf_all)
+        }
+    )
+)
+
+print(
+    loaded_objects_summary,
+    n = Inf
+)
+
+cat(
+    "\nPOLE/POLD1 genes in mutation table:\n"
+)
+
+print(
+    polymerase_variant_table %>%
+        dplyr::count(
+            TCGA_project,
+            Hugo_Symbol,
+            name = "n_variants"
+        ) %>%
+        tibble::as_tibble(),
+    n = Inf
+)
+
+cat(
+    "\nPatient-level polymerase classifications:\n"
+)
+
+print(
+    patient_status_all %>%
+        dplyr::count(
+            TCGA_project,
+            patient_polymerase_status,
+            name = "n_patients"
+        ) %>%
+        tibble::as_tibble(),
+    n = Inf
+)
+```
+
+```{r}
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(tidyr)
+    library(stringr)
+    library(readr)
+    library(tibble)
+    library(ggplot2)
+    library(purrr)
+    library(broom)
+    library(svglite)
+})
+
+
+
+
+
+data_dir <- "data"
+prepared_dir <- file.path(data_dir, "prepared")
+
+output_dir <- file.path(data_dir, "pole_pold1_pathway_analysis")
+figure_dir <- file.path(output_dir, "figures")
+table_dir <- file.path(output_dir, "tables")
+
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+
+clinical_crc_file <- file.path(
+    data_dir,
+    "clinical_data.csv"
+)
+
+clinical_ucec_file <- file.path(
+    data_dir,
+    "ucec_clinical.csv"
+)
+
+gsva_crc_file <- file.path(
+    prepared_dir,
+    "gsva_ssgsea_hallmark.csv"
+)
+
+gsva_ucec_file <- file.path(
+    prepared_dir,
+    "ucec_gsva_ssgsea_hallmark.csv"
+)
+
+
+
+
+
+find_one_file <- function(pattern, search_directory = ".") {
+
+    matches <- list.files(
+        path = search_directory,
+        pattern = pattern,
+        recursive = TRUE,
+        full.names = TRUE,
+        ignore.case = TRUE
+    )
+
+    matches <- matches[
+        file.exists(matches) &
+            file.info(matches)$size > 0
+    ]
+
+    if (length(matches) == 0) {
+        return(NA_character_)
+    }
+
+    if (length(matches) > 1) {
+        message(
+            "Several files matched '",
+            pattern,
+            "'. Using:\n",
+            matches[[1]]
+        )
+    }
+
+    matches[[1]]
+}
+
+patient_status_rds <- find_one_file(
+    "patient_polymerase_status\\.rds$"
+)
+
+patient_status_csv <- find_one_file(
+    "patient_polymerase_status\\.csv$"
+)
+
+variant_table_rds <- find_one_file(
+    "POLE_POLD1.*variants\\.rds$"
+)
+
+variant_table_csv <- find_one_file(
+    "POLE_POLD1.*variants\\.csv$"
+)
+
+read_rds_or_csv <- function(
+    rds_file,
+    csv_file,
+    object_description
+) {
+
+    if (!is.na(rds_file)) {
+        message(
+            "Reading ",
+            object_description,
+            ":\n",
+            rds_file
+        )
+
+        return(readRDS(rds_file))
+    }
+
+    if (!is.na(csv_file)) {
+        message(
+            "Reading ",
+            object_description,
+            ":\n",
+            csv_file
+        )
+
+        return(
+            readr::read_csv(
+                csv_file,
+                show_col_types = FALSE
+            )
+        )
+    }
+
+    stop(
+        "Could not find ",
+        object_description,
+        ".\nExpected a saved RDS or CSV file from the previous analysis."
+    )
+}
+
+patient_status_all <- read_rds_or_csv(
+    patient_status_rds,
+    patient_status_csv,
+    "patient-level POLE/POLD1 status"
+) %>%
+    as.data.frame()
+
+polymerase_variant_table <- read_rds_or_csv(
+    variant_table_rds,
+    variant_table_csv,
+    "variant-level POLE/POLD1 table"
+) %>%
+    as.data.frame()
+
+
+
+
+
+clinical_crc <- readr::read_csv(
+    clinical_crc_file,
+    show_col_types = FALSE
+)
+
+clinical_ucec <- readr::read_csv(
+    clinical_ucec_file,
+    show_col_types = FALSE
+)
+
+
+required_clinical_columns <- c(
+    "Tumor_Sample_Barcode",
+    "MSI_TMB"
+)
+
+for (clinical_name in c("clinical_crc", "clinical_ucec")) {
+
+    clinical_object <- get(clinical_name)
+
+    missing_columns <- setdiff(
+        required_clinical_columns,
+        colnames(clinical_object)
+    )
+
+    if (length(missing_columns) > 0) {
+        stop(
+            clinical_name,
+            " is missing: ",
+            paste(missing_columns, collapse = ", ")
+        )
+    }
+}
+
+
+prepare_clinical <- function(data, default_project = NA_character_) {
+
+    project_value <- if ("project_id" %in% colnames(data)) {
+        as.character(data$project_id)
+    } else {
+        rep(default_project, nrow(data))
+    }
+
+    data %>%
+        dplyr::mutate(
+            sample_id = substr(
+                as.character(Tumor_Sample_Barcode),
+                1,
+                15
+            ),
+            patient_id = substr(
+                as.character(Tumor_Sample_Barcode),
+                1,
+                12
+            ),
+            TCGA_project = project_value,
+            MSI_TMB = stringr::str_trim(
+                as.character(MSI_TMB)
+            )
+        ) %>%
+        dplyr::filter(
+            !is.na(sample_id),
+            sample_id != ""
+        ) %>%
+        dplyr::distinct(
+            sample_id,
+            .keep_all = TRUE
+        )
+}
+
+clinical_crc <- prepare_clinical(
+    clinical_crc
+)
+
+clinical_ucec <- prepare_clinical(
+    clinical_ucec,
+    default_project = "TCGA-UCEC"
+)
+
+clinical_all <- dplyr::bind_rows(
+    clinical_crc,
+    clinical_ucec
+)
+
+
+
+
+
+read_ssgsea_matrix <- function(
+    filename,
+    expected_project
+) {
+
+    raw <- utils::read.csv(
+        filename,
+        row.names = 1,
+        check.names = FALSE
+    )
+
+    required_pathways <- c(
+        "HALLMARK_MTORC1_SIGNALING",
+        "HALLMARK_E2F_TARGETS",
+        "HALLMARK_G2M_CHECKPOINT"
+    )
+
+    missing_pathways <- setdiff(
+        required_pathways,
+        rownames(raw)
+    )
+
+    if (length(missing_pathways) > 0) {
+        stop(
+            basename(filename),
+            " is missing pathways: ",
+            paste(missing_pathways, collapse = ", ")
+        )
+    }
+
+    pathway_matrix <- raw[
+        required_pathways,
+        ,
+        drop = FALSE
+    ]
+
+    pathway_table <- as.data.frame(
+        t(as.matrix(pathway_matrix)),
+        stringsAsFactors = FALSE
+    )
+
+    pathway_table$sample_id <- rownames(pathway_table)
+    rownames(pathway_table) <- NULL
+
+    pathway_table %>%
+        tibble::as_tibble() %>%
+        dplyr::mutate(
+            sample_id = substr(
+                as.character(sample_id),
+                1,
+                15
+            ),
+            patient_id = substr(
+                sample_id,
+                1,
+                12
+            ),
+            pathway_project = expected_project,
+            dplyr::across(
+                dplyr::all_of(required_pathways),
+                as.numeric
+            )
+        )
+}
+
+gsva_crc <- read_ssgsea_matrix(
+    gsva_crc_file,
+    expected_project = "TCGA-COAD/READ"
+)
+
+gsva_ucec <- read_ssgsea_matrix(
+    gsva_ucec_file,
+    expected_project = "TCGA-UCEC"
+)
+
+gsva_all <- dplyr::bind_rows(
+    gsva_crc,
+    gsva_ucec
+)
+
+
+
+
+
+patient_status_all <- patient_status_all %>%
+    dplyr::mutate(
+        patient_id = substr(
+            as.character(patient_id),
+            1,
+            12
+        )
+    )
+
+
+to_logical <- function(x) {
+
+    if (is.logical(x)) {
+        return(x)
+    }
+
+    value <- stringr::str_to_lower(
+        stringr::str_trim(as.character(x))
+    )
+
+    dplyr::case_when(
+        value %in% c("true", "t", "1", "yes") ~ TRUE,
+        value %in% c("false", "f", "0", "no") ~ FALSE,
+        TRUE ~ NA
+    )
+}
+
+possible_pole_columns <- c(
+    "has_pole_mutation",
+    "pole_mutated"
+)
+
+possible_pold1_columns <- c(
+    "has_pold1_mutation",
+    "pold1_mutated"
+)
+
+pole_column <- intersect(
+    possible_pole_columns,
+    colnames(patient_status_all)
+)[1]
+
+pold1_column <- intersect(
+    possible_pold1_columns,
+    colnames(patient_status_all)
+)[1]
+
+if (is.na(pole_column) || is.na(pold1_column)) {
+    stop(
+        "Could not identify POLE/POLD1 mutation columns in patient_status_all.\n",
+        "Available columns:\n",
+        paste(colnames(patient_status_all), collapse = ", ")
+    )
+}
+
+patient_status_prepared <- patient_status_all %>%
+    dplyr::mutate(
+        pole_mutated = to_logical(
+            .data[[pole_column]]
+        ),
+        pold1_mutated = to_logical(
+            .data[[pold1_column]]
+        ),
+        pole_mutated = tidyr::replace_na(
+            pole_mutated,
+            FALSE
+        ),
+        pold1_mutated = tidyr::replace_na(
+            pold1_mutated,
+            FALSE
+        ),
+        polymerase_group = dplyr::case_when(
+            pole_mutated & pold1_mutated ~
+                "POLE/POLD1 double-mutant",
+
+            pole_mutated ~
+                "POLE-mutant",
+
+            pold1_mutated ~
+                "POLD1-mutant",
+
+            TRUE ~
+                "Polymerase wild-type"
+        )
+    ) %>%
+    dplyr::select(
+        patient_id,
+        dplyr::any_of(c(
+            "TCGA_project",
+            "cancer_type",
+            "patient_polymerase_status"
+        )),
+        pole_mutated,
+        pold1_mutated,
+        polymerase_group,
+        dplyr::everything()
+    ) %>%
+    dplyr::distinct(
+        patient_id,
+        .keep_all = TRUE
+    )
+
+
+
+
+
+polymerase_variant_table <- polymerase_variant_table %>%
+    dplyr::mutate(
+        patient_id = substr(
+            as.character(patient_id),
+            1,
+            12
+        )
+    )
+
+clinvar_column <- intersect(
+    c(
+        "ClinVar_significance",
+        "clinvar_significance",
+        "CLNSIG"
+    ),
+    colnames(polymerase_variant_table)
+)[1]
+
+if (is.na(clinvar_column)) {
+
+    warning(
+        "No ClinVar significance column was found. ",
+        "Variants will be labelled as unclassified."
+    )
+
+    polymerase_variant_table$clinical_annotation <-
+        NA_character_
+
+} else {
+
+    polymerase_variant_table$clinical_annotation <-
+        as.character(
+            polymerase_variant_table[[clinvar_column]]
+        )
+}
+
+polymerase_variant_classification <-
+    polymerase_variant_table %>%
+    dplyr::mutate(
+        clinical_annotation_clean =
+            stringr::str_to_lower(
+                tidyr::replace_na(
+                    clinical_annotation,
+                    ""
+                )
+            ),
+
+        variant_clinical_class =
+            dplyr::case_when(
+                stringr::str_detect(
+                    clinical_annotation_clean,
+                    "pathogenic"
+                ) &
+                    !stringr::str_detect(
+                        clinical_annotation_clean,
+                        "conflicting"
+                    ) ~
+                    "Pathogenic/likely pathogenic",
+
+                stringr::str_detect(
+                    clinical_annotation_clean,
+                    "uncertain|vus"
+                ) ~
+                    "VUS",
+
+                clinical_annotation_clean != "" ~
+                    "Other ClinVar classification",
+
+                TRUE ~
+                    "Not classified"
+            )
+    )
+
+
+hgvsp_column <- intersect(
+    c("HGVSp_Short", "HGVSp"),
+    colnames(polymerase_variant_classification)
+)[1]
+
+if (is.na(hgvsp_column)) {
+    polymerase_variant_classification$protein_change_value <- NA_character_
+} else {
+    polymerase_variant_classification$protein_change_value <-
+        as.character(
+            polymerase_variant_classification[[hgvsp_column]]
+        )
+}
+
+variant_patient_summary <-
+    polymerase_variant_classification %>%
+    dplyr::group_by(patient_id) %>%
+    dplyr::summarise(
+        has_pathogenic_pole = any(
+            Hugo_Symbol == "POLE" &
+                variant_clinical_class ==
+                "Pathogenic/likely pathogenic",
+            na.rm = TRUE
+        ),
+
+        has_pathogenic_pold1 = any(
+            Hugo_Symbol == "POLD1" &
+                variant_clinical_class ==
+                "Pathogenic/likely pathogenic",
+            na.rm = TRUE
+        ),
+
+        has_pole_vus = any(
+            Hugo_Symbol == "POLE" &
+                variant_clinical_class == "VUS",
+            na.rm = TRUE
+        ),
+
+        has_pold1_vus = any(
+            Hugo_Symbol == "POLD1" &
+                variant_clinical_class == "VUS",
+            na.rm = TRUE
+        ),
+
+        mutated_genes = paste(
+            sort(
+                unique(
+                    stats::na.omit(
+                        as.character(Hugo_Symbol)
+                    )
+                )
+            ),
+            collapse = ";"
+        ),
+
+        protein_changes = {
+            values <- unique(
+                stats::na.omit(
+                    protein_change_value
+                )
+            )
+
+            if (length(values) == 0) {
+                ""
+            } else {
+                paste(
+                    sort(values),
+                    collapse = ";"
+                )
+            }
+        },
+
+        clinvar_classes = paste(
+            sort(
+                unique(
+                    stats::na.omit(
+                        as.character(
+                            variant_clinical_class
+                        )
+                    )
+                )
+            ),
+            collapse = ";"
+        ),
+
+        .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+        detailed_polymerase_class =
+            dplyr::case_when(
+                has_pathogenic_pole &
+                    has_pathogenic_pold1 ~
+                    "POLE/POLD1 pathogenic",
+
+                has_pathogenic_pole ~
+                    "POLE pathogenic/likely pathogenic",
+
+                has_pathogenic_pold1 ~
+                    "POLD1 pathogenic/likely pathogenic",
+
+                has_pole_vus &
+                    has_pold1_vus ~
+                    "POLE/POLD1 VUS",
+
+                has_pole_vus ~
+                    "POLE VUS",
+
+                has_pold1_vus ~
+                    "POLD1 VUS",
+
+                TRUE ~
+                    "Other or unclassified mutation"
+            )
+    )
+
+patient_status_prepared <-
+    patient_status_prepared %>%
+    dplyr::left_join(
+        variant_patient_summary,
+        by = "patient_id"
+    ) %>%
+    dplyr::mutate(
+        detailed_polymerase_class =
+            dplyr::case_when(
+                polymerase_group ==
+                    "Polymerase wild-type" ~
+                    "Polymerase wild-type",
+
+                !is.na(detailed_polymerase_class) ~
+                    detailed_polymerase_class,
+
+                TRUE ~
+                    "Other or unclassified mutation"
+            ),
+
+        any_pathogenic_polymerase =
+            tidyr::replace_na(
+                has_pathogenic_pole,
+                FALSE
+            ) |
+            tidyr::replace_na(
+                has_pathogenic_pold1,
+                FALSE
+            ),
+
+        any_polymerase_vus =
+            tidyr::replace_na(
+                has_pole_vus,
+                FALSE
+            ) |
+            tidyr::replace_na(
+                has_pold1_vus,
+                FALSE
+            )
+    )
+
+
+
+
+
+analysis_all <- gsva_all %>%
+    dplyr::left_join(
+        clinical_all,
+        by = c(
+            "sample_id",
+            "patient_id"
+        ),
+        suffix = c("_gsva", "_clinical")
+    ) %>%
+    dplyr::left_join(
+        patient_status_prepared,
+        by = "patient_id",
+        suffix = c("", "_polymerase")
+    )
+
+
+matching_summary <- tibble::tibble(
+    quantity = c(
+        "ssGSEA samples",
+        "matched to clinical data",
+        "matched to polymerase table",
+        "MSS/TMB-H samples"
+    ),
+    n = c(
+        nrow(analysis_all),
+        sum(!is.na(analysis_all$MSI_TMB)),
+        sum(!is.na(analysis_all$polymerase_group)),
+        sum(
+            analysis_all$MSI_TMB == "MSS/TMB-H",
+            na.rm = TRUE
+        )
+    )
+)
+
+print(matching_summary, n = Inf)
+
+readr::write_csv(
+    matching_summary,
+    file.path(
+        table_dir,
+        "Table_data_matching_summary.csv"
+    )
+)
+
+
+mss_tmbh <- analysis_all %>%
+    dplyr::filter(
+        MSI_TMB == "MSS/TMB-H"
+    )
+
+if (nrow(mss_tmbh) == 0) {
+    stop(
+        "No MSS/TMB-H samples were found after merging."
+    )
+}
+
+
+unmatched_polymerase <- mss_tmbh %>%
+    dplyr::filter(
+        is.na(polymerase_group)
+    ) %>%
+    dplyr::select(
+        sample_id,
+        patient_id,
+        TCGA_project,
+        MSI_TMB
+    )
+
+if (nrow(unmatched_polymerase) > 0) {
+
+    readr::write_csv(
+        unmatched_polymerase,
+        file.path(
+            table_dir,
+            "MSS_TMBH_samples_without_polymerase_annotation.csv"
+        )
+    )
+
+    warning(
+        nrow(unmatched_polymerase),
+        " MSS/TMB-H samples had no polymerase annotation ",
+        "and were excluded from the grouped analysis."
+    )
+}
+
+mss_tmbh_annotated <- mss_tmbh %>%
+    dplyr::filter(
+        !is.na(polymerase_group)
+    ) %>%
+    dplyr::mutate(
+        cancer_group = dplyr::case_when(
+            TCGA_project %in%
+                c("TCGA-COAD", "TCGA-READ") ~
+                "Colorectal cancer",
+
+            TCGA_project == "TCGA-UCEC" ~
+                "Endometrial cancer",
+
+            pathway_project ==
+                "TCGA-COAD/READ" ~
+                "Colorectal cancer",
+
+            pathway_project == "TCGA-UCEC" ~
+                "Endometrial cancer",
+
+            TRUE ~
+                as.character(TCGA_project)
+        ),
+
+        polymerase_group = factor(
+            polymerase_group,
+            levels = c(
+                "Polymerase wild-type",
+                "POLE-mutant",
+                "POLD1-mutant",
+                "POLE/POLD1 double-mutant"
+            )
+        )
+    )
+
+
+
+
+
+pathway_labels <- c(
+    HALLMARK_MTORC1_SIGNALING =
+        "mTORC1 signaling",
+    HALLMARK_E2F_TARGETS =
+        "E2F targets",
+    HALLMARK_G2M_CHECKPOINT =
+        "G2M checkpoint"
+)
+
+mss_tmbh_long <- mss_tmbh_annotated %>%
+    dplyr::select(
+        sample_id,
+        patient_id,
+        cancer_group,
+        TCGA_project,
+        MSI_TMB,
+        polymerase_group,
+        detailed_polymerase_class,
+        any_pathogenic_polymerase,
+        any_polymerase_vus,
+        mutated_genes,
+        protein_changes,
+        dplyr::all_of(names(pathway_labels))
+    ) %>%
+    tidyr::pivot_longer(
+        cols = dplyr::all_of(
+            names(pathway_labels)
+        ),
+        names_to = "pathway_code",
+        values_to = "pathway_score"
+    ) %>%
+    dplyr::mutate(
+        pathway = unname(
+            pathway_labels[pathway_code]
+        ),
+        pathway = factor(
+            pathway,
+            levels = unname(pathway_labels)
+        ),
+        pathway_score = as.numeric(
+            pathway_score
+        )
+    )
+
+
+
+
+
+case_level_table <- mss_tmbh_annotated %>%
+    dplyr::select(
+        sample_id,
+        patient_id,
+        cancer_group,
+        TCGA_project,
+        MSI_TMB,
+        polymerase_group,
+        detailed_polymerase_class,
+        any_pathogenic_polymerase,
+        any_polymerase_vus,
+        mutated_genes,
+        protein_changes,
+        dplyr::all_of(names(pathway_labels)),
+        dplyr::any_of(c(
+            "total",
+            "total_perMB",
+            "figo_stage",
+            "tumor_grade",
+            "histological_type",
+            "Tumor_purity",
+            "target_capture_kit_name"
+        ))
+    ) %>%
+    dplyr::arrange(
+        cancer_group,
+        polymerase_group,
+        patient_id
+    )
+
+readr::write_csv(
+    case_level_table,
+    file.path(
+        table_dir,
+        "Table_MSS_TMBH_case_level_POLE_POLD1_pathways.csv"
+    ),
+    na = ""
+)
+
+broad_status_counts <- mss_tmbh_annotated %>%
+    dplyr::count(
+        cancer_group,
+        polymerase_group,
+        name = "n_samples"
+    ) %>%
+    dplyr::group_by(cancer_group) %>%
+    dplyr::mutate(
+        total_MSS_TMBH = sum(n_samples),
+        percentage = 100 *
+            n_samples /
+            total_MSS_TMBH
+    ) %>%
+    dplyr::ungroup()
+
+readr::write_csv(
+    broad_status_counts,
+    file.path(
+        table_dir,
+        "Table_MSS_TMBH_POLE_POLD1_status_counts.csv"
+    ),
+    na = ""
+)
+
+detailed_status_counts <- mss_tmbh_annotated %>%
+    dplyr::count(
+        cancer_group,
+        detailed_polymerase_class,
+        name = "n_samples"
+    ) %>%
+    dplyr::group_by(cancer_group) %>%
+    dplyr::mutate(
+        total_MSS_TMBH = sum(n_samples),
+        percentage = 100 *
+            n_samples /
+            total_MSS_TMBH
+    ) %>%
+    dplyr::ungroup()
+
+readr::write_csv(
+    detailed_status_counts,
+    file.path(
+        table_dir,
+        "Table_MSS_TMBH_pathogenic_VUS_counts.csv"
+    ),
+    na = ""
+)
+
+pathway_summary <- mss_tmbh_long %>%
+    dplyr::group_by(
+        cancer_group,
+        polymerase_group,
+        pathway
+    ) %>%
+    dplyr::summarise(
+        n = sum(!is.na(pathway_score)),
+        mean = mean(
+            pathway_score,
+            na.rm = TRUE
+        ),
+        sd = stats::sd(
+            pathway_score,
+            na.rm = TRUE
+        ),
+        median = stats::median(
+            pathway_score,
+            na.rm = TRUE
+        ),
+        q1 = stats::quantile(
+            pathway_score,
+            0.25,
+            na.rm = TRUE
+        ),
+        q3 = stats::quantile(
+            pathway_score,
+            0.75,
+            na.rm = TRUE
+        ),
+        .groups = "drop"
+    )
+
+readr::write_csv(
+    pathway_summary,
+    file.path(
+        table_dir,
+        "Table_pathway_scores_by_POLE_POLD1_status.csv"
+    ),
+    na = ""
+)
+
+
+
+
+
+safe_kruskal <- function(data) {
+
+    usable <- data %>%
+        dplyr::filter(
+            !is.na(pathway_score),
+            !is.na(polymerase_group)
+        ) %>%
+        droplevels()
+
+    if (
+        nrow(usable) < 3 ||
+        dplyr::n_distinct(
+            usable$polymerase_group
+        ) < 2
+    ) {
+        return(
+            tibble::tibble(
+                statistic = NA_real_,
+                degrees_of_freedom = NA_real_,
+                p_value = NA_real_,
+                note = "Insufficient groups"
+            )
+        )
+    }
+
+    result <- stats::kruskal.test(
+        pathway_score ~ polymerase_group,
+        data = usable
+    )
+
+    tibble::tibble(
+        statistic = unname(result$statistic),
+        degrees_of_freedom =
+            unname(result$parameter),
+        p_value = result$p.value,
+        note = NA_character_
+    )
+}
+
+kruskal_results <- mss_tmbh_long %>%
+    dplyr::group_by(
+        cancer_group,
+        pathway
+    ) %>%
+    tidyr::nest() %>%
+    dplyr::mutate(
+        result = purrr::map(
+            data,
+            safe_kruskal
+        )
+    ) %>%
+    dplyr::select(-data) %>%
+    tidyr::unnest(result) %>%
+    dplyr::mutate(
+        p_adjusted_BH = stats::p.adjust(
+            p_value,
+            method = "BH"
+        )
+    )
+
+readr::write_csv(
+    kruskal_results,
+    file.path(
+        table_dir,
+        "Table_Kruskal_Wallis_pathway_tests.csv"
+    ),
+    na = ""
+)
+
+
+mss_tmbh_binary <- mss_tmbh_long %>%
+    dplyr::mutate(
+        polymerase_binary = factor(
+            dplyr::if_else(
+                polymerase_group ==
+                    "Polymerase wild-type",
+                "Polymerase wild-type",
+                "POLE/POLD1-mutant"
+            ),
+            levels = c(
+                "Polymerase wild-type",
+                "POLE/POLD1-mutant"
+            )
+        )
+    )
+
+safe_wilcox <- function(data) {
+
+    usable <- data %>%
+        dplyr::filter(
+            !is.na(pathway_score),
+            !is.na(polymerase_binary)
+        )
+
+    group_counts <- table(
+        usable$polymerase_binary
+    )
+
+    if (
+        length(group_counts) < 2 ||
+        any(group_counts == 0)
+    ) {
+        return(
+            tibble::tibble(
+                n_wildtype = sum(
+                    usable$polymerase_binary ==
+                        "Polymerase wild-type"
+                ),
+                n_mutant = sum(
+                    usable$polymerase_binary ==
+                        "POLE/POLD1-mutant"
+                ),
+                median_wildtype = NA_real_,
+                median_mutant = NA_real_,
+                median_difference = NA_real_,
+                p_value = NA_real_,
+                note = "Insufficient groups"
+            )
+        )
+    }
+
+    wt <- usable$pathway_score[
+        usable$polymerase_binary ==
+            "Polymerase wild-type"
+    ]
+
+    mutant <- usable$pathway_score[
+        usable$polymerase_binary ==
+            "POLE/POLD1-mutant"
+    ]
+
+    result <- stats::wilcox.test(
+        mutant,
+        wt,
+        exact = FALSE
+    )
+
+    tibble::tibble(
+        n_wildtype = length(wt),
+        n_mutant = length(mutant),
+        median_wildtype = median(
+            wt,
+            na.rm = TRUE
+        ),
+        median_mutant = median(
+            mutant,
+            na.rm = TRUE
+        ),
+        median_difference =
+            median(mutant, na.rm = TRUE) -
+            median(wt, na.rm = TRUE),
+        p_value = result$p.value,
+        note = NA_character_
+    )
+}
+
+wilcox_results <- mss_tmbh_binary %>%
+    dplyr::group_by(
+        cancer_group,
+        pathway
+    ) %>%
+    tidyr::nest() %>%
+    dplyr::mutate(
+        result = purrr::map(
+            data,
+            safe_wilcox
+        )
+    ) %>%
+    dplyr::select(-data) %>%
+    tidyr::unnest(result) %>%
+    dplyr::mutate(
+        p_adjusted_BH = stats::p.adjust(
+            p_value,
+            method = "BH"
+        )
+    )
+
+readr::write_csv(
+    wilcox_results,
+    file.path(
+        table_dir,
+        "Table_mutant_vs_wildtype_Wilcoxon_tests.csv"
+    ),
+    na = ""
+)
+
+
+
+
+
+polymerase_wildtype_samples <-
+    mss_tmbh_annotated %>%
+    dplyr::filter(
+        polymerase_group ==
+            "Polymerase wild-type"
+    )
+
+pathogenic_excluded_samples <-
+    mss_tmbh_annotated %>%
+    dplyr::filter(
+        !any_pathogenic_polymerase
+    )
+
+all_mutations_excluded_samples <-
+    mss_tmbh_annotated %>%
+    dplyr::filter(
+        polymerase_group ==
+            "Polymerase wild-type"
+    )
+
+readr::write_csv(
+    polymerase_wildtype_samples,
+    file.path(
+        table_dir,
+        "MSS_TMBH_polymerase_wildtype_samples.csv"
+    ),
+    na = ""
+)
+
+readr::write_csv(
+    pathogenic_excluded_samples,
+    file.path(
+        table_dir,
+        "MSS_TMBH_after_excluding_pathogenic_POLE_POLD1.csv"
+    ),
+    na = ""
+)
+
+
+
+
+
+count_plot <- broad_status_counts %>%
+    dplyr::filter(n_samples > 0) %>%
+    ggplot2::ggplot(
+        ggplot2::aes(
+            x = polymerase_group,
+            y = n_samples
+        )
+    ) +
+    ggplot2::geom_col(
+        width = 0.7
+    ) +
+    ggplot2::geom_text(
+        ggplot2::aes(
+            label = n_samples
+        ),
+        vjust = -0.3,
+        size = 3.5
+    ) +
+    ggplot2::facet_wrap(
+        ~ cancer_group,
+        scales = "free_x"
+    ) +
+    ggplot2::labs(
+        x = NULL,
+        y = "Number of MSS/TMB-H tumors",
+        title = "POLE/POLD1 status of MSS/TMB-H tumors"
+    ) +
+    ggplot2::theme_classic(
+        base_size = 11
+    ) +
+    ggplot2::theme(
+        axis.text.x =
+            ggplot2::element_text(
+                angle = 35,
+                hjust = 1
+            ),
+        strip.background =
+            ggplot2::element_blank(),
+        strip.text =
+            ggplot2::element_text(
+                face = "bold"
+            )
+    )
+
+ggplot2::ggsave(
+    filename = file.path(
+        figure_dir,
+        "Figure_MSS_TMBH_POLE_POLD1_counts.svg"
+    ),
+    plot = count_plot,
+    device = svglite::svglite,
+    width = 9,
+    height = 5.5
+)
+
+
+
+
+
+pathway_plot <- ggplot2::ggplot(
+    mss_tmbh_long,
+    ggplot2::aes(
+        x = polymerase_group,
+        y = pathway_score
+    )
+) +
+    ggplot2::geom_boxplot(
+        outlier.shape = NA,
+        width = 0.65
+    ) +
+    ggplot2::geom_jitter(
+        width = 0.14,
+        height = 0,
+        alpha = 0.75,
+        size = 1.7
+    ) +
+    ggplot2::facet_grid(
+        pathway ~ cancer_group,
+        scales = "free_y"
+    ) +
+    ggplot2::labs(
+        x = NULL,
+        y = "ssGSEA score",
+        title = paste(
+            "Pathway activity in MSS/TMB-H tumors",
+            "stratified by POLE/POLD1 status"
+        )
+    ) +
+    ggplot2::theme_classic(
+        base_size = 11
+    ) +
+    ggplot2::theme(
+        axis.text.x =
+            ggplot2::element_text(
+                angle = 35,
+                hjust = 1
+            ),
+        strip.background =
+            ggplot2::element_blank(),
+        strip.text =
+            ggplot2::element_text(
+                face = "bold"
+            )
+    )
+
+ggplot2::ggsave(
+    filename = file.path(
+        figure_dir,
+        "Figure_MSS_TMBH_pathways_by_POLE_POLD1_status.svg"
+    ),
+    plot = pathway_plot,
+    device = svglite::svglite,
+    width = 11,
+    height = 8
+)
+
+
+
+
+
+binary_plot <- ggplot2::ggplot(
+    mss_tmbh_binary,
+    ggplot2::aes(
+        x = polymerase_binary,
+        y = pathway_score
+    )
+) +
+    ggplot2::geom_boxplot(
+        outlier.shape = NA,
+        width = 0.65
+    ) +
+    ggplot2::geom_jitter(
+        width = 0.14,
+        height = 0,
+        alpha = 0.75,
+        size = 1.7
+    ) +
+    ggplot2::facet_grid(
+        pathway ~ cancer_group,
+        scales = "free_y"
+    ) +
+    ggplot2::labs(
+        x = NULL,
+        y = "ssGSEA score",
+        title = paste(
+            "MSS/TMB-H pathway activity:",
+            "polymerase-mutant versus wild-type"
+        )
+    ) +
+    ggplot2::theme_classic(
+        base_size = 11
+    ) +
+    ggplot2::theme(
+        axis.text.x =
+            ggplot2::element_text(
+                angle = 25,
+                hjust = 1
+            ),
+        strip.background =
+            ggplot2::element_blank(),
+        strip.text =
+            ggplot2::element_text(
+                face = "bold"
+            )
+    )
+
+ggplot2::ggsave(
+    filename = file.path(
+        figure_dir,
+        "Figure_MSS_TMBH_pathways_mutant_vs_wildtype.svg"
+    ),
+    plot = binary_plot,
+    device = svglite::svglite,
+    width = 10,
+    height = 8
+)
+
+
+
+
+
+saveRDS(
+    mss_tmbh_annotated,
+    file.path(
+        output_dir,
+        "MSS_TMBH_with_POLE_POLD1_status.rds"
+    )
+)
+
+saveRDS(
+    mss_tmbh_long,
+    file.path(
+        output_dir,
+        "MSS_TMBH_pathway_scores_long.rds"
+    )
+)
+
+
+
+
+
+cat("\nBroad POLE/POLD1 status:\n")
+print(
+    tibble::as_tibble(
+        broad_status_counts
+    ),
+    n = Inf
+)
+
+cat("\nPathogenic and VUS status:\n")
+print(
+    tibble::as_tibble(
+        detailed_status_counts
+    ),
+    n = Inf
+)
+
+cat("\nMutant versus wild-type pathway tests:\n")
+print(
+    tibble::as_tibble(
+        wilcox_results
+    ),
+    n = Inf
+)
+
+cat(
+    "\nResults saved under:\n",
+    normalizePath(output_dir),
+    "\n"
+)
+```

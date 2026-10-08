@@ -1,0 +1,1077 @@
+```{r}
+params <- list(
+  
+  previous_output_root =
+    "bootstrap_stable_analysis",
+
+  
+  original_crc_de_dir =
+    "data/DE_results",
+
+  
+  comparison_output_dir =
+    "bootstrap_stable_analysis/results/bootstrap_comparison",
+
+  
+  fdr_cutoff = 0.05,
+  logfc_cutoff = 1,
+
+  
+  
+  
+  
+  bootstrap_assessed_contrasts = c(
+    "MSI_H_vs_MSS_TMB_H",
+    "MSS_TMB_H_vs_MSS_TMB_L"
+  )
+)
+
+contrast_names <- c(
+  "MSI_H_vs_MSS_TMB_H",
+  "MSI_H_vs_MSS_TMB_L",
+  "MSS_TMB_H_vs_MSS_TMB_L"
+)
+
+required_packages <- c(
+  "dplyr",
+  "tidyr",
+  "tibble",
+  "ggplot2",
+  "openxlsx",
+  "svglite",
+  "knitr"
+)
+
+missing_packages <- required_packages[
+  !vapply(
+    required_packages,
+    requireNamespace,
+    logical(1),
+    quietly = TRUE
+  )
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing required R packages: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 9,
+  fig.height = 6
+)
+
+stable_crc_de_dir <- file.path(
+  params$previous_output_root,
+  "data",
+  "DE_results",
+  "CRC"
+)
+
+stable_crc_only_dir <- file.path(
+  stable_crc_de_dir,
+  "stable_only"
+)
+
+previous_stable_gene_file <- file.path(
+  params$previous_output_root,
+  "bootstrap_stable_genes_all_contrasts.csv"
+)
+
+previous_stable_count_file <- file.path(
+  params$previous_output_root,
+  "bootstrap_stable_gene_counts.csv"
+)
+
+dir.create(
+  params$comparison_output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+as_flag <- function(x) {
+  if (is.logical(x)) {
+    return(replace(x, is.na(x), FALSE))
+  }
+
+  if (is.numeric(x)) {
+    return(!is.na(x) & x != 0)
+  }
+
+  tolower(trimws(as.character(x))) %in%
+    c("true", "t", "1", "yes", "y")
+}
+
+safe_max_abs <- function(x) {
+  x <- as.numeric(x)
+
+  if (length(x) == 0 || all(is.na(x))) {
+    return(NA_real_)
+  }
+
+  max(abs(x), na.rm = TRUE)
+}
+
+safe_percentage <- function(numerator, denominator) {
+  ifelse(
+    is.na(denominator) | denominator == 0,
+    NA_real_,
+    round(100 * numerator / denominator, 2)
+  )
+}
+```
+
+```{r}
+input_manifest <- tibble(
+  Contrast = contrast_names,
+  Bootstrap_assessed =
+    contrast_names %in% params$bootstrap_assessed_contrasts,
+
+  Original_DE_file = file.path(
+    params$original_crc_de_dir,
+    paste0(contrast_names, ".csv")
+  ),
+
+  Stable_full_file = file.path(
+    stable_crc_de_dir,
+    paste0(contrast_names, ".csv")
+  ),
+
+  Stable_only_file = file.path(
+    stable_crc_only_dir,
+    paste0(contrast_names, ".csv")
+  )
+) %>%
+  mutate(
+    Original_exists = file.exists(Original_DE_file),
+    Stable_full_exists = file.exists(Stable_full_file),
+    Stable_only_exists = file.exists(Stable_only_file)
+  )
+
+knitr::kable(
+  input_manifest,
+  caption = "Input files used for the comparison"
+)
+
+missing_required_files <- input_manifest %>%
+  filter(!Original_exists | !Stable_full_exists)
+
+if (nrow(missing_required_files) > 0) {
+  stop(
+    "Required input files are missing:\n",
+    paste(
+      apply(
+        missing_required_files,
+        1,
+        function(x) {
+          paste(
+            x[["Contrast"]],
+            "original exists =", x[["Original_exists"]],
+            "stable exists =", x[["Stable_full_exists"]]
+          )
+        }
+      ),
+      collapse = "\n"
+    )
+  )
+}
+
+if (any(!input_manifest$Stable_only_exists)) {
+  warning(
+    "One or more stable-only files are missing. ",
+    "The main comparison can still be performed using the ",
+    "bootstrap_stable column in the full stable files."
+  )
+}
+```
+
+```{r}
+if (file.exists(previous_stable_count_file)) {
+  previous_stable_counts <- read.csv(
+    previous_stable_count_file,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+
+  knitr::kable(
+    previous_stable_counts,
+    caption = "Gene counts written by the previous Rmd"
+  )
+} else {
+  cat(
+    "Previous count file not found:",
+    previous_stable_count_file,
+    "\n"
+  )
+}
+
+if (file.exists(previous_stable_gene_file)) {
+  previous_stable_genes <- read.csv(
+    previous_stable_gene_file,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+
+  cat(
+    "Rows in bootstrap_stable_genes_all_contrasts.csv:",
+    nrow(previous_stable_genes),
+    "\n"
+  )
+} else {
+  cat(
+    "Previous stable-gene file not found:",
+    previous_stable_gene_file,
+    "\n"
+  )
+}
+```
+
+```{r}
+read_deg_file <- function(file, require_stability_column = FALSE) {
+  if (!file.exists(file)) {
+    stop("File does not exist: ", file)
+  }
+
+  tab <- read.csv(
+    file,
+    row.names = 1,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+
+  tab <- tibble::rownames_to_column(
+    tab,
+    var = "Gene"
+  ) %>%
+    tibble::as_tibble()
+
+  required_columns <- c("logFC", "FDR")
+
+  missing_columns <- setdiff(
+    required_columns,
+    names(tab)
+  )
+
+  if (length(missing_columns) > 0) {
+    stop(
+      "Missing required columns in ",
+      file,
+      ": ",
+      paste(missing_columns, collapse = ", "),
+      "\nAvailable columns: ",
+      paste(names(tab), collapse = ", ")
+    )
+  }
+
+  if (
+    require_stability_column &&
+    !"bootstrap_stable" %in% names(tab)
+  ) {
+    stop(
+      "The stable result file does not contain bootstrap_stable: ",
+      file
+    )
+  }
+
+  tab <- tab %>%
+    mutate(
+      Gene = trimws(as.character(Gene)),
+      logFC = as.numeric(logFC),
+      FDR = as.numeric(FDR)
+    )
+
+  if ("PValue" %in% names(tab)) {
+    tab$PValue <- as.numeric(tab$PValue)
+  }
+
+  if ("logCPM" %in% names(tab)) {
+    tab$logCPM <- as.numeric(tab$logCPM)
+  }
+
+  if ("bootstrap_stable" %in% names(tab)) {
+    tab$bootstrap_stable <- as_flag(
+      tab$bootstrap_stable
+    )
+  }
+
+  if (anyDuplicated(tab$Gene) > 0) {
+    duplicated_genes <- unique(
+      tab$Gene[duplicated(tab$Gene)]
+    )
+
+    stop(
+      "Duplicated gene identifiers found in ",
+      file,
+      ": ",
+      paste(head(duplicated_genes, 20), collapse = ", ")
+    )
+  }
+
+  tab
+}
+```
+
+```{r}
+comparison_list <- vector(
+  "list",
+  length(contrast_names)
+)
+
+names(comparison_list) <- contrast_names
+
+for (contrast_name in contrast_names) {
+  original_file <- file.path(
+    params$original_crc_de_dir,
+    paste0(contrast_name, ".csv")
+  )
+
+  stable_file <- file.path(
+    stable_crc_de_dir,
+    paste0(contrast_name, ".csv")
+  )
+
+  stable_only_file <- file.path(
+    stable_crc_only_dir,
+    paste0(contrast_name, ".csv")
+  )
+
+  original_tab <- read_deg_file(
+    original_file,
+    require_stability_column = FALSE
+  )
+
+  stable_tab <- read_deg_file(
+    stable_file,
+    require_stability_column = TRUE
+  )
+
+  if (file.exists(stable_only_file)) {
+    stable_only_tab <- read_deg_file(
+      stable_only_file,
+      require_stability_column = TRUE
+    )
+
+    stable_only_genes <- stable_only_tab$Gene
+  } else {
+    stable_only_genes <- character(0)
+  }
+
+  stable_for_join <- stable_tab %>%
+    transmute(
+      Gene,
+      stable_file_logFC = logFC,
+      stable_file_FDR = FDR,
+      bootstrap_stable_from_file = bootstrap_stable
+    )
+
+  contrast_assessed <-
+    contrast_name %in% params$bootstrap_assessed_contrasts
+
+  comparison_tab <- original_tab %>%
+    left_join(
+      stable_for_join,
+      by = "Gene"
+    ) %>%
+    mutate(
+      Contrast = contrast_name,
+      Bootstrap_assessed = contrast_assessed,
+
+      Stable_record_found =
+        !is.na(bootstrap_stable_from_file),
+
+      Stable_only_record_found =
+        Gene %in% stable_only_genes,
+
+      Original_significant =
+        !is.na(FDR) &
+        !is.na(logFC) &
+        FDR <= params$fdr_cutoff &
+        abs(logFC) >= params$logfc_cutoff,
+
+      Original_direction = case_when(
+        Original_significant & logFC > 0 ~ "Up",
+        Original_significant & logFC < 0 ~ "Down",
+        TRUE ~ "Not significant"
+      ),
+
+      logFC_difference =
+        stable_file_logFC - logFC,
+
+      FDR_difference =
+        stable_file_FDR - FDR
+    )
+
+  if (contrast_assessed) {
+    comparison_tab <- comparison_tab %>%
+      mutate(
+        Bootstrap_stable = coalesce(
+          bootstrap_stable_from_file,
+          FALSE
+        ),
+
+        Bootstrap_stable_DE =
+          Original_significant &
+          Bootstrap_stable,
+
+        Comparison_status = case_when(
+          !Original_significant ~
+            "Not significant in original DE",
+
+          !Stable_record_found ~
+            "Original DEG missing from stable full file",
+
+          Bootstrap_stable ~
+            "Original DEG passed bootstrap",
+
+          TRUE ~
+            "Original DEG failed bootstrap"
+        )
+      )
+  } else {
+    comparison_tab <- comparison_tab %>%
+      mutate(
+        Bootstrap_stable = NA,
+
+        Bootstrap_stable_DE = NA,
+
+        Comparison_status = case_when(
+          Original_significant ~
+            "Original DEG; contrast not assessed by bootstrap",
+
+          TRUE ~
+            "Not significant in original DE"
+        )
+      )
+  }
+
+  comparison_list[[contrast_name]] <- comparison_tab
+}
+
+comparison_all <- bind_rows(
+  comparison_list
+)
+
+cat(
+  "Total tested gene rows:",
+  nrow(comparison_all),
+  "\n"
+)
+```
+
+```{r}
+qc_summary <- comparison_all %>%
+  group_by(
+    Contrast,
+    Bootstrap_assessed
+  ) %>%
+  summarise(
+    Original_rows = n(),
+
+    Rows_found_in_stable_full_file =
+      sum(Stable_record_found),
+
+    Rows_missing_from_stable_full_file =
+      sum(!Stable_record_found),
+
+    Maximum_absolute_logFC_difference =
+      safe_max_abs(logFC_difference),
+
+    Maximum_absolute_FDR_difference =
+      safe_max_abs(FDR_difference),
+
+    Stable_flag_vs_stable_only_mismatches =
+      if (first(Bootstrap_assessed)) {
+        sum(
+          Stable_record_found &
+            (
+              bootstrap_stable_from_file !=
+                Stable_only_record_found
+            ),
+          na.rm = TRUE
+        )
+      } else {
+        NA_integer_
+      },
+
+    .groups = "drop"
+  )
+
+knitr::kable(
+  qc_summary,
+  digits = 8,
+  caption = "Quality-control comparison of original and stable files"
+)
+
+if (
+  any(
+    qc_summary$Rows_missing_from_stable_full_file > 0,
+    na.rm = TRUE
+  )
+) {
+  warning(
+    "Some original genes are missing from the stable full files. ",
+    "They are treated as not passing bootstrap for assessed contrasts."
+  )
+}
+
+if (
+  any(
+    qc_summary$Maximum_absolute_logFC_difference > 1e-12,
+    na.rm = TRUE
+  ) ||
+  any(
+    qc_summary$Maximum_absolute_FDR_difference > 1e-12,
+    na.rm = TRUE
+  )
+) {
+  warning(
+    "Original and stable full files contain different edgeR statistics. ",
+    "Inspect the QC table before interpreting the comparison."
+  )
+}
+```
+
+```{r}
+comparison_summary <- comparison_all %>%
+  group_by(
+    Contrast,
+    Bootstrap_assessed
+  ) %>%
+  summarise(
+    Genes_tested = n(),
+
+    Original_DE_genes =
+      sum(Original_significant, na.rm = TRUE),
+
+    Original_upregulated =
+      sum(
+        Original_significant & logFC > 0,
+        na.rm = TRUE
+      ),
+
+    Original_downregulated =
+      sum(
+        Original_significant & logFC < 0,
+        na.rm = TRUE
+      ),
+
+    Bootstrap_stable_DE_genes =
+      if (first(Bootstrap_assessed)) {
+        sum(
+          Bootstrap_stable_DE,
+          na.rm = TRUE
+        )
+      } else {
+        NA_integer_
+      },
+
+    Bootstrap_stable_upregulated =
+      if (first(Bootstrap_assessed)) {
+        sum(
+          Bootstrap_stable_DE & logFC > 0,
+          na.rm = TRUE
+        )
+      } else {
+        NA_integer_
+      },
+
+    Bootstrap_stable_downregulated =
+      if (first(Bootstrap_assessed)) {
+        sum(
+          Bootstrap_stable_DE & logFC < 0,
+          na.rm = TRUE
+        )
+      } else {
+        NA_integer_
+      },
+
+    Original_DE_genes_failing_bootstrap =
+      if (first(Bootstrap_assessed)) {
+        sum(
+          Original_significant &
+            !Bootstrap_stable,
+          na.rm = TRUE
+        )
+      } else {
+        NA_integer_
+      },
+
+    Original_DE_genes_missing_stability_record =
+      if (first(Bootstrap_assessed)) {
+        sum(
+          Original_significant &
+            !Stable_record_found,
+          na.rm = TRUE
+        )
+      } else {
+        NA_integer_
+      },
+
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Retained_percent = safe_percentage(
+      Bootstrap_stable_DE_genes,
+      Original_DE_genes
+    ),
+
+    Removed_percent = safe_percentage(
+      Original_DE_genes_failing_bootstrap,
+      Original_DE_genes
+    )
+  )
+
+knitr::kable(
+  comparison_summary,
+  digits = 2,
+  caption = "Original DEGs compared with bootstrap-stable DEGs"
+)
+```
+
+```{r}
+preferred_gene_columns <- c(
+  "Contrast",
+  "Gene",
+  "logFC",
+  "logCPM",
+  "F",
+  "PValue",
+  "FDR",
+  "Original_direction",
+  "Stable_record_found",
+  "Stable_only_record_found",
+  "Bootstrap_stable",
+  "Comparison_status"
+)
+
+genes_not_passing_bootstrap <- comparison_all %>%
+  filter(
+    Bootstrap_assessed,
+    Original_significant,
+    !Bootstrap_stable
+  ) %>%
+  select(
+    any_of(preferred_gene_columns),
+    everything()
+  ) %>%
+  arrange(
+    Contrast,
+    FDR,
+    desc(abs(logFC))
+  )
+
+genes_passing_bootstrap <- comparison_all %>%
+  filter(
+    Bootstrap_assessed,
+    Original_significant,
+    Bootstrap_stable
+  ) %>%
+  select(
+    any_of(preferred_gene_columns),
+    everything()
+  ) %>%
+  arrange(
+    Contrast,
+    FDR,
+    desc(abs(logFC))
+  )
+
+all_original_de_genes <- comparison_all %>%
+  filter(Original_significant) %>%
+  select(
+    any_of(preferred_gene_columns),
+    everything()
+  ) %>%
+  arrange(
+    Contrast,
+    FDR,
+    desc(abs(logFC))
+  )
+
+unassessed_original_de_genes <- comparison_all %>%
+  filter(
+    !Bootstrap_assessed,
+    Original_significant
+  ) %>%
+  select(
+    any_of(preferred_gene_columns),
+    everything()
+  ) %>%
+  arrange(
+    Contrast,
+    FDR,
+    desc(abs(logFC))
+  )
+
+failed_counts <- genes_not_passing_bootstrap %>%
+  count(
+    Contrast,
+    Original_direction,
+    name = "Genes_not_passing"
+  ) %>%
+  arrange(
+    Contrast,
+    Original_direction
+  )
+
+cat(
+  "Original significant genes failing bootstrap:",
+  nrow(genes_not_passing_bootstrap),
+  "\n"
+)
+
+knitr::kable(
+  failed_counts,
+  caption = "Genes not passing bootstrap by contrast and direction"
+)
+```
+
+```{r}
+failed_display <- genes_not_passing_bootstrap %>%
+  select(
+    any_of(
+      c(
+        "Contrast",
+        "Gene",
+        "logFC",
+        "logCPM",
+        "PValue",
+        "FDR",
+        "Original_direction",
+        "Comparison_status"
+      )
+    )
+  ) %>%
+  slice_head(n = 50)
+
+if (nrow(failed_display) == 0) {
+  cat("No originally significant genes failed bootstrap.\n")
+} else {
+  knitr::kable(
+    failed_display,
+    digits = 5,
+    caption = "First 50 original DEGs that do not pass bootstrap"
+  )
+}
+```
+
+```{r}
+plot_count_data <- comparison_summary %>%
+  filter(Bootstrap_assessed) %>%
+  select(
+    Contrast,
+    Original_DE_genes,
+    Bootstrap_stable_DE_genes
+  ) %>%
+  pivot_longer(
+    cols = c(
+      Original_DE_genes,
+      Bootstrap_stable_DE_genes
+    ),
+    names_to = "Analysis",
+    values_to = "Number_of_genes"
+  ) %>%
+  mutate(
+    Analysis = recode(
+      Analysis,
+      Original_DE_genes = "Original DE",
+      Bootstrap_stable_DE_genes =
+        "Original DE + bootstrap stability"
+    )
+  )
+
+if (nrow(plot_count_data) > 0) {
+  p_counts <- ggplot(
+    plot_count_data,
+    aes(
+      x = Contrast,
+      y = Number_of_genes,
+      fill = Analysis
+    )
+  ) +
+    geom_col(
+      position = position_dodge(width = 0.8),
+      width = 0.72
+    ) +
+    geom_text(
+      aes(label = Number_of_genes),
+      position = position_dodge(width = 0.8),
+      vjust = -0.3,
+      size = 3.8
+    ) +
+    labs(
+      title = "Original versus bootstrap-stable CRC DEGs",
+      x = NULL,
+      y = "Number of significant genes",
+      fill = NULL
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      axis.text.x = element_text(
+        angle = 25,
+        hjust = 1
+      ),
+      legend.position = "top"
+    ) +
+    expand_limits(
+      y = max(plot_count_data$Number_of_genes) * 1.12
+    )
+
+  print(p_counts)
+
+  ggsave(
+    file.path(
+      params$comparison_output_dir,
+      "original_vs_bootstrap_DEG_counts.svg"
+    ),
+    p_counts,
+    width = 8.5,
+    height = 5.5,
+    device = "svg"
+  )
+
+  ggsave(
+    file.path(
+      params$comparison_output_dir,
+      "original_vs_bootstrap_DEG_counts.pdf"
+    ),
+    p_counts,
+    width = 8.5,
+    height = 5.5
+  )
+}
+```
+
+```{r}
+retention_plot_data <- comparison_summary %>%
+  filter(
+    Bootstrap_assessed,
+    !is.na(Retained_percent)
+  )
+
+if (nrow(retention_plot_data) > 0) {
+  p_retention <- ggplot(
+    retention_plot_data,
+    aes(
+      x = Contrast,
+      y = Retained_percent
+    )
+  ) +
+    geom_col(width = 0.65) +
+    geom_text(
+      aes(
+        label = paste0(
+          Retained_percent,
+          "%"
+        )
+      ),
+      vjust = -0.35,
+      size = 4
+    ) +
+    coord_cartesian(
+      ylim = c(
+        0,
+        max(
+          100,
+          retention_plot_data$Retained_percent * 1.12
+        )
+      )
+    ) +
+    labs(
+      title = "Percentage of original CRC DEGs retained after bootstrap",
+      x = NULL,
+      y = "Original DEGs retained (%)"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      axis.text.x = element_text(
+        angle = 25,
+        hjust = 1
+      )
+    )
+
+  print(p_retention)
+
+  ggsave(
+    file.path(
+      params$comparison_output_dir,
+      "bootstrap_DEG_retention_percentage.svg"
+    ),
+    p_retention,
+    width = 8,
+    height = 5,
+    device = "svg"
+  )
+
+  ggsave(
+    file.path(
+      params$comparison_output_dir,
+      "bootstrap_DEG_retention_percentage.pdf"
+    ),
+    p_retention,
+    width = 8,
+    height = 5
+  )
+}
+```
+
+```{r}
+write.csv(
+  comparison_summary,
+  file.path(
+    params$comparison_output_dir,
+    "original_DE_vs_bootstrap_summary.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  genes_not_passing_bootstrap,
+  file.path(
+    params$comparison_output_dir,
+    "original_DE_genes_not_passing_bootstrap.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  genes_passing_bootstrap,
+  file.path(
+    params$comparison_output_dir,
+    "original_DE_genes_passing_bootstrap.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  all_original_de_genes,
+  file.path(
+    params$comparison_output_dir,
+    "all_original_DE_genes_with_bootstrap_status.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  unassessed_original_de_genes,
+  file.path(
+    params$comparison_output_dir,
+    "original_DE_genes_in_unassessed_contrasts.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  comparison_all,
+  file.path(
+    params$comparison_output_dir,
+    "all_tested_genes_original_vs_bootstrap.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  qc_summary,
+  file.path(
+    params$comparison_output_dir,
+    "comparison_quality_control.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  input_manifest,
+  file.path(
+    params$comparison_output_dir,
+    "comparison_input_manifest.csv"
+  ),
+  row.names = FALSE
+)
+
+
+for (
+  contrast_name in
+  params$bootstrap_assessed_contrasts
+) {
+  contrast_failed <- genes_not_passing_bootstrap %>%
+    filter(Contrast == contrast_name)
+
+  write.csv(
+    contrast_failed,
+    file.path(
+      params$comparison_output_dir,
+      paste0(
+        "genes_not_passing_bootstrap_",
+        contrast_name,
+        ".csv"
+      )
+    ),
+    row.names = FALSE
+  )
+}
+
+excel_file <- file.path(
+  params$comparison_output_dir,
+  "original_DE_vs_bootstrap_comparison.xlsx"
+)
+
+openxlsx::write.xlsx(
+  list(
+    Summary = comparison_summary,
+    Failed_bootstrap = genes_not_passing_bootstrap,
+    Passed_bootstrap = genes_passing_bootstrap,
+    Original_DE_all = all_original_de_genes,
+    Unassessed_DE = unassessed_original_de_genes,
+    QC = qc_summary,
+    Input_manifest = input_manifest,
+    All_tested_genes = comparison_all
+  ),
+  file = excel_file,
+  overwrite = TRUE
+)
+
+cat(
+  "Comparison results saved to:\n",
+  params$comparison_output_dir,
+  "\n\nExcel workbook:\n",
+  excel_file,
+  "\n"
+)
+```
+
+```{r}
+comparison_output_manifest <- list.files(
+  params$comparison_output_dir,
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+writeLines(
+  comparison_output_manifest,
+  file.path(
+    params$comparison_output_dir,
+    "output_manifest.txt"
+  )
+)
+
+cat(
+  paste(
+    comparison_output_manifest,
+    collapse = "\n"
+  )
+)
+```
+
+```{r}
+sessionInfo()
+```
