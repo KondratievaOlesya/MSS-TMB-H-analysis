@@ -1,0 +1,25 @@
+# Local study data and generated analysis files
+/data/*
+!/data/clinical_data.csv
+!/data/ucec_clinical.csv
+/clinvar/
+/pole_pold1_results/
+/pole_pold1_pathway_analysis/
+/paper_figures/
+/bootstrap_validated_downstream_analysis/
+/bootstrap_validated_miRNA_analysis/
+/GDCdata/
+
+# Rendered notebooks and local runtime files
+/*.html
+/reports/
+/scripts/**/*.html
+/scripts/**/*.knit.md
+/scripts/**/*.utf8.md
+*_files/
+*_cache/
+.Rhistory
+.RData
+Rplots.pdf
+.ipynb_checkpoints/
+__pycache__/

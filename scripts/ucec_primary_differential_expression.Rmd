@@ -1,0 +1,74 @@
+---
+title: "UCEC primary differential expression for drug signatures"
+output: html_document
+---
+
+Fit the UCEC edgeR analysis used by the drug signature notebook. Export the three MSI/TMB contrasts.
+
+```{r project-root, include=FALSE}
+project_root <- Sys.getenv("MSS_TMB_PROJECT_ROOT", unset = "")
+if (!nzchar(project_root)) {
+  project_root <- file.path(dirname(knitr::current_input(dir = TRUE)), "..")
+}
+knitr::opts_knit$set(root.dir = normalizePath(project_root, mustWork = TRUE))
+```
+
+```{r setup, include=FALSE}
+library(edgeR)
+
+ucec_res_dir <- "data/DE_results/ucec"
+dir.create(ucec_res_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Fit the model and export contrasts
+
+```{r differential-expression}
+clinical_data <- read.csv(
+  "data/ucec_clinical.csv",
+  header = TRUE,
+  stringsAsFactors = FALSE,
+  fileEncoding = "UTF-8",
+  na.strings = c("NA", "")
+)
+rownames(clinical_data) <- clinical_data$sample_submitter_id
+clinical_data <- clinical_data[!is.na(clinical_data$MSI_TMB), ]
+
+counts <- as.matrix(read.csv(
+  "data/UCEC/count_gene_name.csv",
+  row.names = 1,
+  check.names = FALSE
+))
+
+clinical_data$MSI_TMB <- factor(
+  clinical_data$MSI_TMB,
+  levels = c("MSI-H", "MSS/TMB-H", "MSS/TMB-L"),
+  labels = c("MSI_H", "MSS_TMB_H", "MSS_TMB_L")
+)
+
+common_samples <- intersect(colnames(counts), rownames(clinical_data))
+counts <- counts[, common_samples, drop = FALSE]
+clinical_data <- clinical_data[common_samples, , drop = FALSE]
+
+y <- DGEList(counts = counts, group = clinical_data$MSI_TMB)
+keep <- filterByExpr(y, group = clinical_data$MSI_TMB, min.count = 10)
+y <- y[keep, , keep.lib.sizes = FALSE]
+y <- calcNormFactors(y, method = "TMM")
+
+design <- model.matrix(~0 + clinical_data$MSI_TMB)
+colnames(design) <- levels(clinical_data$MSI_TMB)
+
+y <- estimateDisp(y, design, robust = TRUE)
+fit <- glmQLFit(y, design, robust = TRUE)
+
+ucec_contrasts <- list(
+  MSI_H_vs_MSS_TMB_H = makeContrasts(MSI_H - MSS_TMB_H, levels = design),
+  MSI_H_vs_MSS_TMB_L = makeContrasts(MSI_H - MSS_TMB_L, levels = design),
+  MSS_TMB_H_vs_MSS_TMB_L = makeContrasts(MSS_TMB_H - MSS_TMB_L, levels = design)
+)
+
+for (nm in names(ucec_contrasts)) {
+  qlf <- glmQLFTest(fit, contrast = ucec_contrasts[[nm]])
+  res <- topTags(qlf, n = Inf)$table
+  write.csv(res, file.path(ucec_res_dir, paste0(nm, ".csv")))
+}
+```

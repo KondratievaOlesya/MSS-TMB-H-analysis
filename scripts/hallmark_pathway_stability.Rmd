@@ -1,0 +1,121 @@
+---
+title: "Hallmark pathway bootstrap stability"
+output:
+  html_document:
+    toc: true
+params:
+  bootstrap_iterations: 500
+  random_seed: 20260805
+---
+
+Fit the three MSI/TMB contrasts on the sample-level Hallmark ssGSEA scores and resample patients within MSI/TMB groups. Export the limma contrast estimates and bootstrap stability summaries used in Figure 3.
+
+```{r project-root, include=FALSE}
+project_root <- Sys.getenv("MSS_TMB_PROJECT_ROOT", unset = "")
+if (!nzchar(project_root)) {
+  project_root <- file.path(dirname(knitr::current_input(dir = TRUE)), "..")
+}
+knitr::opts_knit$set(root.dir = normalizePath(project_root, mustWork = TRUE))
+```
+
+```{r setup, include=FALSE}
+library(limma)
+library(knitr)
+
+iterations <- params$bootstrap_iterations
+stopifnot(length(iterations) == 1L, is.finite(iterations),
+          iterations >= 2, iterations == floor(iterations))
+set.seed(params$random_seed)
+
+groups <- c("MSI_H", "MSS_TMB_H", "MSS_TMB_L")
+group_labels <- c("MSI-H", "MSS/TMB-H", "MSS/TMB-L")
+output_root <- "bootstrap_validated_downstream_analysis/results/GSEA_bootstrap"
+```
+
+## Fit primary and bootstrap contrasts
+
+```{r bootstrap-functions}
+summarize_pathways <- function(scores_file, clinical_file, cohort) {
+  scores <- as.matrix(read.csv(scores_file, row.names = 1, check.names = FALSE))
+  clinical <- read.csv(clinical_file)
+  normalize_id <- function(ids) toupper(gsub(".", "-", ids, fixed = TRUE))
+  clinical_ids <- normalize_id(clinical$sample_submitter_id)
+  stopifnot(!anyDuplicated(clinical_ids), !anyDuplicated(colnames(scores)),
+            is.numeric(scores), all(is.finite(scores)))
+
+  group <- factor(
+    clinical$MSI_TMB[match(normalize_id(colnames(scores)), clinical_ids)],
+    levels = group_labels,
+    labels = groups
+  )
+  scores <- scores[, !is.na(group), drop = FALSE]
+  group <- group[!is.na(group)]
+  group_indices <- split(seq_along(group), group)
+  if (any(lengths(group_indices) < 2L)) {
+    stop(cohort, " requires at least two scored samples in each MSI/TMB group.")
+  }
+
+  design <- model.matrix(~ 0 + group)
+  colnames(design) <- groups
+  contrasts <- makeContrasts(
+    MSI_H_vs_MSS_TMB_L = MSI_H - MSS_TMB_L,
+    MSI_H_vs_MSS_TMB_H = MSI_H - MSS_TMB_H,
+    MSS_TMB_H_vs_MSS_TMB_L = MSS_TMB_H - MSS_TMB_L,
+    levels = design
+  )
+
+  fit_contrasts <- function(indices) {
+    fit <- lmFit(scores[, indices, drop = FALSE], design[indices, , drop = FALSE])
+    eBayes(contrasts.fit(fit, contrasts))
+  }
+
+  primary <- fit_contrasts(seq_len(ncol(scores)))
+  boot <- array(NA_real_, c(nrow(scores), ncol(contrasts), iterations))
+  for (iteration in seq_len(iterations)) {
+    indices <- unlist(lapply(group_indices, function(idx) {
+      sample(idx, length(idx), replace = TRUE)
+    }), use.names = FALSE)
+    boot[, , iteration] <- fit_contrasts(indices)$coefficients
+  }
+
+  do.call(rbind, lapply(seq_len(ncol(contrasts)), function(j) {
+    effects <- matrix(boot[, j, ], nrow = nrow(scores))
+    primary_effect <- primary$coefficients[, j]
+    tested <- is.finite(effects)
+    data.frame(
+      Contrast = colnames(contrasts)[j],
+      pathway = rownames(scores),
+      primary_logFC = unname(primary_effect),
+      primary_FDR = p.adjust(primary$p.value[, j], method = "BH"),
+      tested_rate = rowMeans(tested),
+      bootstrap_sign_consistency = rowMeans(
+        ifelse(tested, sign(effects) == sign(primary_effect), NA),
+        na.rm = TRUE
+      ),
+      bootstrap_median_logFC = apply(effects, 1, median, na.rm = TRUE),
+      bootstrap_logFC_q025 = apply(effects, 1, quantile, probs = 0.025, na.rm = TRUE),
+      bootstrap_logFC_q975 = apply(effects, 1, quantile, probs = 0.975, na.rm = TRUE),
+      row.names = NULL
+    )
+  }))
+}
+```
+
+## Export cohort summaries
+
+```{r export, results='asis'}
+inputs <- list(
+  CRC = c("data/prepared/gsva_ssgsea_hallmark.csv", "data/clinical_data.csv"),
+  UCEC = c("data/prepared/ucec_gsva_ssgsea_hallmark.csv", "data/ucec_clinical.csv")
+)
+
+for (cohort in names(inputs)) {
+  files <- inputs[[cohort]]
+  summary <- summarize_pathways(files[1], files[2], cohort)
+  output_dir <- file.path(output_root, cohort)
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  write.csv(summary, file.path(output_dir, paste0(cohort, "_GSVA_bootstrap_stability_summary.csv")),
+            row.names = FALSE)
+  print(kable(head(summary), caption = paste(cohort, "Hallmark pathway stability")))
+}
+```

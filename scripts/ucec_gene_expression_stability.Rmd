@@ -62,18 +62,6 @@ library(ggplot2)
 library(fs)
 library(knitr)
 
-params <- list(
-  clinical_file = "data/ucec_clinical.csv",
-  counts_file = "data/UCEC/count_gene_name.csv",
-  output_dir = "data/DE_results/ucec_gene_DE",
-  bootstrap_iterations = 500L,
-  random_seed = 20260804L,
-  fdr_threshold = 0.05,
-  sign_consistency_threshold = 0.90,
-  repeated_significance_threshold = 0.70,
-  parallel_workers = 23L
-)
-
 knitr::opts_chunk$set(
   echo = TRUE,
   message = TRUE,
@@ -172,9 +160,6 @@ if (anyDuplicated(rownames(counts))) {
   stop("The count matrix contains duplicated gene names.")
 }
 
-if (anyDuplicated(colnames(counts))) {
-  stop("The count matrix contains duplicated sample names.")
-}
 ```
 
 ```{r}
@@ -687,11 +672,18 @@ run_resampling_parallel <- function(
     ceiling(seq_len(n_resamples) / batch_size)
   )
 
-  bp <- BiocParallel::MulticoreParam(
-    workers = n_cores,
-    RNGseed = random_seed,
-    progressbar = TRUE
-  )
+  bp <- if (.Platform$OS.type == "unix" && n_cores > 1L) {
+    BiocParallel::MulticoreParam(
+      workers = n_cores,
+      RNGseed = random_seed,
+      progressbar = TRUE
+    )
+  } else {
+    BiocParallel::SerialParam(
+      RNGseed = random_seed,
+      progressbar = TRUE
+    )
+  }
 
   parts <- BiocParallel::bplapply(
     batch_ids,
@@ -1258,7 +1250,7 @@ knitr::kable(
 
 ## Stratified bootstrap analysis
 
-```{r bootstrap-run, cache=TRUE}
+```{r bootstrap-run}
 set.seed(params$random_seed)
 
 B <- as.integer(
@@ -1342,7 +1334,7 @@ message(
 
 ## Leave-one-MSS/TMB-H-out analysis
 
-```{r leave-one-out-run, cache=TRUE}
+```{r leave-one-out-run}
 mss_tmb_h_indices <- which(
   clinical_data$MSI_TMB ==
     "MSS_TMB_H"

@@ -21,7 +21,7 @@ knitr::opts_knit$set(root.dir = normalizePath(project_root, mustWork = TRUE))
 ```{r setup, message=FALSE, warning=FALSE}
 required_packages <- c(
   "dplyr", "tidyr", "tibble", "stringr", "ggplot2",
-  "gprofiler2", "multiMiR", "openxlsx", "svglite", "knitr"
+  "gprofiler2", "openxlsx", "svglite", "knitr"
 )
 
 missing_packages <- required_packages[
@@ -38,7 +38,6 @@ library(tibble)
 library(stringr)
 library(ggplot2)
 library(gprofiler2)
-library(multiMiR)
 library(openxlsx)
 library(svglite)
 
@@ -600,6 +599,10 @@ write.csv(
 query_one_mirna <- function(pre_miRNA, mature_query) {
   message("Querying multiMiR: ", mature_query)
 
+  if (!requireNamespace("multiMiR", quietly = TRUE)) {
+    stop("Install multiMiR to query validated targets, or supply the saved query CSV.")
+  }
+
   result <- tryCatch(
     multiMiR::get_multimir(
       mirna = mature_query,
@@ -717,44 +720,24 @@ shared_target_interactions <- multimir_edges_clean %>%
     shared_mirna %>%
       dplyr::transmute(
         pre_miRNA,
-
-        miRNA_CRC_logFC =
-          CRC_miRNA_logFC,
-
-        miRNA_UCEC_logFC =
-          UCEC_miRNA_logFC,
-
-        miRNA_CRC_FDR =
-          CRC_miRNA_FDR,
-
-        miRNA_UCEC_FDR =
-          UCEC_miRNA_FDR,
-
-        miRNA_Direction
+        miRNA_CRC_logFC = CRC_logFC,
+        miRNA_UCEC_logFC = UCEC_logFC,
+        miRNA_CRC_FDR = CRC_FDR,
+        miRNA_UCEC_FDR = UCEC_FDR,
+        miRNA_Direction = Direction
       ),
     by = "pre_miRNA"
   ) %>%
   dplyr::inner_join(
     shared_mrna %>%
       dplyr::transmute(
-        gene_key = target_key,
-
-        target_symbol_DE =
-          target_symbol,
-
-        gene_CRC_logFC =
-          CRC_gene_logFC,
-
-        gene_UCEC_logFC =
-          UCEC_gene_logFC,
-
-        gene_CRC_FDR =
-          CRC_gene_FDR,
-
-        gene_UCEC_FDR =
-          UCEC_gene_FDR,
-
-        gene_Direction
+        gene_key,
+        target_symbol_DE = Gene,
+        gene_CRC_logFC = CRC_logFC,
+        gene_UCEC_logFC = UCEC_logFC,
+        gene_CRC_FDR = CRC_FDR,
+        gene_UCEC_FDR = UCEC_FDR,
+        gene_Direction = Direction
       ),
     by = "gene_key"
   ) %>%

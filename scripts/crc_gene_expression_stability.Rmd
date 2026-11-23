@@ -16,6 +16,7 @@ params:
   fdr_threshold: 0.05
   sign_consistency_threshold: 0.90
   repeated_significance_threshold: 0.70
+  parallel_workers: 23
 ---
 
 Fit edgeR contrasts and evaluate effect stability with stratified bootstrap and leave-one-out resampling.
@@ -37,7 +38,8 @@ required_packages <- c(
   "tidyr",
   "ggplot2",
   "fs",
-  "knitr"
+  "knitr",
+  "BiocParallel"
 )
 
 missing_packages <- required_packages[
@@ -59,17 +61,6 @@ library(tidyr)
 library(ggplot2)
 library(fs)
 library(knitr)
-
-params <- list(
-  clinical_file = "data/clinical_data.csv",
-  counts_file = "data/prepared/counts_coad_read_HUGO_shortbarcodes.csv",
-  output_dir = "data/DE_results",
-  bootstrap_iterations = 500L,
-  random_seed = 20260804L,
-  fdr_threshold = 0.05,
-  sign_consistency_threshold = 0.90,
-  repeated_significance_threshold = 0.70
-)
 
 knitr::opts_chunk$set(
   echo = TRUE,
@@ -663,11 +654,18 @@ run_resampling_parallel <- function(
     ceiling(seq_len(n_resamples) / batch_size)
   )
 
-  bp <- BiocParallel::MulticoreParam(
-    workers = n_cores,
-    RNGseed = random_seed,
-    progressbar = TRUE
-  )
+  bp <- if (.Platform$OS.type == "unix" && n_cores > 1L) {
+    BiocParallel::MulticoreParam(
+      workers = n_cores,
+      RNGseed = random_seed,
+      progressbar = TRUE
+    )
+  } else {
+    BiocParallel::SerialParam(
+      RNGseed = random_seed,
+      progressbar = TRUE
+    )
+  }
 
   parts <- BiocParallel::bplapply(
     batch_ids,
@@ -1234,7 +1232,7 @@ knitr::kable(
 
 ## Stratified bootstrap analysis
 
-```{r bootstrap-run, cache=TRUE}
+```{r bootstrap-run}
 set.seed(params$random_seed)
 
 B <- as.integer(
@@ -1265,7 +1263,6 @@ counts_bootstrap <- counts[
   ,
   drop = FALSE
 ]
-params$bootstrap_iterations <- 500L
 bootstrap_results <- run_resampling_parallel(
   index_list = bootstrap_index_list,
   resample_names = bootstrap_names,
@@ -1275,7 +1272,7 @@ bootstrap_results <- run_resampling_parallel(
   target_genes = target_genes,
   contrasts_to_test = stability_contrasts,
   fdr_cutoff = fdr_threshold,
-  n_cores = 23,
+  n_cores = params$parallel_workers,
   random_seed = params$random_seed
 )
 
@@ -1319,7 +1316,7 @@ message(
 
 ## Leave-one-MSS/TMB-H-out analysis
 
-```{r leave-one-out-run, cache=TRUE}
+```{r leave-one-out-run}
 mss_tmb_h_indices <- which(
   clinical_data$MSI_TMB ==
     "MSS_TMB_H"

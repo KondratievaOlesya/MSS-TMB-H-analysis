@@ -1,0 +1,24 @@
+# Python versions used for the notebook runs
+anndata==0.8.0
+Cython==0.29.32
+h5py==3.16.0
+igraph==0.9.11
+ipykernel==7.3.0
+ipython==8.39.0
+jupyterlab==4.6.2
+louvain==0.7.1
+matplotlib==3.6.3
+nbconvert==7.17.1
+numba==0.66.0
+numpy==1.23.3
+openpyxl==3.1.5
+pandas==1.4.4
+pynndescent==0.6.0
+rpy2==3.5.4
+scanpy==1.9.1
+scikit-learn==1.1.2
+scipy==1.9.1
+setuptools==81.0.0
+statsmodels==0.14.6
+umap-learn==0.5.3
+wheel==0.47.0

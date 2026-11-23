@@ -15,7 +15,6 @@ knitr::opts_knit$set(root.dir = normalizePath(project_root, mustWork = TRUE))
 
 ```{r}
 suppressPackageStartupMessages({
-    library(TCGAbiolinks)
     library(dplyr)
     library(tidyr)
     library(stringr)
@@ -43,10 +42,6 @@ maf_cache <- file.path(
     "tcga_coad_read_ucec_masked_maf.rds"
 )
 
-if (!requireNamespace("BiocManager", quietly = TRUE)) {
-    install.packages("BiocManager")
-}
-
 bioc_packages <- c(
     "VariantAnnotation",
     "GenomicRanges",
@@ -64,10 +59,9 @@ missing_bioc_packages <- bioc_packages[
 ]
 
 if (length(missing_bioc_packages) > 0) {
-    BiocManager::install(
-        missing_bioc_packages,
-        ask = FALSE,
-        update = FALSE
+    stop(
+        "Install the required Bioconductor packages before rendering: ",
+        paste(missing_bioc_packages, collapse = ", ")
     )
 }
 
@@ -89,7 +83,7 @@ download_tcga_maf <- function(project, data_dir = "data") {
         showWarnings = FALSE
     )
 
-    query <- GDCquery(
+    query <- TCGAbiolinks::GDCquery(
         project = project,
         data.category = "Simple Nucleotide Variation",
         data.type = "Masked Somatic Mutation",
@@ -98,14 +92,14 @@ download_tcga_maf <- function(project, data_dir = "data") {
         access = "open"
     )
 
-    GDCdownload(
+    TCGAbiolinks::GDCdownload(
         query,
         method = "api",
         directory = project_dir,
         files.per.chunk = 10
     )
 
-    maf <- GDCprepare(
+    maf <- TCGAbiolinks::GDCprepare(
         query,
         directory = project_dir
     )
@@ -2099,6 +2093,7 @@ variant_patient_summary <-
 
 patient_status_prepared <-
     patient_status_prepared %>%
+    dplyr::select(-dplyr::any_of("protein_changes")) %>%
     dplyr::left_join(
         variant_patient_summary,
         by = "patient_id"

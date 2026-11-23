@@ -28,7 +28,6 @@ required_packages <- c(
   "igraph",
   "ggraph",
   "ggplot2",
-  "multiMiR",
   "patchwork",
   "openxlsx",
   "svglite",
@@ -62,7 +61,6 @@ library(STRINGdb)
 library(igraph)
 library(ggraph)
 library(ggplot2)
-library(multiMiR)
 library(patchwork)
 library(openxlsx)
 library(svglite)
@@ -1062,6 +1060,10 @@ safe_get_multimir <- function(
     "Querying: ",
     mature_query
   )
+
+  if (!requireNamespace("multiMiR", quietly = TRUE)) {
+    stop("Install multiMiR to query validated targets, or supply the saved query CSV.")
+  }
 
   result <- tryCatch(
     multiMiR::get_multimir(

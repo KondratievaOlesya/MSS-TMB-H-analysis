@@ -9,13 +9,11 @@ output:
     code_folding: show
 params:
   crc_clinical_file: "data/clinical_data.csv"
-  crc_mirna_counts_file: "data/coad/miRNA_counts_matrix.csv"
+  crc_mirna_counts_file: "data/miRNA/miRNA_counts_matrix.csv"
 
   ucec_clinical_file: "data/ucec_clinical.csv"
 
-  # Set this explicitly when the file is known. When left null, the
-  # notebook searches common UCEC directories for a miRNA count matrix.
-  ucec_mirna_counts_file: null
+  ucec_mirna_counts_file: "data/miRNA/miRNA_counts_matrix.csv"
 
   output_root: "data/DE_results/pre_miRNA/bootstrap_stability"
 
@@ -148,34 +146,7 @@ write_empty_csv <- function(file, columns) {
     row.names = FALSE
   )
 }
-params <- list(
-  crc_clinical_file =
-    "data/clinical_data.csv",
 
-  crc_mirna_counts_file =
-    "data/coad/miRNA_counts_matrix.csv",
-
-  ucec_clinical_file =
-    "data/ucec_clinical.csv",
-
-  ucec_mirna_counts_file = NULL,
-
-  output_root =
-    "data/DE_results/pre_miRNA/bootstrap_stability",
-
-  bootstrap_iterations = 500L,
-  random_seed = 20260805L,
-  parallel_workers = 23L,
-  bootstrap_batch_size = 5L,
-
-  fdr_threshold = 0.05,
-  logfc_threshold = 1,
-  min_count = 5L,
-  sign_consistency_threshold = 0.90,
-  repeated_significance_threshold = 0.70,
-
-  run_leave_one_out = TRUE
-)
 ```
 
 ## Resolve input files
@@ -183,102 +154,13 @@ params <- list(
 ```{r resolve-files}
 resolve_existing_file <- function(
     explicit_file,
-    candidate_files = character(),
-    search_roots = character(),
-    search_pattern = "(?i)mirna.*count.*\\.csv$",
     dataset_name
 ) {
-  explicit_valid <-
-    length(explicit_file) == 1 &&
-    !is.null(explicit_file) &&
-    !is.na(explicit_file) &&
-    nzchar(trimws(as.character(explicit_file)))
-
-  if (explicit_valid) {
-    explicit_file <- path.expand(
-      as.character(explicit_file)
-    )
-
-    if (!file.exists(explicit_file)) {
-      stop(
-        dataset_name,
-        " file specified in YAML does not exist: ",
-        explicit_file
-      )
-    }
-
-    return(normalizePath(explicit_file))
+  input_file <- path.expand(explicit_file)
+  if (!file.exists(input_file)) {
+    stop(dataset_name, " file does not exist: ", input_file)
   }
-
-  candidate_files <- unique(
-    path.expand(candidate_files)
-  )
-
-  candidates_found <- candidate_files[
-    file.exists(candidate_files)
-  ]
-
-  searchable_roots <- search_roots[
-    dir.exists(search_roots)
-  ]
-
-  discovered_files <- unique(
-    unlist(
-      lapply(
-        searchable_roots,
-        function(root) {
-          list.files(
-            root,
-            pattern = search_pattern,
-            recursive = TRUE,
-            full.names = TRUE
-          )
-        }
-      ),
-      use.names = FALSE
-    )
-  )
-
-  discovered_files <- discovered_files[
-    !grepl(
-      "DE_results|stability|bootstrap|primary_DE|sig_genes",
-      discovered_files,
-      ignore.case = TRUE
-    )
-  ]
-
-  all_found <- unique(
-    c(
-      candidates_found,
-      discovered_files
-    )
-  )
-
-  if (length(all_found) == 1) {
-    message(
-      "Automatically selected ",
-      dataset_name,
-      " file: ",
-      all_found
-    )
-
-    return(normalizePath(all_found))
-  }
-
-  if (length(all_found) == 0) {
-    stop(
-      "Could not find the ",
-      dataset_name,
-      " file. Set the corresponding YAML parameter explicitly."
-    )
-  }
-
-  stop(
-    "Several possible ",
-    dataset_name,
-    " files were found. Set the YAML parameter explicitly:\n",
-    paste(all_found, collapse = "\n")
-  )
+  normalizePath(input_file)
 }
 
 crc_counts_file <- resolve_existing_file(
@@ -288,15 +170,6 @@ crc_counts_file <- resolve_existing_file(
 
 ucec_counts_file <- resolve_existing_file(
   explicit_file = params$ucec_mirna_counts_file,
-  candidate_files = c(
-    "data/coad/miRNA_counts_matrix.csv"
-  ),
-  search_roots = c(
-    "data/UCEC",
-    "data/ucec",
-    "data/TCGA-UCEC",
-    "data/tcga_ucec"
-  ),
   dataset_name = "UCEC miRNA count matrix"
 )
 
@@ -2769,7 +2642,7 @@ run_mirna_stability_analysis <- function(
 
 ## Run CRC analysis
 
-```{r run-crc, cache=TRUE}
+```{r run-crc}
 crc_analysis <- run_mirna_stability_analysis(
   dataset_name = "CRC",
   clinical_file =
@@ -2791,7 +2664,7 @@ knitr::kable(
 
 ## Run UCEC analysis
 
-```{r run-ucec, cache=TRUE}
+```{r run-ucec}
 ucec_analysis <- run_mirna_stability_analysis(
   dataset_name = "UCEC",
   clinical_file =

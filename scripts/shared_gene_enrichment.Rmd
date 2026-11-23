@@ -656,39 +656,13 @@ safe_gost_gscs <- function(
     )
   )
 
-  result <- tryCatch(
-    gprofiler2::gost(
-      query =
-        genes,
-
-      organism =
-        "hsapiens",
-
-      sources =
-        params$
-          sources,
-
-      significant =
-        TRUE,
-
-      correction_method =
-        "g_SCS",
-
-      evcodes =
-        TRUE
-    ),
-
-    error =
-      function(e) {
-        warning(
-          "g:Profiler failed: ",
-          conditionMessage(
-            e
-          )
-        )
-
-        NULL
-      }
+  result <- gprofiler2::gost(
+    query = genes,
+    organism = "hsapiens",
+    sources = params$sources,
+    significant = TRUE,
+    correction_method = "g_SCS",
+    evcodes = TRUE
   )
 
   if (
@@ -1323,7 +1297,8 @@ if (
 ```{r summary}
 enrichment_summary <- dplyr::bind_rows(
   enrichment_mssl_all,
-  enrichment_msih_all
+  enrichment_msih_all,
+  tibble::tibble(comparison = character(), direction = character(), source = character())
 ) %>%
   dplyr::count(
     comparison,

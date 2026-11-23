@@ -504,10 +504,9 @@ safe_wilcox <- function(
 }
 
 polymerase_file <- file.path(
-    data_dir,
-    "pole_pold1_full_cohort",
-    "tables",
-    "TCGA_CRC_UCEC_full_patient_polymerase_status.csv"
+    project_dir,
+    "pole_pold1_results",
+    "TCGA_COAD_READ_UCEC_patient_polymerase_status.csv"
 )
 
 if (!file.exists(polymerase_file)) {
@@ -592,10 +591,12 @@ polymerase_status_raw <- readr::read_csv(
 
 required_polymerase_columns <- c(
     "patient_id",
+    "cancer_type",
     "has_pole_mutation",
     "has_pold1_mutation",
     "has_exonuclease_domain_variant",
-    "has_known_pole_hotspot"
+    "has_known_pole_hotspot",
+    "likely_proofreading_relevant"
 )
 
 missing_polymerase_columns <- setdiff(
@@ -616,6 +617,7 @@ if (length(missing_polymerase_columns) > 0) {
 }
 
 polymerase_status <- polymerase_status_raw %>%
+    dplyr::rename(cancer_group = cancer_type) %>%
     dplyr::mutate(
         patient_id = normalize_patient_id(
             patient_id
@@ -831,7 +833,7 @@ readr::write_csv(
 )
 
 print(
-    group_counts,
+    tibble::as_tibble(group_counts),
     n = Inf
 )
 
@@ -1559,7 +1561,7 @@ cat(
 )
 
 print(
-    primary_wilcox,
+    tibble::as_tibble(primary_wilcox),
     n = Inf
 )
 
@@ -1578,7 +1580,8 @@ print(
                 term,
                 ":"
             )
-        ),
+        ) %>%
+        tibble::as_tibble(),
     n = Inf
 )
 
