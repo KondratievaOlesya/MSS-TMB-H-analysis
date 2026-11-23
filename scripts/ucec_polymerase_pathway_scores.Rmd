@@ -1,0 +1,96 @@
+---
+title: "UCEC ssGSEA scores for polymerase analysis"
+output: html_document
+---
+
+Calculate Hallmark ssGSEA scores for the UCEC polymerase comparisons.
+
+```{r project-root, include=FALSE}
+project_root <- Sys.getenv("MSS_TMB_PROJECT_ROOT", unset = "")
+if (!nzchar(project_root)) {
+  project_root <- file.path(dirname(knitr::current_input(dir = TRUE)), "..")
+}
+knitr::opts_knit$set(root.dir = normalizePath(project_root, mustWork = TRUE))
+```
+
+```{r setup, include=FALSE}
+library(GSVA)
+library(msigdbr)
+library(edgeR)
+```
+
+```{r}
+clinical_data <- read.csv("data/ucec_clinical.csv", header = TRUE, stringsAsFactors = FALSE, fileEncoding = "UTF-8", na.strings = c("NA", ""))
+
+rownames(clinical_data) <- clinical_data$sample_submitter_id
+clinical_data <- clinical_data[!is.na(clinical_data$MSI_TMB),]
+```
+
+```{r}
+counts <- as.matrix(read.csv("data/UCEC/count_gene_name.csv",
+                             row.names = 1, check.names = FALSE))
+```
+
+```{r}
+clinical_data$MSI_TMB <- factor(clinical_data$MSI_TMB,
+                                levels = c("MSI-H", "MSS/TMB-H", "MSS/TMB-L"),
+                                labels = c("MSI_H", "MSS_TMB_H", "MSS_TMB_L"))
+
+common_samples <- intersect(colnames(counts), rownames(clinical_data))
+counts <- counts[, common_samples, drop = FALSE]
+clinical_data <- clinical_data[common_samples, , drop = FALSE]
+```
+
+```{r}
+y <- edgeR::DGEList(counts = counts, group = clinical_data$MSI_TMB)
+
+keep <- edgeR::filterByExpr(y, group = clinical_data$MSI_TMB, min.count = 10)
+y <- y[keep, , keep.lib.sizes = FALSE]
+
+y <- edgeR::calcNormFactors(y, method = "TMM")
+
+expr_matrix <- edgeR::cpm(y, log = TRUE, prior.count = 1)
+
+expr_matrix <- as.matrix(expr_matrix)
+storage.mode(expr_matrix) <- "double"
+expr_matrix <- expr_matrix[!duplicated(rownames(expr_matrix)), , drop = FALSE]
+
+out_expr <- "data/prepared/ucec_expr_logCPM_TMM.csv"
+
+if (!dir.exists(dirname(out_expr))) dir.create(dirname(out_expr), recursive = TRUE)
+utils::write.csv(expr_matrix, out_expr, row.names = TRUE)
+```
+
+```{r}
+expr_matrix <- read.csv(out_expr, 
+                        row.names = 1, 
+                        check.names = FALSE,    # keeps original colnames with "-"
+                        stringsAsFactors = FALSE)
+
+expr_matrix <- as.matrix(expr_matrix)
+
+colnames(expr_matrix) <- gsub("\\.", "-", colnames(expr_matrix), fixed = FALSE)
+```
+
+```{r}
+msig_h <- msigdbr::msigdbr(species = "Homo sapiens", collection = "H")
+pathways_list <- split(msig_h$gene_symbol, msig_h$gs_name)
+
+pathways_list <- lapply(pathways_list, function(gs) intersect(gs, rownames(expr_matrix)))
+pathways_list <- pathways_list[vapply(pathways_list, length, 1L) >= 10]
+```
+
+```{r}
+genes_in_pathways <- unique(unlist(pathways_list))
+expr_matrix <- expr_matrix[rownames(expr_matrix) %in% genes_in_pathways, , drop = FALSE]
+
+gsva_params <- GSVA::ssgseaParam(
+  expr = expr_matrix,
+  geneSets = pathways_list
+)
+
+gsva_scores <- GSVA::gsva(gsva_params)
+
+out_gsva <- "data/prepared/ucec_gsva_ssgsea_hallmark.csv"
+utils::write.csv(gsva_scores, out_gsva, row.names = TRUE)
+```

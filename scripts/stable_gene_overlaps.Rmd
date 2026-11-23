@@ -1,0 +1,573 @@
+---
+title: "Overlap of bootstrap-stable genes"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: false
+    code_folding: show
+---
+
+Compare bootstrap-stable differential expression across cancer types and contrasts.
+
+```{r project-root, include=FALSE}
+project_root <- Sys.getenv("MSS_TMB_PROJECT_ROOT", unset = "")
+if (!nzchar(project_root)) {
+  project_root <- file.path(dirname(knitr::current_input(dir = TRUE)), "..")
+}
+knitr::opts_knit$set(root.dir = normalizePath(project_root, mustWork = TRUE))
+```
+
+```{r setup, message=FALSE, warning=FALSE}
+params <- list(
+
+  original_crc_de_dir = "data/DE_results",
+  original_ucec_de_dir = "data/DE_results/ucec_gene_DE",
+
+  crc_mrna_stability_file = "data/DE_results/stability_analysis/combined_primary_bootstrap_LOO_stability.csv",
+  ucec_mrna_stability_file = "data/DE_results/ucec_gene_DE/stability_analysis/combined_primary_bootstrap_LOO_stability.csv",
+  mrna_stability_flag_column = "bootstrap_robust_effect",
+
+
+
+
+  output_root = "bootstrap_validated_downstream_analysis",
+
+  fdr_cutoff = 0.05,
+  logfc_cutoff = 1
+)
+
+core_packages <- c(
+  "dplyr", "tidyr", "tibble", "stringr", "ggplot2", "ggVennDiagram", "svglite"
+)
+
+missing_core <- core_packages[
+  !vapply(core_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_core) > 0) {
+  stop(
+    "Missing required R packages: ",
+    paste(missing_core, collapse = ", ")
+  )
+}
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(ggplot2)
+library(ggVennDiagram)
+library(svglite)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  fig.width = 9,
+  fig.height = 6
+)
+
+set.seed(20260805)
+
+contrast_names <- c(
+  "MSI_H_vs_MSS_TMB_H",
+  "MSI_H_vs_MSS_TMB_L",
+  "MSS_TMB_H_vs_MSS_TMB_L"
+)
+
+stable_crc_de_dir <- file.path(
+  params$output_root, "data", "DE_results", "CRC"
+)
+stable_crc_only_dir <- file.path(
+  stable_crc_de_dir, "stable_only"
+)
+
+stable_ucec_de_dir <- file.path(
+  params$output_root, "data", "DE_results", "UCEC"
+)
+stable_ucec_only_dir <- file.path(
+  stable_ucec_de_dir, "stable_only"
+)
+
+deg_plot_dir <- file.path(params$output_root, "results", "figures", "DEG")
+output_dirs <- c(
+  stable_crc_de_dir,
+  stable_crc_only_dir,
+  stable_ucec_de_dir,
+  stable_ucec_only_dir,
+  deg_plot_dir
+)
+
+invisible(
+  lapply(
+    output_dirs,
+    dir.create,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+)
+
+as_flag <- function(x) {
+  if (is.logical(x)) {
+    return(replace(x, is.na(x), FALSE))
+  }
+
+  if (is.numeric(x)) {
+    return(!is.na(x) & x != 0)
+  }
+
+  tolower(trimws(as.character(x))) %in%
+    c("true", "t", "1", "yes", "y")
+}
+
+save_placeholder_svg <- function(
+    file,
+    title,
+    detail = "No results available"
+) {
+  p <- ggplot() +
+    annotate(
+      "text",
+      x = 0,
+      y = 0.15,
+      label = title,
+      fontface = "bold",
+      size = 5
+    ) +
+    annotate(
+      "text",
+      x = 0,
+      y = -0.10,
+      label = detail,
+      size = 4
+    ) +
+    xlim(-1, 1) +
+    ylim(-1, 1) +
+    theme_void()
+
+  ggsave(
+    file,
+    p,
+    width = 7,
+    height = 5,
+    device = "svg"
+  )
+
+  invisible(p)
+}
+
+write_empty_csv <- function(file, columns) {
+  x <- as.data.frame(
+    setNames(
+      replicate(
+        length(columns),
+        logical(0),
+        simplify = FALSE
+      ),
+      columns
+    )
+  )
+
+  write.csv(
+    x,
+    file,
+    row.names = FALSE
+  )
+}
+```
+
+## Build bootstrap-validated CRC and UCEC mRNA files
+
+```{r prepare-bootstrap-validated-mrna-results}
+read_stability_table <- function(
+    stability_file,
+    id_column,
+    flag_column,
+    dataset_name
+) {
+  if (!file.exists(stability_file)) {
+    stop(
+      dataset_name,
+      " stability table not found: ",
+      stability_file
+    )
+  }
+
+  stability <- read.csv(
+    stability_file,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+
+  required_columns <- c(
+    "Contrast",
+    id_column
+  )
+
+  missing_columns <- setdiff(
+    required_columns,
+    names(stability)
+  )
+
+  if (length(missing_columns) > 0) {
+    stop(
+      dataset_name,
+      " stability table is missing columns: ",
+      paste(missing_columns, collapse = ", ")
+    )
+  }
+
+  if (flag_column %in% names(stability)) {
+    stability$selected_stable <- as_flag(
+      stability[[flag_column]]
+    )
+  } else if (
+    all(c("Method", "robust_effect") %in% names(stability))
+  ) {
+    stability <- stability[
+      grepl(
+        "bootstrap",
+        stability$Method,
+        ignore.case = TRUE
+      ),
+      ,
+      drop = FALSE
+    ]
+
+    stability$selected_stable <- as_flag(
+      stability$robust_effect
+    )
+  } else {
+    stop(
+      dataset_name,
+      ": could not find stability flag '",
+      flag_column,
+      "' or long-format Method/robust_effect columns."
+    )
+  }
+
+  stability %>%
+    transmute(
+      Contrast = trimws(
+        as.character(Contrast)
+      ),
+      Feature = trimws(
+        as.character(
+          .data[[id_column]]
+        )
+      ),
+      selected_stable =
+        selected_stable
+    ) %>%
+    filter(
+      !is.na(Contrast),
+      Contrast != "",
+      !is.na(Feature),
+      Feature != ""
+    ) %>%
+    group_by(
+      Contrast,
+      Feature
+    ) %>%
+    summarise(
+      selected_stable = any(
+        selected_stable,
+        na.rm = TRUE
+      ),
+      .groups = "drop"
+    )
+}
+
+build_validated_result_files <- function(
+    dataset_name,
+    original_dir,
+    stability_file,
+    output_dir,
+    stable_only_dir,
+    id_column,
+    stability_flag_column
+) {
+  stability <- read_stability_table(
+    stability_file = stability_file,
+    id_column = id_column,
+    flag_column = stability_flag_column,
+    dataset_name = dataset_name
+  )
+
+  assessed_contrasts <- unique(
+    stability$Contrast
+  )
+
+  count_rows <- vector(
+    "list",
+    length(contrast_names)
+  )
+
+  names(count_rows) <- contrast_names
+
+  for (contrast_name in contrast_names) {
+    source_file <- file.path(
+      original_dir,
+      paste0(contrast_name, ".csv")
+    )
+
+    if (!file.exists(source_file)) {
+      stop(
+        "Missing ",
+        dataset_name,
+        " result file: ",
+        source_file
+      )
+    }
+
+    tab <- read.csv(
+      source_file,
+      row.names = 1,
+      stringsAsFactors = FALSE,
+      check.names = FALSE
+    )
+
+    feature_ids <- trimws(
+      rownames(tab)
+    )
+
+    contrast_assessed <-
+      contrast_name %in% assessed_contrasts
+
+    stable_ids <- stability %>%
+      filter(
+        Contrast == contrast_name,
+        selected_stable
+      ) %>%
+      pull(Feature)
+
+    tab$bootstrap_assessed <-
+      contrast_assessed
+
+    tab$bootstrap_stable <-
+      contrast_assessed &
+      feature_ids %in% stable_ids
+
+    write.csv(
+      tab,
+      file.path(
+        output_dir,
+        paste0(contrast_name, ".csv")
+      )
+    )
+
+    write.csv(
+      tab[
+        tab$bootstrap_stable,
+        ,
+        drop = FALSE
+      ],
+      file.path(
+        stable_only_dir,
+        paste0(contrast_name, ".csv")
+      )
+    )
+
+    primary_significant <-
+      !is.na(tab$FDR) &
+      !is.na(tab$logFC) &
+      tab$FDR <= params$fdr_cutoff &
+      abs(tab$logFC) >= params$logfc_cutoff
+
+    count_rows[[contrast_name]] <- tibble(
+      Dataset = dataset_name,
+      Contrast = contrast_name,
+      Bootstrap_assessed =
+        contrast_assessed,
+      Features_tested = nrow(tab),
+      Primary_significant =
+        sum(primary_significant),
+      Bootstrap_stable_total =
+        sum(tab$bootstrap_stable),
+      Bootstrap_stable_significant =
+        sum(
+          primary_significant &
+            tab$bootstrap_stable
+        ),
+      Primary_significant_not_stable =
+        if (contrast_assessed) {
+          sum(
+            primary_significant &
+              !tab$bootstrap_stable
+          )
+        } else {
+          NA_integer_
+        }
+    )
+  }
+
+  bind_rows(count_rows)
+}
+
+crc_mrna_counts <- build_validated_result_files(
+  dataset_name = "CRC_mRNA",
+  original_dir = params$original_crc_de_dir,
+  stability_file = params$crc_mrna_stability_file,
+  output_dir = stable_crc_de_dir,
+  stable_only_dir = stable_crc_only_dir,
+  id_column = "Gene",
+  stability_flag_column =
+    params$mrna_stability_flag_column
+)
+
+ucec_mrna_counts <- build_validated_result_files(
+  dataset_name = "UCEC_mRNA",
+  original_dir = params$original_ucec_de_dir,
+  stability_file = params$ucec_mrna_stability_file,
+  output_dir = stable_ucec_de_dir,
+  stable_only_dir = stable_ucec_only_dir,
+  id_column = "Gene",
+  stability_flag_column =
+    params$mrna_stability_flag_column
+)
+
+mrna_validation_counts <- bind_rows(
+  crc_mrna_counts,
+  ucec_mrna_counts
+)
+
+write.csv(
+  mrna_validation_counts,
+  file.path(
+    params$output_root,
+    "CRC_UCEC_mRNA_bootstrap_validation_counts.csv"
+  ),
+  row.names = FALSE
+)
+
+knitr::kable(
+  mrna_validation_counts,
+  caption = "CRC and UCEC mRNA bootstrap-validation counts."
+)
+```
+
+## Gene sets and overlap plots
+
+```{r deg-helper-functions}
+read_deg <- function(
+    file,
+    contrast_name,
+    flip_logfc = FALSE
+) {
+  df <- read.csv(
+    file,
+    row.names = 1,
+    check.names = FALSE
+  ) %>%
+    rownames_to_column(
+      "Gene"
+    ) %>%
+    as_tibble()
+
+  required_columns <- c(
+    "logFC",
+    "FDR",
+    "bootstrap_assessed",
+    "bootstrap_stable"
+  )
+
+  missing_columns <- setdiff(
+    required_columns,
+    names(df)
+  )
+
+  if (length(missing_columns) > 0) {
+    stop(
+      "Missing columns in ",
+      file,
+      ": ",
+      paste(missing_columns, collapse = ", ")
+    )
+  }
+
+  df$bootstrap_assessed <- as_flag(
+    df$bootstrap_assessed
+  )
+  df$bootstrap_stable <- as_flag(
+    df$bootstrap_stable
+  )
+
+  if (flip_logfc) {
+    df$logFC <- -df$logFC
+  }
+
+  df %>%
+    mutate(
+      contrast = contrast_name,
+      sig =
+        bootstrap_assessed &
+        bootstrap_stable &
+        !is.na(FDR) &
+        !is.na(logFC) &
+        FDR <= params$fdr_cutoff &
+        abs(logFC) >= params$logfc_cutoff,
+      direction = case_when(
+        sig & logFC > 0 ~
+          "Up in MSS/TMB-H",
+        sig & logFC < 0 ~
+          "Down in MSS/TMB-H",
+        TRUE ~
+          "Not significant"
+      ),
+      neglog10FDR =
+        -log10(
+          pmax(FDR, 1e-300)
+        )
+    )
+}
+
+save_venn <- function(sets, title, file, high_color) {
+  if (all(vapply(sets, length, integer(1)) == 0)) {
+    save_placeholder_svg(file, title, "No bootstrap-stable significant features")
+    return(invisible(NULL))
+  }
+  p <- ggVennDiagram(sets, label_alpha = 0) +
+    scale_fill_gradient(low = "white", high = high_color) +
+    labs(title = title) +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5))
+  ggsave(file, p, width = 7, height = 6, device = "svg")
+  p
+}
+```
+
+```{r load-deg-results-and-plot}
+crc_mssh_vs_msih <- read_deg(
+  file.path(stable_crc_de_dir, "MSI_H_vs_MSS_TMB_H.csv"),
+  "CRC_MSS/TMB-H_vs_MSI-H",
+  flip_logfc = TRUE
+)
+crc_mssh_vs_mssl <- read_deg(
+  file.path(stable_crc_de_dir, "MSS_TMB_H_vs_MSS_TMB_L.csv"),
+  "CRC_MSS/TMB-H_vs_MSS/TMB-L"
+)
+ucec_mssh_vs_msih <- read_deg(
+  file.path(stable_ucec_de_dir, "MSI_H_vs_MSS_TMB_H.csv"),
+  "UCEC_MSS/TMB-H_vs_MSI-H",
+  flip_logfc = TRUE
+)
+ucec_mssh_vs_mssl <- read_deg(
+  file.path(stable_ucec_de_dir, "MSS_TMB_H_vs_MSS_TMB_L.csv"),
+  "UCEC_MSS/TMB-H_vs_MSS/TMB-L"
+)
+
+
+crc_sets <- list(
+  "CRC: MSS/TMB-H vs MSI-H" = crc_mssh_vs_msih %>% filter(sig) %>% pull(Gene),
+  "CRC: MSS/TMB-H vs MSS/TMB-L" = crc_mssh_vs_mssl %>% filter(sig) %>% pull(Gene)
+)
+save_venn(crc_sets, "Overlap of bootstrap-stable DEGs in CRC", file.path(deg_plot_dir, "venn_crc_significant_degs.svg"), "#56B4E9")
+
+combined_sets <- list(
+  "CRC\nMSS/TMB-H vs MSI-H" = crc_mssh_vs_msih %>% filter(sig) %>% pull(Gene),
+  "CRC\nMSS/TMB-H vs MSS/TMB-L" = crc_mssh_vs_mssl %>% filter(sig) %>% pull(Gene),
+  "UCEC\nMSS/TMB-H vs MSI-H" = ucec_mssh_vs_msih %>% filter(sig) %>% pull(Gene),
+  "UCEC\nMSS/TMB-H vs MSS/TMB-L" = ucec_mssh_vs_mssl %>% filter(sig) %>% pull(Gene)
+)
+save_venn(combined_sets, "Overlap of bootstrap-stable CRC and UCEC DEGs", file.path(deg_plot_dir, "venn_crc_ucec_significant_degs.svg"), "#CC79A7")
+```
